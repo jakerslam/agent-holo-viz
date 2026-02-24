@@ -105,14 +105,15 @@
     }
     #selectedTag {
       position: fixed;
-      right: 16px;
-      bottom: 16px;
+      right: max(12px, env(safe-area-inset-right));
+      bottom: max(12px, env(safe-area-inset-bottom));
       z-index: 12;
-      max-width: min(52vw, 520px);
+      max-width: min(50vw, 560px);
+      min-width: min(300px, 44vw);
       border: 1px solid var(--line);
       border-radius: 12px;
-      padding: 10px 12px;
-      font-size: 0.74rem;
+      padding: 10px 11px;
+      font-size: 0.7rem;
       font-family: "Share Tech Mono", monospace;
       color: var(--ink);
       background: rgba(5, 14, 24, 0.74);
@@ -126,52 +127,75 @@
       opacity: 1;
       transform: translateY(0);
     }
+    #selectedTag .selName {
+      font-size: 0.74rem;
+      color: var(--ink);
+      word-break: break-word;
+    }
+    #selectedTag .selPath {
+      margin-top: 4px;
+      font-size: 0.66rem;
+      color: var(--muted);
+      word-break: break-word;
+      opacity: 0.94;
+    }
     #statsPanel {
       position: fixed;
-      left: 16px;
-      bottom: 16px;
+      left: 8px;
+      top: 74px;
+      bottom: 10px;
       z-index: 12;
-      width: min(420px, 92vw);
+      width: min(252px, 30vw);
       border: 1px solid var(--line);
       border-radius: 14px;
-      padding: 12px;
+      padding: 8px 8px 7px;
       background: var(--panel);
       backdrop-filter: blur(10px);
       box-shadow: 0 0 34px rgba(93, 247, 255, 0.12);
+      overflow: auto;
     }
     #statsPanel h2 {
-      margin: 0 0 8px;
-      font-size: 0.74rem;
+      margin: 0 0 6px;
+      font-size: 0.66rem;
       color: var(--muted);
       letter-spacing: 0.1em;
     }
     #statsGrid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(120px, 1fr));
-      gap: 8px;
+      grid-template-columns: 1fr;
+      gap: 5px;
       font-family: "Share Tech Mono", monospace;
-      font-size: 0.72rem;
+      font-size: 0.68rem;
     }
     #statsGrid .item {
       border: 1px dashed rgba(93, 247, 255, 0.24);
       border-radius: 8px;
-      padding: 6px 8px;
+      padding: 5px 7px;
       background: rgba(9, 25, 40, 0.58);
     }
     #statsGrid .k {
       color: rgba(215, 249, 255, 0.65);
-      font-size: 0.62rem;
+      font-size: 0.58rem;
     }
     #statsGrid .v {
-      margin-top: 2px;
+      margin-top: 1px;
       color: var(--ink);
-      font-size: 0.78rem;
+      font-size: 0.72rem;
     }
     #metaLine {
-      margin-top: 8px;
+      margin-top: 6px;
       font-family: "Share Tech Mono", monospace;
-      font-size: 0.64rem;
+      font-size: 0.58rem;
       color: rgba(215, 249, 255, 0.72);
+    }
+    @media (max-width: 900px) {
+      #statsPanel {
+        width: min(220px, 44vw);
+      }
+      #selectedTag {
+        min-width: min(220px, 52vw);
+        max-width: min(72vw, 420px);
+      }
     }
   </style>
 </head>
