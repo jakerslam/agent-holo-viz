@@ -9,7 +9,10 @@ const QUALITY_PROFILES = {
     max_particles: 220,
     trail_length: 0,
     tube_alpha: 0.06,
-    dpr_cap: 1
+    dpr_cap: 1,
+    motion_dt_blend: 0.8,
+    spin_lerp_gain: 0.28,
+    spin_substeps: 4
   },
   medium: {
     label: 'TRON-EVOLVED',
@@ -20,7 +23,10 @@ const QUALITY_PROFILES = {
     max_particles: 650,
     trail_length: 4,
     tube_alpha: 0.075,
-    dpr_cap: 1.35
+    dpr_cap: 1.35,
+    motion_dt_blend: 0.62,
+    spin_lerp_gain: 0.42,
+    spin_substeps: 4
   },
   high: {
     label: 'ULTRON-LITE',
@@ -31,7 +37,10 @@ const QUALITY_PROFILES = {
     max_particles: 1400,
     trail_length: 9,
     tube_alpha: 0.095,
-    dpr_cap: 1.8
+    dpr_cap: 1.8,
+    motion_dt_blend: 0.44,
+    spin_lerp_gain: 0.58,
+    spin_substeps: 4
   },
   ultra: {
     label: 'ULTRON-CINEMATIC',
@@ -42,7 +51,10 @@ const QUALITY_PROFILES = {
     max_particles: 2600,
     trail_length: 16,
     tube_alpha: 0.115,
-    dpr_cap: 2.2
+    dpr_cap: 2.2,
+    motion_dt_blend: 0.26,
+    spin_lerp_gain: 0.74,
+    spin_substeps: 4
   }
 };
 
@@ -57,6 +69,7 @@ const PACKET_RADIUS_CEILING = 3.8;
 const MODULE_RADIUS_MIN = 10;
 const MODULE_RADIUS_MAX = 34;
 const MODULE_RADIUS_SIZE_BLEND = 0.42;
+const ROOT_MIN_SCREEN_HEIGHT_RATIO = 0.7;
 const SHELL_ORDER_SWAP_COOLDOWN_MS = 10 * 60 * 1000;
 const SHELL_INTRO_INITIAL_DELAY_MS = 110;
 const SHELL_INTRO_LAYER_DELAY_MS = 70;
@@ -78,6 +91,11 @@ const state = {
   refresh_ms: 6000,
   refresh_timer: null,
   last_frame_ts: 0,
+  motion_initialized: false,
+  motion_frame_count: 0,
+  motion_dt_smoothed: 16.7,
+  motion_jitter_ema: 0,
+  motion_smoothness_ema: 1,
   fps: 0,
   fps_smoothed: 60,
   gpu: null,
@@ -117,7 +135,7 @@ const state = {
   camera: {
     zoom: 1,
     min_zoom: 0.72,
-    max_zoom: 2.8,
+    max_zoom: 16,
     pan_x: 0,
     pan_y: 0,
     focus_mode: false,
@@ -130,6 +148,10 @@ const state = {
     map_return_zoom: 1,
     map_return_pan_x: 0,
     map_return_pan_y: 0,
+    module_return_selection: null,
+    module_return_selection_for: '',
+    submodule_return_selection: null,
+    submodule_return_selection_for: '',
     transition: null,
     panning: false,
     drag_px: 0,
@@ -182,13 +204,16 @@ function syncCameraTransition(ts = performance.now()) {
   const toZoom = Number(tr.to_zoom || fromZoom);
   const toPanX = Number(tr.to_pan_x || fromPanX);
   const toPanY = Number(tr.to_pan_y || fromPanY);
+  const allowOutOfBounds = tr.allow_out_of_bounds === true;
   cam.zoom = mix(fromZoom, toZoom, e);
   cam.pan_x = mix(fromPanX, toPanX, e);
   cam.pan_y = mix(fromPanY, toPanY, e);
+  if (!allowOutOfBounds) clampCameraPanInPlace();
   if (p >= 1) {
     cam.zoom = toZoom;
     cam.pan_x = toPanX;
     cam.pan_y = toPanY;
+    if (!allowOutOfBounds) clampCameraPanInPlace();
     cam.transition = null;
   }
 }
@@ -198,12 +223,20 @@ function stopCameraTransition() {
   state.camera.transition = null;
 }
 
-function startCameraTransition(targetZoom, targetPanX, targetPanY, durationMs = 170) {
+function startCameraTransition(targetZoom, targetPanX, targetPanY, durationMs = 170, options = {}) {
   const cam = state.camera;
   syncCameraTransition(performance.now());
-  const toZoom = clamp(Number(targetZoom), cam.min_zoom, cam.max_zoom);
-  const toPanX = Number(targetPanX);
-  const toPanY = Number(targetPanY);
+  const allowOutOfBounds = options && options.allow_out_of_bounds === true;
+  const desiredZoom = clampZoomToSceneBounds(Number(targetZoom));
+  let toZoom = desiredZoom;
+  let toPanX = Number(targetPanX);
+  let toPanY = Number(targetPanY);
+  if (!allowOutOfBounds) {
+    const panCandidate = clampPanToSceneBounds(Number(targetPanX), Number(targetPanY), desiredZoom);
+    toZoom = Number(panCandidate.zoom || desiredZoom);
+    toPanX = Number(panCandidate.pan_x);
+    toPanY = Number(panCandidate.pan_y);
+  }
   if (!Number.isFinite(toZoom) || !Number.isFinite(toPanX) || !Number.isFinite(toPanY)) return;
   const fromZoom = Number(cam.zoom || 1);
   const fromPanX = Number(cam.pan_x || 0);
@@ -215,6 +248,7 @@ function startCameraTransition(targetZoom, targetPanX, targetPanY, durationMs = 
     cam.zoom = toZoom;
     cam.pan_x = toPanX;
     cam.pan_y = toPanY;
+    if (!allowOutOfBounds) clampCameraPanInPlace();
     cam.transition = null;
     return;
   }
@@ -226,7 +260,8 @@ function startCameraTransition(targetZoom, targetPanX, targetPanY, durationMs = 
     from_pan_y: fromPanY,
     to_zoom: toZoom,
     to_pan_x: toPanX,
-    to_pan_y: toPanY
+    to_pan_y: toPanY,
+    allow_out_of_bounds: allowOutOfBounds
   };
 }
 
@@ -462,8 +497,12 @@ function setQualityTier(tier) {
 }
 
 function maybeAutoTuneQuality() {
-  if (state.fps_smoothed < 23) {
-    state.adaptive_downgrade_streak += 1;
+  const smoothness = clamp(Number(state.motion_smoothness_ema || 0), 0, 1);
+  const fpsLow = state.fps_smoothed < 23;
+  const smoothLow = smoothness < 0.42;
+  if (fpsLow || smoothLow) {
+    const penalty = smoothness < 0.26 ? 2 : 1;
+    state.adaptive_downgrade_streak += penalty;
     if (state.adaptive_downgrade_streak > 140) {
       const idx = QUALITY_LEVELS.indexOf(state.quality_tier);
       if (idx > 0) {
@@ -473,7 +512,7 @@ function maybeAutoTuneQuality() {
     }
     return;
   }
-  if (state.fps_smoothed > 52) {
+  if (state.fps_smoothed > 52 && smoothness > 0.78) {
     state.adaptive_downgrade_streak = Math.max(0, state.adaptive_downgrade_streak - 4);
   } else {
     state.adaptive_downgrade_streak = Math.max(0, state.adaptive_downgrade_streak - 1);
@@ -501,17 +540,132 @@ function screenToWorld(x, y) {
   };
 }
 
+function sceneWorldBounds(scene) {
+  const src = scene && typeof scene === 'object' ? scene : null;
+  if (!src) return null;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  const includeCircle = (x, y, r) => {
+    const cx = Number(x);
+    const cy = Number(y);
+    const cr = Math.max(0, Number(r || 0));
+    if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(cr)) return;
+    minX = Math.min(minX, cx - cr);
+    maxX = Math.max(maxX, cx + cr);
+    minY = Math.min(minY, cy - cr);
+    maxY = Math.max(maxY, cy + cr);
+  };
+  const targets = Array.isArray(src.hit_targets) ? src.hit_targets : [];
+  for (const t of targets) {
+    if (!t) continue;
+    const kind = String(t.kind || '').toLowerCase();
+    if (kind === 'ring' || kind === 'shell_fill') {
+      includeCircle(Number(t.cx || 0), Number(t.cy || 0), Math.max(0, Number(t.outer || 0)));
+    } else {
+      includeCircle(Number(t.x || 0), Number(t.y || 0), Math.max(0, Number(t.r || 0)));
+    }
+  }
+  const links = Array.isArray(src.links) ? src.links : [];
+  for (const link of links) {
+    if (!link) continue;
+    for (const key of ['p0', 'p1', 'p2', 'p3']) {
+      const p = link[key];
+      if (!p) continue;
+      includeCircle(Number(p.x || 0), Number(p.y || 0), 3.5);
+    }
+  }
+  if (!(maxX > minX) || !(maxY > minY)) {
+    const center = src.center && typeof src.center === 'object'
+      ? src.center
+      : { x: state.width * 0.52, y: state.height * 0.5 };
+    const fallbackOuter = Math.max(64, Number(src.outer_shell_boundary || 0), Number(src.outer_radius || 0));
+    includeCircle(Number(center.x || 0), Number(center.y || 0), fallbackOuter);
+  }
+  if (!(maxX > minX) || !(maxY > minY)) return null;
+  const pad = 10;
+  minX -= pad;
+  minY -= pad;
+  maxX += pad;
+  maxY += pad;
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    width: Math.max(1, maxX - minX),
+    height: Math.max(1, maxY - minY),
+    cx: (minX + maxX) * 0.5,
+    cy: (minY + maxY) * 0.5
+  };
+}
+
+function effectiveMinZoom(scene = state.scene) {
+  const cam = state.camera;
+  const baseMin = Math.max(0.001, Number(cam.min_zoom || 0.72));
+  const bounds = sceneWorldBounds(scene);
+  if (!bounds) return baseMin;
+  const ratio = clamp(Number(ROOT_MIN_SCREEN_HEIGHT_RATIO || 0.7), 0.1, 1);
+  const targetHeightPx = Math.max(1, state.height * ratio);
+  const byHeight = targetHeightPx / Math.max(1, Number(bounds.height || 1));
+  if (!Number.isFinite(byHeight) || byHeight <= 0) return baseMin;
+  return Math.max(baseMin, byHeight);
+}
+
+function clampZoomToSceneBounds(nextZoom, scene = state.scene) {
+  const cam = state.camera;
+  const minZoom = effectiveMinZoom(scene);
+  const maxZoom = Math.max(minZoom, Number(cam.max_zoom || minZoom));
+  return clamp(Number(nextZoom), minZoom, maxZoom);
+}
+
+function clampPanToSceneBounds(panX, panY, zoom, scene = state.scene) {
+  const z = clampZoomToSceneBounds(zoom, scene);
+  const bounds = sceneWorldBounds(scene);
+  let nextPanX = Number(panX || 0);
+  let nextPanY = Number(panY || 0);
+  if (!bounds) {
+    return { pan_x: nextPanX, pan_y: nextPanY, zoom: z };
+  }
+  const worldWpx = bounds.width * z;
+  const worldHpx = bounds.height * z;
+  if (worldWpx <= state.width) {
+    nextPanX = (state.width * 0.5) - (bounds.cx * z);
+  } else {
+    const minPanX = state.width - (bounds.maxX * z);
+    const maxPanX = -(bounds.minX * z);
+    nextPanX = clamp(nextPanX, minPanX, maxPanX);
+  }
+  if (worldHpx <= state.height) {
+    nextPanY = (state.height * 0.5) - (bounds.cy * z);
+  } else {
+    const minPanY = state.height - (bounds.maxY * z);
+    const maxPanY = -(bounds.minY * z);
+    nextPanY = clamp(nextPanY, minPanY, maxPanY);
+  }
+  return { pan_x: nextPanX, pan_y: nextPanY, zoom: z };
+}
+
+function clampCameraPanInPlace() {
+  const cam = state.camera;
+  const clamped = clampPanToSceneBounds(cam.pan_x, cam.pan_y, cam.zoom);
+  cam.pan_x = clamped.pan_x;
+  cam.pan_y = clamped.pan_y;
+}
+
 function setZoomAt(screenX, screenY, nextZoom) {
   const cam = state.camera;
   stopCameraTransition();
   const prevZoom = cam.zoom;
-  const target = clamp(nextZoom, cam.min_zoom, cam.max_zoom);
+  const target = clampZoomToSceneBounds(nextZoom);
   if (Math.abs(target - prevZoom) < 0.0005) return;
   const worldX = (screenX - cam.pan_x) / prevZoom;
   const worldY = (screenY - cam.pan_y) / prevZoom;
   cam.zoom = target;
   cam.pan_x = screenX - (worldX * target);
   cam.pan_y = screenY - (worldY * target);
+  clampCameraPanInPlace();
 }
 
 async function fetchPayload(hours) {
@@ -891,6 +1045,18 @@ function isPreviewWarningRow(key, value) {
   const v = String(value == null ? '' : value).trim().toLowerCase();
   if (!k && !v) return false;
   if (isPreviewErrorRow(key)) return false;
+  if (k === 'blocked links') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n > 0) return true;
+  }
+  if (k === 'max block ratio') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n > 0) return true;
+  }
+  if (k === 'motion smoothness') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n < 65) return true;
+  }
   if (k === 'integrity' && (v.includes('warning') || v.includes('recent'))) return true;
   if (k === 'health' && v.includes('watch')) return true;
   if (k === 'flow status' && (v.includes('degraded') || v.includes('partial') || v.includes('blocked'))) return true;
@@ -1022,10 +1188,25 @@ function selectionTypeFrom(node, kindHint = '') {
   return '';
 }
 
+function cloneSelectionRef(selection) {
+  const src = selection && typeof selection === 'object' ? selection : null;
+  if (!src) return null;
+  const id = String(src.id || '').trim();
+  if (!id) return null;
+  return {
+    id,
+    name: String(src.name || id),
+    path: String(src.path || ''),
+    kind: String(src.kind || ''),
+    type: String(src.type || '')
+  };
+}
+
 function updateSceneMotion(scene, ts) {
   if (!scene || !Number.isFinite(ts)) return;
   const nodes = Array.isArray(scene.nodes) ? scene.nodes : [];
   const links = Array.isArray(scene.links) ? scene.links : [];
+  const profile = state.quality_profile || QUALITY_PROFILES.low;
   const center = scene.center && typeof scene.center === 'object'
     ? scene.center
     : { x: state.width * 0.52, y: state.height * 0.5 };
@@ -1060,7 +1241,11 @@ function updateSceneMotion(scene, ts) {
     : (orbitLock.runtime_by_layer = Object.create(null));
   const advancedLayers = new Set();
   const prevTs = Number(scene.last_motion_ts || ts);
-  const dtMs = clamp(ts - prevTs, 0, 80);
+  const rawDtMs = clamp(ts - prevTs, 0, 80);
+  const smoothDtMs = clamp(Number(state.motion_dt_smoothed || rawDtMs || 16.7), 1, 80);
+  const motionDtBlend = clamp(Number(profile.motion_dt_blend || 0), 0, 0.95);
+  const dtMs = (rawDtMs * (1 - motionDtBlend)) + (smoothDtMs * motionDtBlend);
+  const spinSubsteps = clamp(Math.round(Number(profile.spin_substeps || 1)), 1, 8);
   scene.last_motion_ts = ts;
   const layerIntroScale = computeLayerIntroScale(scene, ts);
 
@@ -1128,17 +1313,30 @@ function updateSceneMotion(scene, ts) {
     if (!Number.isFinite(node.spin_runtime)) {
       node.spin_runtime = Number(node.spin_base || 0);
     }
+    if (!Number.isFinite(node.spin_target)) {
+      node.spin_target = Number(node.spin_runtime || node.spin_base || 0);
+    }
     const spinSpeed = Number(node.spin_speed || 0);
     const freezeSpin = selectedId && selectedId === String(node.id || '');
     let spinAngle = Number(node.spin_runtime || node.spin_base || 0);
     if (freezeSpin) {
       node.spin_locked = true;
       node.spin_lock_angle = spinAngle;
+      node.spin_target = spinAngle;
     } else if (spinSpeed !== 0) {
       node.spin_locked = false;
-      node.spin_runtime += dtMs * spinSpeed;
-      if (Math.abs(node.spin_runtime) > 1e6) {
-        node.spin_runtime = node.spin_runtime % (Math.PI * 2);
+      const spinLerpGain = clamp(Number(profile.spin_lerp_gain || 0.5), 0.08, 1);
+      const spinStepDt = dtMs / spinSubsteps;
+      for (let step = 0; step < spinSubsteps; step += 1) {
+        node.spin_target += spinStepDt * spinSpeed;
+        if (Math.abs(node.spin_target) > 1e6) {
+          node.spin_target = node.spin_target % (Math.PI * 2);
+        }
+        const spinAlpha = clamp((spinStepDt / 16.7) * spinLerpGain, 0.018, 1);
+        node.spin_runtime += (node.spin_target - node.spin_runtime) * spinAlpha;
+        if (Math.abs(node.spin_runtime) > 1e6) {
+          node.spin_runtime = node.spin_runtime % (Math.PI * 2);
+        }
       }
       spinAngle = Number(node.spin_runtime || 0);
     }
@@ -1910,12 +2108,51 @@ function computeSelectionFocus(scene, selectedId) {
   if (sid === SPINE_NODE_ID) {
     const focusNodes = new Set([sid]);
     const focusLinks = new Set();
-    for (const link of links) {
+    const spineDirectLinkIds = Array.isArray(linksByNode[sid]) ? linksByNode[sid] : [];
+    const selectedLinks = [];
+    for (const lid of spineDirectLinkIds) {
+      const link = linkById[lid];
+      if (link) selectedLinks.push(link);
+    }
+    if (!selectedLinks.length) {
+      // Fallback for datasets that do not emit explicit spine endpoints:
+      // use immediate ingress/egress + IO boundary links as inferred spine-adjacent flow.
+      for (const link of links) {
+        if (!link) continue;
+        const fromId = String(link.from_id || '');
+        const toId = String(link.to_id || '');
+        const fromNode = nodeById[fromId];
+        const toNode = nodeById[toId];
+        const fromType = String(fromNode && fromNode.type || '').toLowerCase();
+        const toType = String(toNode && toNode.type || '').toLowerCase();
+        const kind = String(link.kind || '').toLowerCase();
+        const touchesIo = fromType.startsWith('io_') || toType.startsWith('io_');
+        if (kind === 'ingress' || kind === 'egress' || touchesIo) {
+          selectedLinks.push(link);
+        }
+      }
+    }
+    if (!selectedLinks.length) {
+      // Last-resort compact view instead of opening full graph.
+      const ranked = links
+        .slice()
+        .sort((a, b) => {
+          const av = Number(a && a.activity || 0);
+          const bv = Number(b && b.activity || 0);
+          if (Math.abs(av - bv) > 0.0001) return bv - av;
+          return String(a && a.id || '').localeCompare(String(b && b.id || ''));
+        })
+        .slice(0, 12);
+      for (const link of ranked) {
+        if (link) selectedLinks.push(link);
+      }
+    }
+    for (const link of selectedLinks) {
       const lid = String(link && link.id || '').trim();
       if (!lid) continue;
       focusLinks.add(lid);
-      focusNodes.add(String(link.from_id || ''));
-      focusNodes.add(String(link.to_id || ''));
+      focusNodes.add(String(link && link.from_id || ''));
+      focusNodes.add(String(link && link.to_id || ''));
     }
     return { nodes: focusNodes, links: focusLinks };
   }
@@ -2045,6 +2282,7 @@ function setPayload(payload) {
     : { integrity: null };
   state.scene = buildScene(payload);
   if (state.scene) primeShellIntro(state.scene, performance.now());
+  clampCameraPanInPlace();
   applySelectionFocus(false);
   syncParticlePool(false);
   renderSelectionTag();
@@ -2653,6 +2891,20 @@ function drawParticles(dt) {
   }
 }
 
+function drawSelectionForeground(scene, ts) {
+  if (!scene || !scene.node_by_id) return;
+  const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selected && selected.id || '').trim();
+  if (!selectedId) return;
+  const node = scene.node_by_id[selectedId];
+  if (!node) return;
+  const selectedTypeHint = String(selected && selected.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String(node.type || '').toLowerCase();
+  if (selectedType === 'module' && String(node.type || '').toLowerCase() === 'module') {
+    drawModuleNode(node, ts);
+  }
+}
+
 function drawHoverPathLabel(scene) {
   const hover = state.hover;
   if (!scene || !hover) return;
@@ -2729,6 +2981,7 @@ function drawScene(ts) {
   for (const node of scene.io_nodes || []) drawIoNode(node, ts);
   drawLinks(scene);
   drawParticles(1 / Math.max(1, state.fps_smoothed));
+  drawSelectionForeground(scene, ts);
   ctx.restore();
   drawHoverPathLabel(scene);
 }
@@ -2742,6 +2995,40 @@ function describeLinkProcess(link) {
   if (kind === 'ingress') return 'Ingress path from external input';
   if (kind === 'egress') return 'Egress path to external output';
   return 'Cross-module process path';
+}
+
+function topRejectedGateRows(summary, limit = 5) {
+  const rows = [];
+  const src = summary && typeof summary === 'object' && Array.isArray(summary.top_rejected_gates)
+    ? summary.top_rejected_gates
+    : [];
+  for (const row of src) {
+    if (rows.length >= Math.max(1, Number(limit || 5))) break;
+    const gate = Array.isArray(row) ? String(row[0] || '').trim() : '';
+    const count = Array.isArray(row) ? Number(row[1] || 0) : 0;
+    if (!gate || !Number.isFinite(count) || count <= 0) continue;
+    rows.push([`Bottleneck/${gate}`, fmtNum(count)]);
+  }
+  if (!rows.length) rows.push(['Bottleneck/none', '0']);
+  return rows;
+}
+
+function blockedFlowStats(links) {
+  const rows = Array.isArray(links) ? links : [];
+  let blockedLinks = 0;
+  let maxRatio = 0;
+  for (const link of rows) {
+    if (!link || typeof link !== 'object') continue;
+    const ratio = clamp(Number(link.blocked_ratio || 0), 0, 1);
+    const blocked = link.flow_blocked === true || ratio > 0.02;
+    if (!blocked) continue;
+    blockedLinks += 1;
+    maxRatio = Math.max(maxRatio, ratio);
+  }
+  return {
+    blocked_links: blockedLinks,
+    max_blocked_ratio: maxRatio
+  };
 }
 
 function renderIncidentBanner() {
@@ -2885,14 +3172,19 @@ function renderStats() {
         return a.localeCompare(b);
       })
       .map((kind) => [`Process/${kind}`, fmtNum(processCounts[kind])]);
+    const blockStats = blockedFlowStats(scene.links);
+    const bottleneckRows = topRejectedGateRows(summary, 5);
     if (titleEl) titleEl.textContent = 'Preview Pane';
     rows = [
       ['Mode', 'System Process Overview'],
       ['Scope', 'All shells + children'],
       ['Total Links', fmtNum(scene.links.length)],
+      ['Blocked Links', fmtNum(blockStats.blocked_links)],
+      ['Max Block Ratio', `${fmtNum(blockStats.max_blocked_ratio * 100)}%`],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
+      ...bottleneckRows,
       ...processRows
     ];
     if (!processRows.length) rows.push(['Process/none', '0']);
@@ -2930,6 +3222,7 @@ function renderStats() {
         return a.localeCompare(b);
       })
       .map((kind) => [`Process/${kind}`, fmtNum(processCounts[kind])]);
+    const blockStats = blockedFlowStats(relevantLinks);
 
     if (titleEl) titleEl.textContent = 'Preview Pane';
     rows = [
@@ -2939,6 +3232,8 @@ function renderStats() {
       ['Modules', fmtNum(moduleIds.length)],
       ['Fractals', fmtNum(submoduleIds.length)],
       ['Total Child Links', fmtNum(relevantLinks.length)],
+      ['Blocked Links', fmtNum(blockStats.blocked_links)],
+      ['Max Block Ratio', `${fmtNum(blockStats.max_blocked_ratio * 100)}%`],
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
       ...processRows
@@ -2972,6 +3267,7 @@ function renderStats() {
         return a.localeCompare(b);
       })
       .map((kind) => [`Process/${kind}`, fmtNum(processCounts[kind])]);
+    const blockStats = blockedFlowStats(relevantLinks);
     if (titleEl) titleEl.textContent = 'Preview Pane';
     rows = [
       ['Mode', 'Module Process Overview'],
@@ -2979,6 +3275,8 @@ function renderStats() {
       ['Module Path', String(selectedNode.rel || moduleId)],
       ['Fractals', fmtNum(submoduleIds.length)],
       ['Total Child Links', fmtNum(relevantLinks.length)],
+      ['Blocked Links', fmtNum(blockStats.blocked_links)],
+      ['Max Block Ratio', `${fmtNum(blockStats.max_blocked_ratio * 100)}%`],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
@@ -3007,6 +3305,7 @@ function renderStats() {
         return a.localeCompare(b);
       })
       .map((kind) => [`Process/${kind}`, fmtNum(processCounts[kind])]);
+    const blockStats = blockedFlowStats(relevantLinks);
     if (titleEl) titleEl.textContent = 'Preview Pane';
     rows = [
       ['Mode', 'Fractal Process Overview'],
@@ -3015,6 +3314,8 @@ function renderStats() {
       ['Module', String((moduleNode && moduleNode.name) || moduleId || 'n/a')],
       ['Shell', String((layerNode && layerNode.name) || layerId || 'n/a')],
       ['Direct Links', fmtNum(relevantLinks.length)],
+      ['Blocked Links', fmtNum(blockStats.blocked_links)],
+      ['Max Block Ratio', `${fmtNum(blockStats.max_blocked_ratio * 100)}%`],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
@@ -3022,11 +3323,13 @@ function renderStats() {
     ];
     if (!processRows.length) rows.push(['Process/none', '0']);
   } else {
+    const bottleneckRows = topRejectedGateRows(summary, 5);
     if (titleEl) titleEl.textContent = 'Preview Pane';
     rows = [
       ['Mode', 'System Overview'],
       ['GPU Tier', gpuLabel],
       ['FPS', fmtNum(state.fps_smoothed)],
+      ['Motion Smoothness', `${fmtNum(clamp(state.motion_smoothness_ema, 0, 1) * 100)}%`],
       ['Run Events', fmtNum(summary.run_events)],
       ['Executed', fmtNum(summary.executed)],
       ['Shipped', fmtNum(summary.shipped)],
@@ -3035,7 +3338,8 @@ function renderStats() {
       ['Yield', `${fmtNum(Number(holoMetrics.yield_rate || 0) * 100)}%`],
       ['Drift Proxy', `${fmtNum(Number(holoMetrics.drift_proxy || 0) * 100)}%`],
       ['Layer Nodes', fmtNum(nodeCount)],
-      ['Links', fmtNum(linkCount)]
+      ['Links', fmtNum(linkCount)],
+      ...bottleneckRows
     ];
   }
   const integrityLabel = integrityIncident.active
@@ -3340,7 +3644,7 @@ function normalizeHitForCurrentLevel(scene, hit) {
       const parentId = String(node.parent_id || '');
       const parentNode = scene.node_by_id ? scene.node_by_id[parentId] : null;
       if (parentNode && String(parentNode.parent_id || '') === String(selectedNode.id || '')) {
-        return hitTargetFromNode(scene, parentId, 'circle') || hit;
+        return hitTargetFromNode(scene, String(node.id || ''), 'circle') || hit;
       }
       return mapToLayer();
     }
@@ -3388,7 +3692,14 @@ function isHitAllowedForCurrentLevel(scene, hit) {
     if (!shellZoomed) {
       return targetType === 'module' && String(targetNode.parent_id || '') === selectedLayerId;
     }
-    return targetType === 'module' && String(targetNode.parent_id || '') === selectedLayerId;
+    if (targetType === 'module') {
+      return String(targetNode.parent_id || '') === selectedLayerId;
+    }
+    if (targetType === 'submodule') {
+      const parentModule = scene.node_by_id ? scene.node_by_id[String(targetNode.parent_id || '')] : null;
+      return String(parentModule && parentModule.parent_id || '') === selectedLayerId;
+    }
+    return false;
   }
 
   if (selectedType === 'module') {
@@ -3425,6 +3736,7 @@ function onCanvasClick(evt) {
   const y = evt.clientY - rect.top;
   const scene = state.scene;
   const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedSnapshot = cloneSelectionRef(selectedRef);
   const selectedId = String(selectedRef && selectedRef.id || '').trim();
   const selectedNode = selectedId && scene && scene.node_by_id ? scene.node_by_id[selectedId] : null;
   const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
@@ -3467,6 +3779,43 @@ function onCanvasClick(evt) {
     return;
   }
   if (!hit && !linkHit && (selectedType === 'module' || selectedType === 'submodule')) {
+    const cam = state.camera;
+    const submoduleReturnSelection = cloneSelectionRef(cam.submodule_return_selection);
+    const hasSubmoduleReturn = (
+      selectedType === 'submodule'
+      && cam.focus_mode
+      && String(cam.focus_target_id || '') === selectedId
+      && submoduleReturnSelection
+      && String(cam.submodule_return_selection_for || '') === selectedId
+    );
+    if (hasSubmoduleReturn) {
+      restoreCameraFocus();
+      state.selected = submoduleReturnSelection;
+      state.selected_link = null;
+      clearModuleDepthReturns();
+      applySelectionFocus(true);
+      renderSelectionTag();
+      renderStats();
+      return;
+    }
+    const moduleReturnSelection = cloneSelectionRef(cam.module_return_selection);
+    const hasModuleReturn = (
+      selectedType === 'module'
+      && cam.focus_mode
+      && String(cam.focus_target_id || '') === selectedId
+      && moduleReturnSelection
+      && String(cam.module_return_selection_for || '') === selectedId
+    );
+    if (hasModuleReturn) {
+      restoreCameraFocus();
+      state.selected = moduleReturnSelection;
+      state.selected_link = null;
+      clearModuleDepthReturns();
+      applySelectionFocus(true);
+      renderSelectionTag();
+      renderStats();
+      return;
+    }
     let parentLayerId = '';
     if (selectedType === 'module') {
       parentLayerId = String(selectedNode && selectedNode.parent_id || '');
@@ -3488,6 +3837,7 @@ function onCanvasClick(evt) {
         type: 'layer'
       };
       state.selected_link = null;
+      clearModuleDepthReturns();
       zoomIntoLayer(parentLayerId);
       applySelectionFocus(true);
       renderSelectionTag();
@@ -3570,9 +3920,14 @@ function onCanvasClick(evt) {
       const parentId = String(node.parent_id || '').trim();
       const parentNode = scene && scene.node_by_id ? scene.node_by_id[parentId] : null;
       const selectedSubmoduleParentId = selectedNode ? String(selectedNode.parent_id || '') : '';
+      const selectedLayerId = selectedNode ? String(selectedNode.id || '') : '';
+      const layerZoomed = selectedType === 'layer' && isLayerFocusZoomed(scene, selectedLayerId);
       const allowDirectSubmodule = (
         (selectedType === 'module' && selectedId === parentId)
         || (selectedType === 'submodule' && selectedSubmoduleParentId === parentId)
+        || (layerZoomed
+          && parentNode
+          && String(parentNode.parent_id || '') === selectedLayerId)
       );
       if (!allowDirectSubmodule && parentNode) {
         targetId = parentId;
@@ -3629,14 +3984,30 @@ function onCanvasClick(evt) {
     }
     const selectedTypeFinal = String(state.selected && state.selected.type || '').toLowerCase();
     const cameFromModuleDepth = selectedType === 'module' || selectedType === 'submodule';
-    if (selectedTypeFinal === 'module' || selectedTypeFinal === 'submodule') {
-      centerOnSelectionNoZoom(String(state.selected.id || ''));
+    if (selectedTypeFinal === 'module') {
+      const originSelection = (selectedType === 'module' || selectedType === 'submodule')
+        ? null
+        : selectedSnapshot;
+      zoomIntoModule(String(state.selected.id || ''), originSelection);
+      state.camera.submodule_return_selection = null;
+      state.camera.submodule_return_selection_for = '';
+    } else if (selectedTypeFinal === 'submodule') {
+      const originSelection = selectedType === 'module' ? selectedSnapshot : null;
+      zoomIntoSubmodule(String(state.selected.id || ''), originSelection);
+      state.camera.module_return_selection = null;
+      state.camera.module_return_selection_for = '';
     } else if (selectedTypeFinal === 'layer') {
+      clearModuleDepthReturns();
       if (cameFromModuleDepth) {
         zoomIntoLayer(String(state.selected.id || ''));
       }
       clearMapMode();
+    } else if (selectedTypeFinal === 'system') {
+      clearModuleDepthReturns();
+      zoomToSystemRoot();
+      clearMapMode();
     } else {
+      clearModuleDepthReturns();
       clearMapMode();
     }
     state.selected_link = null;
@@ -3660,6 +4031,7 @@ function onCanvasClick(evt) {
     } else {
       state.selected = null;
       state.selected_link = null;
+      clearModuleDepthReturns();
       clearMapMode();
     }
   }
@@ -3713,9 +4085,24 @@ function updateHoverAtCanvasPoint(x, y) {
 
 function animate(ts) {
   syncCameraTransition(ts);
-  if (!state.last_frame_ts) state.last_frame_ts = ts;
-  const dtMs = Math.max(1, ts - state.last_frame_ts);
+  const hasFrameHistory = Number.isFinite(state.last_frame_ts) && state.last_frame_ts > 0;
+  const dtMs = hasFrameHistory ? clamp(ts - state.last_frame_ts, 1, 80) : 16.7;
   state.last_frame_ts = ts;
+  if (!state.motion_initialized) {
+    state.motion_initialized = true;
+    state.motion_frame_count = 1;
+    state.motion_dt_smoothed = dtMs;
+    state.motion_jitter_ema = 0;
+    state.motion_smoothness_ema = 1;
+  } else {
+    state.motion_frame_count += 1;
+    const warmupBlend = state.motion_frame_count < 18 ? 0.26 : 0.14;
+    state.motion_dt_smoothed = (state.motion_dt_smoothed * (1 - warmupBlend)) + (dtMs * warmupBlend);
+    const jitterSample = Math.abs(dtMs - state.motion_dt_smoothed) / Math.max(8, state.motion_dt_smoothed);
+    state.motion_jitter_ema = (state.motion_jitter_ema * 0.9) + (clamp(jitterSample, 0, 2.5) * 0.1);
+    const smoothFrame = clamp(1 - (state.motion_jitter_ema / 0.75), 0, 1);
+    state.motion_smoothness_ema = (state.motion_smoothness_ema * 0.88) + (smoothFrame * 0.12);
+  }
   state.fps = 1000 / dtMs;
   state.fps_smoothed = (state.fps_smoothed * 0.92) + (state.fps * 0.08);
   maybeAutoTuneQuality();
@@ -3766,6 +4153,14 @@ function clearMapMode() {
   const cam = state.camera;
   cam.map_mode = false;
   cam.map_owner_id = '';
+}
+
+function clearModuleDepthReturns() {
+  const cam = state.camera;
+  cam.module_return_selection = null;
+  cam.module_return_selection_for = '';
+  cam.submodule_return_selection = null;
+  cam.submodule_return_selection_for = '';
 }
 
 function centerOnSelectionNoZoom(nodeId) {
@@ -3842,6 +4237,33 @@ function zoomIntoLayer(layerId) {
   startCameraTransition(zoomTarget, panX, panY, 175);
   cam.focus_mode = true;
   cam.focus_target_id = id;
+  return true;
+}
+
+function zoomToSystemRoot() {
+  const scene = state.scene;
+  const bounds = sceneWorldBounds(scene);
+  if (!scene || !bounds) return false;
+  const cam = state.camera;
+  syncCameraTransition(performance.now());
+  const id = String(scene.system_id || SYSTEM_ROOT_ID);
+  if (!cam.focus_mode || String(cam.focus_target_id || '') !== id) {
+    cam.restore_zoom = cam.zoom;
+    cam.restore_pan_x = cam.pan_x;
+    cam.restore_pan_y = cam.pan_y;
+  }
+  const fill = 0.92;
+  const zoomX = (Math.max(1, state.width) * fill) / Math.max(1, Number(bounds.width || 1));
+  const zoomY = (Math.max(1, state.height) * fill) / Math.max(1, Number(bounds.height || 1));
+  let zoomTarget = Math.min(zoomX, zoomY);
+  if (!Number.isFinite(zoomTarget) || zoomTarget <= 0) return false;
+  zoomTarget = clamp(zoomTarget, cam.min_zoom, cam.max_zoom);
+  const panX = (state.width * 0.5) - (Number(bounds.cx || 0) * zoomTarget);
+  const panY = (state.height * 0.5) - (Number(bounds.cy || 0) * zoomTarget);
+  startCameraTransition(zoomTarget, panX, panY, 180);
+  cam.focus_mode = true;
+  cam.focus_target_id = id;
+  clearMapMode();
   return true;
 }
 
@@ -3983,43 +4405,82 @@ function exitMapModeToCenteredSelection() {
   return true;
 }
 
-function zoomIntoSubmodule(nodeId) {
+function submoduleVisualExtent(node) {
+  const n = node && typeof node === 'object' ? node : {};
+  const inner = Math.max(1, Number(n.shell_inner || (Number(n.radius || 2) * 2.2)));
+  const outer = Math.max(inner + 1, Number(n.shell_outer || (Number(n.radius || 2) * 3.1)));
+  const start = Number(n.shell_start || 0);
+  const end = Number(n.shell_end || (start + (Math.PI * 0.35)));
+  const span = Math.max(0.05, Math.abs(end - start));
+  const midR = (inner + outer) * 0.5;
+  const arcLength = span * midR;
+  const radialThickness = outer - inner;
+  const nodeDiameter = Math.max(2, Number(n.radius || 2) * 2.4);
+  return Math.max(3.5, nodeDiameter, radialThickness, arcLength);
+}
+
+function zoomIntoSubmodule(nodeId, originSelection = null) {
   const id = String(nodeId || '').trim();
   if (!id || !state.scene || !state.scene.node_by_id) return false;
   const node = state.scene.node_by_id[id];
   if (!node || String(node.type || '') !== 'submodule') return false;
   const cam = state.camera;
+  const origin = cloneSelectionRef(originSelection);
   if (!cam.focus_mode || String(cam.focus_target_id || '') !== id) {
     cam.restore_zoom = cam.zoom;
     cam.restore_pan_x = cam.pan_x;
     cam.restore_pan_y = cam.pan_y;
   }
-  const shellOuter = Math.max(6, Number(node.shell_outer || (Number(node.radius || 4) * 3.2)));
-  const zoomTarget = clamp(Math.max(2.1, 220 / (shellOuter * 2)), cam.min_zoom, cam.max_zoom);
-  cam.zoom = zoomTarget;
-  cam.pan_x = (state.width * 0.5) - (Number(node.x || 0) * zoomTarget);
-  cam.pan_y = (state.height * 0.5) - (Number(node.y || 0) * zoomTarget);
+  if (origin) {
+    cam.submodule_return_selection = origin;
+    cam.submodule_return_selection_for = id;
+  } else if (cam.submodule_return_selection && String(cam.submodule_return_selection.id || '').trim()) {
+    cam.submodule_return_selection_for = id;
+  } else {
+    cam.submodule_return_selection = null;
+    cam.submodule_return_selection_for = '';
+  }
+  const fractalExtent = submoduleVisualExtent(node);
+  const targetDiameter = Math.max(14, state.height * 0.05);
+  const desiredZoom = targetDiameter / Math.max(1, fractalExtent);
+  const zoomTarget = clamp(desiredZoom, cam.min_zoom, cam.max_zoom);
+  const panX = (state.width * 0.5) - (Number(node.x || 0) * zoomTarget);
+  const panY = (state.height * 0.5) - (Number(node.y || 0) * zoomTarget);
+  startCameraTransition(zoomTarget, panX, panY, 140, { allow_out_of_bounds: true });
   cam.focus_mode = true;
   cam.focus_target_id = id;
+  clearMapMode();
   return true;
 }
 
-function zoomIntoModule(nodeId) {
+function zoomIntoModule(nodeId, originSelection = null) {
   const id = String(nodeId || '').trim();
   if (!id || !state.scene || !state.scene.node_by_id) return false;
   const node = state.scene.node_by_id[id];
   if (!node || String(node.type || '') !== 'module') return false;
   const cam = state.camera;
+  const origin = cloneSelectionRef(originSelection);
   if (!cam.focus_mode || String(cam.focus_target_id || '') !== id) {
     cam.restore_zoom = cam.zoom;
     cam.restore_pan_x = cam.pan_x;
     cam.restore_pan_y = cam.pan_y;
   }
+  if (origin) {
+    cam.module_return_selection = origin;
+    cam.module_return_selection_for = id;
+  } else if (cam.module_return_selection && String(cam.module_return_selection.id || '').trim()) {
+    cam.module_return_selection_for = id;
+  } else {
+    cam.module_return_selection = null;
+    cam.module_return_selection_for = '';
+  }
   const radius = Math.max(8, Number(node.radius || 12));
-  const zoomTarget = clamp(Math.max(1.85, 210 / (radius * 2)), cam.min_zoom, cam.max_zoom);
-  cam.zoom = zoomTarget;
-  cam.pan_x = (state.width * 0.5) - (Number(node.x || 0) * zoomTarget);
-  cam.pan_y = (state.height * 0.5) - (Number(node.y || 0) * zoomTarget);
+  const targetDiameter = Math.max(56, state.height * 0.2);
+  const desiredZoom = targetDiameter / Math.max(2, radius * 2);
+  const zoomTarget = clamp(Math.max(1.08, desiredZoom), cam.min_zoom, cam.max_zoom);
+  const panX = (state.width * 0.5) - (Number(node.x || 0) * zoomTarget);
+  const panY = (state.height * 0.5) - (Number(node.y || 0) * zoomTarget);
+  startCameraTransition(zoomTarget, panX, panY, 160, { allow_out_of_bounds: true });
   cam.focus_mode = true;
   cam.focus_target_id = id;
   return true;
@@ -4058,6 +4519,7 @@ function onCanvasMouseMove(evt) {
     cam.last_y = evt.clientY;
     cam.pan_x += dx;
     cam.pan_y += dy;
+    clampCameraPanInPlace();
     cam.drag_px += Math.abs(dx) + Math.abs(dy);
     state.hover = null;
     return;
@@ -4107,7 +4569,9 @@ function boot() {
   state.canvas.addEventListener('contextmenu', (evt) => evt.preventDefault());
   window.addEventListener('resize', () => {
     resizeCanvas();
+    clampCameraPanInPlace();
     state.scene = buildScene(state.payload);
+    clampCameraPanInPlace();
     applySelectionFocus(false);
     syncParticlePool(true);
   });
