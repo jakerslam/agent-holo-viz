@@ -87,6 +87,9 @@ const state = {
   spine_event_count: 0,
   spine_event_top: '',
   spine_burst_until: 0,
+  incidents: {
+    integrity: null
+  },
   orbit_lock: {
     layer_id: '',
     runtime_by_layer: Object.create(null)
@@ -117,6 +120,12 @@ const state = {
     restore_zoom: 1,
     restore_pan_x: 0,
     restore_pan_y: 0,
+    map_mode: false,
+    map_owner_id: '',
+    map_return_zoom: 1,
+    map_return_pan_x: 0,
+    map_return_pan_y: 0,
+    transition: null,
     panning: false,
     drag_px: 0,
     last_x: 0,
@@ -154,6 +163,68 @@ function easeOutCubic(v) {
   return 1 - Math.pow(1 - t, 3);
 }
 
+function syncCameraTransition(ts = performance.now()) {
+  const cam = state.camera;
+  const tr = cam.transition && typeof cam.transition === 'object' ? cam.transition : null;
+  if (!tr) return;
+  const startTs = Number(tr.start_ts || ts);
+  const durationMs = Math.max(1, Number(tr.duration_ms || 1));
+  const p = clamp((Number(ts || startTs) - startTs) / durationMs, 0, 1);
+  const e = easeOutCubic(p);
+  const fromZoom = Number(tr.from_zoom || cam.zoom);
+  const fromPanX = Number(tr.from_pan_x || cam.pan_x);
+  const fromPanY = Number(tr.from_pan_y || cam.pan_y);
+  const toZoom = Number(tr.to_zoom || fromZoom);
+  const toPanX = Number(tr.to_pan_x || fromPanX);
+  const toPanY = Number(tr.to_pan_y || fromPanY);
+  cam.zoom = mix(fromZoom, toZoom, e);
+  cam.pan_x = mix(fromPanX, toPanX, e);
+  cam.pan_y = mix(fromPanY, toPanY, e);
+  if (p >= 1) {
+    cam.zoom = toZoom;
+    cam.pan_x = toPanX;
+    cam.pan_y = toPanY;
+    cam.transition = null;
+  }
+}
+
+function stopCameraTransition() {
+  syncCameraTransition(performance.now());
+  state.camera.transition = null;
+}
+
+function startCameraTransition(targetZoom, targetPanX, targetPanY, durationMs = 170) {
+  const cam = state.camera;
+  syncCameraTransition(performance.now());
+  const toZoom = clamp(Number(targetZoom), cam.min_zoom, cam.max_zoom);
+  const toPanX = Number(targetPanX);
+  const toPanY = Number(targetPanY);
+  if (!Number.isFinite(toZoom) || !Number.isFinite(toPanX) || !Number.isFinite(toPanY)) return;
+  const fromZoom = Number(cam.zoom || 1);
+  const fromPanX = Number(cam.pan_x || 0);
+  const fromPanY = Number(cam.pan_y || 0);
+  const dist = Math.hypot(toPanX - fromPanX, toPanY - fromPanY);
+  const zoomDelta = Math.abs(toZoom - fromZoom);
+  const dur = Math.max(1, Number(durationMs || 1));
+  if (dur <= 1 || (dist < 0.8 && zoomDelta < 0.0009)) {
+    cam.zoom = toZoom;
+    cam.pan_x = toPanX;
+    cam.pan_y = toPanY;
+    cam.transition = null;
+    return;
+  }
+  cam.transition = {
+    start_ts: performance.now(),
+    duration_ms: dur,
+    from_zoom: fromZoom,
+    from_pan_x: fromPanX,
+    from_pan_y: fromPanY,
+    to_zoom: toZoom,
+    to_pan_x: toPanX,
+    to_pan_y: toPanY
+  };
+}
+
 function activityRgb(activity) {
   const t = clamp(activity, 0, 1);
   return {
@@ -175,6 +246,10 @@ function colorFromActivityBright(activity, alpha = 1, amount = 0.12) {
   const g = Math.round(mix(bg, 255, boost));
   const b = Math.round(mix(bb, 255, boost));
   return `rgba(${r},${g},${b},${clamp(alpha, 0, 1)})`;
+}
+
+function softHighlightColor(alpha = 1) {
+  return `rgba(236,242,246,${clamp(alpha, 0, 1)})`;
 }
 
 function brightenChannel(value, amount = 0.12) {
@@ -423,6 +498,7 @@ function screenToWorld(x, y) {
 
 function setZoomAt(screenX, screenY, nextZoom) {
   const cam = state.camera;
+  stopCameraTransition();
   const prevZoom = cam.zoom;
   const target = clamp(nextZoom, cam.min_zoom, cam.max_zoom);
   if (Math.abs(target - prevZoom) < 0.0005) return;
@@ -481,12 +557,14 @@ function applySnapshotMessage(msg) {
   if (!msg || typeof msg !== 'object') return;
   const summary = msg.summary && typeof msg.summary === 'object' ? msg.summary : null;
   const holo = msg.holo && typeof msg.holo === 'object' ? msg.holo : null;
+  const incidents = msg.incidents && typeof msg.incidents === 'object' ? msg.incidents : {};
   if (summary && holo) {
     setPayload({
       ok: true,
       generated_at: msg.generated_at || new Date().toISOString(),
       summary,
-      holo
+      holo,
+      incidents
     });
   }
   applySpinePulse(msg.spine_pulse || null);
@@ -605,6 +683,22 @@ function computeNodeErrorHint(...parts) {
   return clamp(score, 0, 1);
 }
 
+function hasActiveErrorState(rawNode, errorHint = 0, errorSignal = 0) {
+  const row = rawNode && typeof rawNode === 'object' ? rawNode : {};
+  const explicit = Boolean(
+    row.error_state === true
+    || row.error_active === true
+    || row.has_error === true
+    || row.error === true
+  );
+  if (explicit) return true;
+  const status = String(row.status || row.state || '').toLowerCase();
+  if (/(error|failed|failure|panic|exception|fault|degraded)/.test(status)) return true;
+  const hint = clamp(Number(errorHint || 0), 0, 1);
+  const signal = clamp(Number(errorSignal || 0), 0, 1);
+  return hint * signal >= 0.16;
+}
+
 function computeErrorSignal(summary) {
   const s = summary && typeof summary === 'object' ? summary : {};
   const runEvents = Math.max(1, Number(s.run_events || 0));
@@ -622,6 +716,217 @@ function computeErrorSignal(summary) {
   }
   const gatePressure = gateTotal / (runEvents * 4.5);
   return clamp((basePressure * 0.78) + (gatePressure * 0.22), 0, 1);
+}
+
+function asStringArray(rows, limit = 12) {
+  const src = Array.isArray(rows) ? rows : [];
+  const out = [];
+  for (const row of src) {
+    if (out.length >= limit) break;
+    const value = String(row || '').trim();
+    if (!value) continue;
+    out.push(value);
+  }
+  return out;
+}
+
+function normalizeIntegrityIncident(payload) {
+  const root = payload && typeof payload === 'object' ? payload : {};
+  const summary = root.summary && typeof root.summary === 'object' ? root.summary : {};
+  const incidents = root.incidents && typeof root.incidents === 'object' ? root.incidents : {};
+  const integrity = incidents.integrity && typeof incidents.integrity === 'object'
+    ? incidents.integrity
+    : {};
+  const holoMetrics = root.holo && root.holo.metrics && typeof root.holo.metrics === 'object'
+    ? root.holo.metrics
+    : {};
+  const active = (
+    integrity.active_alert === true
+    || summary.integrity_active_alert === true
+    || Number(holoMetrics.integrity_alert || 0) > 0
+  );
+  const violationTotal = Math.max(
+    0,
+    Number(
+      integrity.violation_total
+      || summary.integrity_violation_total
+      || 0
+    ) || 0
+  );
+  const severityRaw = String(
+    integrity.severity
+    || summary.integrity_severity
+    || holoMetrics.integrity_severity
+    || (active ? 'critical' : 'ok')
+  ).trim().toLowerCase();
+  const severity = severityRaw || (active ? 'critical' : 'ok');
+  const violationsRaw = Array.isArray(integrity.violations) ? integrity.violations : [];
+  const violations = [];
+  for (const row of violationsRaw) {
+    const file = String(row && row.file || '').trim();
+    const type = String(row && row.type || 'unknown').trim() || 'unknown';
+    const detail = String(row && row.detail || '').trim();
+    if (!file) continue;
+    violations.push({
+      file,
+      type,
+      detail: detail ? detail.slice(0, 180) : ''
+    });
+    if (violations.length >= 16) break;
+  }
+  if (!violations.length) {
+    const fallbackFiles = asStringArray(
+      integrity.top_files
+      || summary.integrity_top_files
+      || [],
+      16
+    );
+    for (const file of fallbackFiles) {
+      violations.push({ file, type: 'hash_mismatch', detail: '' });
+    }
+  }
+  return {
+    active,
+    severity,
+    violation_total: violationTotal,
+    top_files: asStringArray(
+      integrity.top_files
+      || summary.integrity_top_files
+      || []
+    ),
+    last_violation_ts: String(
+      integrity.last_violation_ts
+      || summary.integrity_last_violation_ts
+      || ''
+    ).trim(),
+    last_reseal_ts: String(
+      integrity.last_reseal_ts
+      || summary.integrity_last_reseal_ts
+      || ''
+    ).trim(),
+    policy_path: String(integrity.policy_path || summary.integrity_policy_path || '').trim(),
+    policy_version: String(integrity.policy_version || summary.integrity_policy_version || '').trim(),
+    violations
+  };
+}
+
+function hasIntegrityPathMatch(relPath, files) {
+  const rel = String(relPath || '').trim().toLowerCase();
+  if (!rel) return false;
+  const rows = Array.isArray(files) ? files : [];
+  for (const fileRow of rows) {
+    const file = String(fileRow || '').trim().toLowerCase();
+    if (!file) continue;
+    if (file === rel) return true;
+    if (file.startsWith(`${rel}/`)) return true;
+    if (rel.startsWith(`${file}/`)) return true;
+  }
+  return false;
+}
+
+function integrityRowsForSelection(incident, selectedType, selectedNode) {
+  const out = [];
+  const alert = incident && typeof incident === 'object' ? incident : {};
+  if (alert.active !== true) return out;
+  const type = String(selectedType || '').toLowerCase();
+  const node = selectedNode && typeof selectedNode === 'object' ? selectedNode : null;
+  const allRows = Array.isArray(alert.violations) ? alert.violations : [];
+  let matched = [];
+
+  if (type === 'spine' || type === 'system') {
+    matched = allRows.slice(0, 6);
+  } else if (node) {
+    const rel = String(node.rel || '').trim();
+    if (rel) {
+      matched = allRows.filter((row) => hasIntegrityPathMatch(rel, [String(row && row.file || '')]));
+    }
+    matched = matched.slice(0, 6);
+  }
+
+  if (!matched.length) {
+    if (type === 'spine' || type === 'system') {
+      out.push(['Integrity Errors', 'No mapped errors for selection']);
+      return out;
+    }
+    const nodeHasLocalAlert = !!(node && (node.error_state_active === true || node.integrity_alert === true));
+    if (nodeHasLocalAlert) {
+      out.push(['Integrity Errors', 'Local alert active (file mapping unavailable)']);
+    }
+    return out;
+  }
+
+  out.push(['Integrity Errors', `${fmtNum(matched.length)} mapped`]);
+  for (let i = 0; i < matched.length; i += 1) {
+    const row = matched[i];
+    const file = String(row && row.file || '').trim();
+    const vType = String(row && row.type || 'violation').trim();
+    const detail = String(row && row.detail || '').trim();
+    const value = detail
+      ? `${vType}: ${file} (${detail})`
+      : `${vType}: ${file}`;
+    out.push([`Error ${i + 1}`, value]);
+  }
+  return out;
+}
+
+function isPreviewErrorRow(key) {
+  const k = String(key || '').trim();
+  if (!k) return false;
+  if (k === 'Integrity Errors') return true;
+  if (/^Error\s+\d+$/i.test(k)) return true;
+  return false;
+}
+
+function normalizeChangeState(raw) {
+  const row = raw && typeof raw === 'object' ? raw : {};
+  const topFiles = Array.isArray(row.top_files)
+    ? row.top_files.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 10)
+    : [];
+  const activeWrite = row.active_write === true;
+  const dirty = row.dirty === true;
+  const staged = row.staged === true;
+  const pendingPush = row.pending_push === true;
+  const justPushed = row.just_pushed === true;
+  const changed = row.changed === true || activeWrite || dirty || staged || pendingPush || justPushed;
+  return {
+    active_write: activeWrite,
+    dirty,
+    staged,
+    pending_push: pendingPush,
+    just_pushed: justPushed,
+    changed,
+    file_count: Math.max(0, Number(row.file_count || topFiles.length || 0) || 0),
+    dirty_file_count: Math.max(0, Number(row.dirty_file_count || 0) || 0),
+    staged_file_count: Math.max(0, Number(row.staged_file_count || 0) || 0),
+    pending_push_file_count: Math.max(0, Number(row.pending_push_file_count || 0) || 0),
+    active_write_file_count: Math.max(0, Number(row.active_write_file_count || 0) || 0),
+    top_files: topFiles,
+    last_push_ts: String(row.last_push_ts || '').trim()
+  };
+}
+
+function changeStateLabel(change) {
+  const c = normalizeChangeState(change);
+  const flags = [];
+  if (c.active_write) flags.push('mutating');
+  if (c.dirty) flags.push('dirty');
+  if (c.staged) flags.push('staged');
+  if (c.pending_push) flags.push('pending_push');
+  if (c.just_pushed) flags.push('just_pushed');
+  return flags.length ? flags.join(', ') : 'none';
+}
+
+function changeRowsForSelection(change, selectedType, selectedNode) {
+  const rows = [];
+  const c = normalizeChangeState(change);
+  if (!c.changed && !c.just_pushed) return rows;
+  const type = String(selectedType || '').toLowerCase();
+  if (type !== 'module' && type !== 'submodule' && type !== 'spine' && type !== 'system') return rows;
+  rows.push(['Change State', changeStateLabel(c)]);
+  if (c.file_count > 0) rows.push(['Changed Files', fmtNum(c.file_count)]);
+  if (c.top_files.length) rows.push(['Change Paths', c.top_files.slice(0, 3).join(' | ')]);
+  if (c.last_push_ts) rows.push(['Last Push', new Date(c.last_push_ts).toLocaleString()]);
+  return rows;
 }
 
 function updateHitTargetCircle(scene, id, x, y, radius) {
@@ -804,6 +1109,45 @@ function buildScene(payload) {
   if (!holo) return null;
   const summary = payload && payload.summary && typeof payload.summary === 'object' ? payload.summary : {};
   const errorSignal = computeErrorSignal(summary);
+  const integrity = normalizeIntegrityIncident(payload);
+  const integrityAlert = integrity.active === true;
+  const integrityFiles = Array.isArray(integrity.top_files) ? integrity.top_files : [];
+  const changeSummaryRaw = holo && holo.change && typeof holo.change === 'object' ? holo.change : {};
+  const changeSummary = {
+    dirty_files_total: Math.max(0, Number(changeSummaryRaw.dirty_files_total || 0) || 0),
+    staged_files_total: Math.max(0, Number(changeSummaryRaw.staged_files_total || 0) || 0),
+    pending_push_files_total: Math.max(0, Number(changeSummaryRaw.pending_push_files_total || 0) || 0),
+    active_write_files_total: Math.max(0, Number(changeSummaryRaw.active_write_files_total || 0) || 0),
+    active_modules: Math.max(0, Number(changeSummaryRaw.active_modules || 0) || 0),
+    active_submodules: Math.max(0, Number(changeSummaryRaw.active_submodules || 0) || 0),
+    ahead_count: Math.max(0, Number(changeSummaryRaw.ahead_count || 0) || 0),
+    pending_push: changeSummaryRaw.pending_push === true,
+    just_pushed: changeSummaryRaw.just_pushed === true,
+    top_files: Array.isArray(changeSummaryRaw.top_files)
+      ? changeSummaryRaw.top_files.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 10)
+      : [],
+    has_upstream: changeSummaryRaw.has_upstream === true,
+    upstream: String(changeSummaryRaw.upstream || '').trim(),
+    last_push_ts: String(changeSummaryRaw.last_push_ts || '').trim(),
+    last_commit_ts: String(changeSummaryRaw.last_commit_ts || '').trim()
+  };
+  const spineChangeState = normalizeChangeState({
+    active_write: changeSummary.active_write_files_total > 0,
+    dirty: changeSummary.dirty_files_total > 0,
+    staged: changeSummary.staged_files_total > 0,
+    pending_push: changeSummary.pending_push === true || changeSummary.ahead_count > 0,
+    just_pushed: changeSummary.just_pushed === true,
+    changed: (changeSummary.active_write_files_total + changeSummary.dirty_files_total + changeSummary.staged_files_total) > 0
+      || changeSummary.pending_push === true
+      || changeSummary.just_pushed === true,
+    file_count: changeSummary.top_files.length,
+    dirty_file_count: changeSummary.dirty_files_total,
+    staged_file_count: changeSummary.staged_files_total,
+    pending_push_file_count: changeSummary.pending_push_files_total,
+    active_write_file_count: changeSummary.active_write_files_total,
+    top_files: changeSummary.top_files,
+    last_push_ts: changeSummary.last_push_ts
+  });
   const profile = state.quality_profile;
   const layersRaw = Array.isArray(holo.layers) ? holo.layers : [];
   const layerPriorityBase = {
@@ -910,7 +1254,12 @@ function buildScene(payload) {
     y: center.y,
     radius: 15,
     activity: clamp(holo.metrics && holo.metrics.drift_proxy, 0, 1),
-    error_hint: 0.1
+    error_hint: 0.1,
+    integrity_alert: integrityAlert,
+    integrity_severity: integrity.severity,
+    error_state_active: integrityAlert,
+    change_state: spineChangeState,
+    change_active: spineChangeState.changed === true
   };
   nodes.push(spineNode);
   nodeById[spineNode.id] = spineNode;
@@ -924,7 +1273,11 @@ function buildScene(payload) {
     x: center.x,
     y: center.y,
     radius: outerRadius,
-    activity: 0.5
+    activity: 0.5,
+    integrity_alert: integrityAlert,
+    integrity_severity: integrity.severity,
+    change_state: spineChangeState,
+    change_active: spineChangeState.changed === true
   };
   nodes.push(systemNode);
   nodeById[systemNode.id] = systemNode;
@@ -1009,19 +1362,25 @@ function buildScene(payload) {
     const layerRadius = Number(plannedRadii[li] || (minRing + (li * nominalRingStep)));
     const layerId = String(layer.id || `layer:${li}`);
     const layerRel = String(layer.rel || layer.key || layerId);
+    const layerKey = String(layer.key || layer.name || layerRel || '').trim().toLowerCase();
     const layerOrbitDirection = (li % 2 === 0) ? 1 : -1;
     const layerOrbitSpeed = layerOrbitDirection * (0.000018 + (li * 0.000001));
+    const layerIntegrityAlert = integrityAlert && (layerKey === 'systems' || layerRel.toLowerCase().includes('systems'));
     const layerNode = {
       id: layerId,
       type: 'layer',
       name: String(layer.name || layer.key || layerId),
       rel: layerRel,
+      key: layerKey,
       x: center.x,
       y: center.y,
       radius: layerRadius,
       ring_width: Math.max(13, nominalRingStep * 0.5),
       activity: clamp(layer.activity, 0, 1),
-      error_hint: computeNodeErrorHint(layerId, layerRel, layer.name, layer.key)
+      error_hint: computeNodeErrorHint(layerId, layerRel, layer.name, layer.key),
+      integrity_alert: layerIntegrityAlert,
+      integrity_severity: integrity.severity,
+      error_state_active: layerIntegrityAlert
     };
     nodes.push(layerNode);
     nodeById[layerNode.id] = layerNode;
@@ -1049,6 +1408,8 @@ function buildScene(payload) {
       const y = center.y + (Math.sin(angle) * layerRadius);
       const modId = String(mod.id || `${layerId}/m${mi}`);
       const modRel = String(mod.rel || `${layerRel}/${String(mod.name || modId)}`);
+      const moduleIntegrityAlert = integrityAlert && hasIntegrityPathMatch(modRel, integrityFiles);
+      const moduleChangeState = normalizeChangeState(mod && mod.change_state);
       const spinSeed = (stableHash(`${modId}|spin`) % 1000) / 1000;
       const spinBase = (stableHash(`${modId}|spinbase`) % 6283) / 1000;
       const moduleNode = {
@@ -1072,7 +1433,12 @@ function buildScene(payload) {
         fractal_count: modRow.fractal_count,
         child_ids: [],
         activity: clamp(mod.activity, 0, 1),
-        error_hint: computeNodeErrorHint(modId, modRel, mod.name, layerNode.name)
+        error_hint: computeNodeErrorHint(modId, modRel, mod.name, layerNode.name),
+        integrity_alert: moduleIntegrityAlert,
+        integrity_severity: integrity.severity,
+        error_state_active: moduleIntegrityAlert,
+        change_state: moduleChangeState,
+        change_active: moduleChangeState.changed === true
       };
       nodes.push(moduleNode);
       nodeById[moduleNode.id] = moduleNode;
@@ -1100,6 +1466,10 @@ function buildScene(payload) {
         const sy = y + (Math.sin(mid) * shellMid);
         const subId = String(sub.id || `${modId}/s${si}`);
         const subRel = String(sub.rel || `${modRel}/${String(sub.name || subId)}`);
+        const subErrorHint = computeNodeErrorHint(subId, subRel, sub.name, moduleNode.name);
+        const subIntegrityAlert = integrityAlert && hasIntegrityPathMatch(subRel, integrityFiles);
+        const subErrorActive = subIntegrityAlert || hasActiveErrorState(sub, subErrorHint, errorSignal);
+        const subChangeState = normalizeChangeState(sub && sub.change_state);
         const subNode = {
           id: subId,
           parent_id: modId,
@@ -1119,7 +1489,12 @@ function buildScene(payload) {
           shell_start: start,
           shell_end: end,
           activity: clamp(sub.activity, 0, 1),
-          error_hint: computeNodeErrorHint(subId, subRel, sub.name, moduleNode.name)
+          error_hint: subErrorHint,
+          error_state_active: subErrorActive,
+          integrity_alert: subIntegrityAlert,
+          integrity_severity: integrity.severity,
+          change_state: subChangeState,
+          change_active: subChangeState.changed === true
         };
         nodes.push(subNode);
         nodeById[subNode.id] = subNode;
@@ -1232,9 +1607,20 @@ function buildScene(payload) {
     const endpointHint = Math.max(fromHint, toHint);
     const kindHint = (kind === 'ingress' || kind === 'egress') ? 0.18 : 0;
     const channelHint = Math.max(endpointHint, kindHint);
+    const integrityPathAlert = integrityAlert && (
+      from.error_state_active === true
+      || to.error_state_active === true
+      || from.integrity_alert === true
+      || to.integrity_alert === true
+      || hasIntegrityPathMatch(String(from.rel || ''), integrityFiles)
+      || hasIntegrityPathMatch(String(to.rel || ''), integrityFiles)
+    );
     link.error_weight = channelHint > 0
       ? clamp(errorSignal * channelHint * (0.7 + (link.activity * 0.3)), 0, 1)
       : 0;
+    if (integrityPathAlert) {
+      link.error_weight = Math.max(link.error_weight, clamp(0.52 + (link.activity * 0.38), 0.52, 0.95));
+    }
     setLinkGeometry(link, from, to, center);
     linkRows.push(link);
     linkById[link.id] = link;
@@ -1261,7 +1647,12 @@ function buildScene(payload) {
     outer_shell_boundary: Math.max(outerShellBoundary, 0),
     summary,
     error_signal: errorSignal,
-    metrics: holo.metrics && typeof holo.metrics === 'object' ? holo.metrics : {}
+    metrics: holo.metrics && typeof holo.metrics === 'object' ? holo.metrics : {},
+    change_summary: changeSummary,
+    integrity_alert: integrityAlert,
+    integrity_severity: integrity.severity,
+    integrity_violation_total: Number(integrity.violation_total || 0),
+    integrity_top_files: integrityFiles
   };
 }
 
@@ -1479,6 +1870,9 @@ function applySelectionFocus(rebuild = true) {
 
 function setPayload(payload) {
   state.payload = payload;
+  state.incidents = payload && payload.incidents && typeof payload.incidents === 'object'
+    ? payload.incidents
+    : { integrity: null };
   state.scene = buildScene(payload);
   if (state.scene) primeShellIntro(state.scene, performance.now());
   applySelectionFocus(false);
@@ -1516,6 +1910,23 @@ function drawBackground(ts) {
     ctx.stroke();
   }
   ctx.restore();
+
+  const integrityIncident = normalizeIntegrityIncident(state.payload);
+  if (integrityIncident.active) {
+    const alpha = 0.08 + (Math.sin(ts * 0.0032) * 0.025);
+    const pulseGrad = ctx.createRadialGradient(
+      state.width * 0.52,
+      state.height * 0.5,
+      state.height * 0.08,
+      state.width * 0.52,
+      state.height * 0.5,
+      state.height * 0.7
+    );
+    pulseGrad.addColorStop(0, `rgba(255,82,82,${clamp(alpha * 1.6, 0.06, 0.24)})`);
+    pulseGrad.addColorStop(1, 'rgba(255,82,82,0)');
+    ctx.fillStyle = pulseGrad;
+    ctx.fillRect(0, 0, state.width, state.height);
+  }
 }
 
 function drawLayerRing(layerNode, ts) {
@@ -1529,13 +1940,18 @@ function drawLayerRing(layerNode, ts) {
   const introScale = clamp(Number(layerNode.intro_scale == null ? 1 : layerNode.intro_scale), 0, 1);
   const baseRadius = Number(layerNode.render_radius || layerNode.radius || 0);
   if (baseRadius <= 0.5) return;
+  const integrityAlert = layerNode && (layerNode.integrity_alert === true || layerNode.error_state_active === true);
   const jitter = Math.sin(ts * 0.00035 + layerNode.radius * 0.02) * 1.5 * introScale;
   const radius = Math.max(0.2, baseRadius + jitter);
   const alphaScale = 0.25 + (introScale * 0.75);
   const primaryAlpha = (0.2 + (layerNode.activity * 0.22)) * alphaScale;
   const secondaryAlpha = 0.11;
+  const integrityPrimary = `rgba(255,82,82,${clamp(0.28 + (primaryAlpha * 0.92), 0.2, 0.92)})`;
+  const integritySecondary = `rgba(255,112,112,${clamp(0.2 + (secondaryAlpha * 1.25), 0.16, 0.84)})`;
   const stroke = isSelected
-    ? colorFromActivityBright(layerNode.activity, primaryAlpha + 0.09, 0.18)
+    ? softHighlightColor(Math.min(0.92, primaryAlpha + 0.11))
+    : integrityAlert
+      ? integrityPrimary
     : colorFromActivity(layerNode.activity, primaryAlpha);
   ctx.strokeStyle = stroke;
   ctx.lineWidth = Math.max(0.8, layerNode.ring_width * 0.08 * (0.32 + (introScale * 0.68)));
@@ -1544,7 +1960,9 @@ function drawLayerRing(layerNode, ts) {
   ctx.stroke();
 
   ctx.strokeStyle = isSelected
-    ? colorFromActivityBright(layerNode.activity, secondaryAlpha + 0.1, 0.2)
+    ? softHighlightColor(Math.min(0.8, secondaryAlpha + 0.22))
+    : integrityAlert
+      ? integritySecondary
     : colorFromActivity(layerNode.activity, secondaryAlpha);
   ctx.lineWidth = Math.max(0.7, layerNode.ring_width * 0.03 * (0.35 + (introScale * 0.65)));
   for (let i = 0; i < 24; i += 1) {
@@ -1567,20 +1985,58 @@ function drawSpineHub(scene, ts) {
     && (!selectedType || selectedType === 'spine');
   const pulse = 1 + (Math.sin(ts * 0.00125) * 0.08);
   const drift = clamp(Number(scene.metrics && scene.metrics.drift_proxy || 0), 0, 1);
+  const integrityAlert = scene && (
+    scene.integrity_alert === true
+    || Number(scene.metrics && scene.metrics.integrity_alert || 0) > 0
+  );
   const base = 13 * pulse;
-  ctx.strokeStyle = spineSelected
+  const normalPrimary = spineSelected
     ? `rgba(${brightenChannel(110, 0.2)},${brightenChannel(203, 0.2)},${brightenChannel(255, 0.2)},0.86)`
     : 'rgba(110, 203, 255, 0.72)';
+  const normalSecondary = spineSelected
+    ? `rgba(${brightenChannel(110, 0.22)},${brightenChannel(203, 0.22)},${brightenChannel(255, 0.22)},0.5)`
+    : 'rgba(110, 203, 255, 0.34)';
+  const alertPrimary = spineSelected ? 'rgba(255,236,236,0.9)' : 'rgba(255,86,86,0.86)';
+  const alertSecondary = spineSelected ? 'rgba(255,226,226,0.58)' : 'rgba(255,104,104,0.46)';
+  ctx.strokeStyle = integrityAlert ? alertPrimary : normalPrimary;
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(c.x, c.y, base, 0, Math.PI * 2);
   ctx.stroke();
-  ctx.strokeStyle = spineSelected
-    ? `rgba(${brightenChannel(110, 0.22)},${brightenChannel(203, 0.22)},${brightenChannel(255, 0.22)},0.5)`
-    : 'rgba(110, 203, 255, 0.34)';
+  ctx.strokeStyle = integrityAlert ? alertSecondary : normalSecondary;
   ctx.beginPath();
   ctx.arc(c.x, c.y, base + 7, 0, Math.PI * 2);
   ctx.stroke();
+  if (integrityAlert) {
+    const alarmPulse = 0.32 + (0.16 * (0.5 + Math.sin(ts * 0.004)));
+    ctx.fillStyle = `rgba(255,76,76,${alarmPulse})`;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, base + 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  drawNodeChangeIndicator({
+    id: SPINE_NODE_ID,
+    x: c.x,
+    y: c.y,
+    radius: base + 1.4,
+    change_state: scene && scene.change_summary && typeof scene.change_summary === 'object'
+      ? {
+          active_write: Number(scene.change_summary.active_write_files_total || 0) > 0,
+          dirty: Number(scene.change_summary.dirty_files_total || 0) > 0,
+          staged: Number(scene.change_summary.staged_files_total || 0) > 0,
+          pending_push: scene.change_summary.pending_push === true || Number(scene.change_summary.ahead_count || 0) > 0,
+          just_pushed: scene.change_summary.just_pushed === true,
+          changed: Number(scene.change_summary.active_write_files_total || 0) > 0
+            || Number(scene.change_summary.dirty_files_total || 0) > 0
+            || Number(scene.change_summary.staged_files_total || 0) > 0
+            || scene.change_summary.pending_push === true
+            || scene.change_summary.just_pushed === true,
+          file_count: Number(scene.change_summary.top_files && scene.change_summary.top_files.length || 0),
+          top_files: Array.isArray(scene.change_summary.top_files) ? scene.change_summary.top_files : [],
+          last_push_ts: String(scene.change_summary.last_push_ts || '')
+        }
+      : {}
+  }, ts, 1.05);
   if (drift > 0.02) {
     ctx.fillStyle = `rgba(255, 90, 64, ${0.08 + (drift * 0.2)})`;
     ctx.beginPath();
@@ -1615,6 +2071,66 @@ function drawDriftOverlay(scene, ts) {
   }
 }
 
+function drawNodeChangeIndicator(node, ts, baseScale = 1) {
+  const ctx = state.ctx;
+  const n = node && typeof node === 'object' ? node : {};
+  const change = normalizeChangeState(n.change_state);
+  if (!change.changed && !change.just_pushed) return;
+  const x = Number(n.x || 0);
+  const y = Number(n.y || 0);
+  const radius = Math.max(3, Number(n.radius || 8));
+  const scale = Math.max(0.25, Number(baseScale || 1));
+  const phase = (ts * 0.0018) + (stableHash(String(n.id || 'node')) % 23);
+  const base = radius + (4 * scale);
+  ctx.save();
+  ctx.lineWidth = Math.max(0.9, 1 * scale);
+  ctx.shadowBlur = 0;
+
+  if (change.active_write) {
+    const pulseR = base + (Math.sin(phase * 2.2) * 1.2 * scale);
+    ctx.strokeStyle = `rgba(244,248,255,${0.68 + (0.14 * (0.5 + Math.sin(phase * 1.7)))})`;
+    ctx.beginPath();
+    ctx.arc(x, y, pulseR, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  if (change.dirty) {
+    ctx.setLineDash([3 * scale, 2.4 * scale]);
+    ctx.strokeStyle = 'rgba(255,176,94,0.84)';
+    ctx.beginPath();
+    ctx.arc(x, y, base + (3.6 * scale), 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  if (change.staged) {
+    ctx.strokeStyle = 'rgba(118,226,255,0.88)';
+    ctx.beginPath();
+    ctx.arc(x, y, base + (6.2 * scale), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  if (change.pending_push) {
+    ctx.setLineDash([1.8 * scale, 2.6 * scale]);
+    ctx.strokeStyle = 'rgba(162,208,255,0.86)';
+    ctx.beginPath();
+    ctx.arc(x, y, base + (8.6 * scale), 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  if (change.just_pushed) {
+    const ripple = base + (11 * scale) + ((0.5 + (0.5 * Math.sin(phase * 2.8))) * 4.8 * scale);
+    const alpha = 0.46 + (0.2 * (0.5 + Math.sin(phase * 2.4)));
+    ctx.strokeStyle = `rgba(134,255,186,${alpha})`;
+    ctx.beginPath();
+    ctx.arc(x, y, ripple, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
 function drawModuleNode(node, ts) {
   const ctx = state.ctx;
   const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
@@ -1625,6 +2141,7 @@ function drawModuleNode(node, ts) {
     && (!selectedType || selectedType === 'module');
   const introScale = nodeIntroScale(node);
   if (introScale <= 0.02) return;
+  const errorActive = Boolean(node && node.error_state_active === true);
   const glow = 0.17 + (node.activity * 0.35);
   const pulse = 0.88 + (Math.sin(ts * 0.001 + node.x * 0.01) * 0.1);
   const r = node.radius * pulse;
@@ -1632,23 +2149,23 @@ function drawModuleNode(node, ts) {
   ctx.save();
   ctx.globalAlpha *= (0.2 + (introScale * 0.8));
   ctx.strokeStyle = isSelected
-    ? colorFromActivityBright(node.activity, 0.82, 0.2)
-    : colorFromActivity(node.activity, 0.65);
+    ? softHighlightColor(0.9)
+    : (errorActive ? 'rgba(255,96,96,0.92)' : colorFromActivity(node.activity, 0.65));
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
   ctx.stroke();
 
   ctx.fillStyle = isSelected
-    ? colorFromActivityBright(node.activity, glow * 0.35, 0.16)
-    : colorFromActivity(node.activity, glow * 0.2);
+    ? softHighlightColor(Math.min(0.34, 0.2 + (glow * 0.16)))
+    : (errorActive ? 'rgba(255,88,88,0.22)' : colorFromActivity(node.activity, glow * 0.2));
   ctx.beginPath();
   ctx.arc(node.x, node.y, r * 0.72, 0, Math.PI * 2);
   ctx.fill();
 
   ctx.strokeStyle = isSelected
-    ? colorFromActivityBright(node.activity, 0.56, 0.19)
-    : colorFromActivity(node.activity, 0.36);
+    ? softHighlightColor(0.74)
+    : (errorActive ? 'rgba(255,132,132,0.74)' : colorFromActivity(node.activity, 0.36));
   ctx.lineWidth = 1;
   for (let i = 0; i < 3; i += 1) {
     const start = ((i / 3) * Math.PI * 2) + (ts * 0.00016) + (stableHash(node.id) % 10) * 0.07 + spinOffset;
@@ -1656,6 +2173,7 @@ function drawModuleNode(node, ts) {
     ctx.arc(node.x, node.y, r * (0.82 + i * 0.09), start, start + 0.78);
     ctx.stroke();
   }
+  drawNodeChangeIndicator({ ...node, radius: r }, ts, 1);
   ctx.restore();
 }
 
@@ -1667,16 +2185,22 @@ function drawSubmoduleNode(node) {
   const isSelected = selectedId
     && selectedId === String(node.id || '')
     && (!selectedType || selectedType === 'submodule');
+  const errorActive = Boolean(node && node.error_state_active === true);
   const introScale = nodeIntroScale(node);
   if (introScale <= 0.02) return;
   ctx.save();
   ctx.globalAlpha *= (0.18 + (introScale * 0.82));
   if (state.quality_tier === 'low') {
     const s = Math.max(1.4, node.radius * 1.45);
-    ctx.fillStyle = isSelected
-      ? colorFromActivityBright(node.activity, 0.95, 0.18)
+    ctx.fillStyle = errorActive
+      ? 'rgba(255,72,72,0.92)'
       : colorFromActivity(node.activity, 0.82);
     ctx.fillRect(node.x - s, node.y - s, s * 2, s * 2);
+    if (isSelected || errorActive) {
+      ctx.strokeStyle = softHighlightColor(0.88);
+      ctx.lineWidth = 1;
+      ctx.strokeRect(node.x - s, node.y - s, s * 2, s * 2);
+    }
     ctx.restore();
     return;
   }
@@ -1686,12 +2210,12 @@ function drawSubmoduleNode(node) {
   const outer = Math.max(inner + 1, Number(node.shell_outer || (node.radius * 3.1)));
   const start = Number(node.shell_start || 0);
   const end = Number(node.shell_end || (Math.PI * 0.4));
-  ctx.fillStyle = isSelected
-    ? colorFromActivityBright(node.activity, 0.3, 0.15)
+  ctx.fillStyle = errorActive
+    ? `rgba(255,68,68,${0.18 + (node.activity * 0.24)})`
     : colorFromActivity(node.activity, 0.16 + (node.activity * 0.22));
   ctx.strokeStyle = isSelected
-    ? colorFromActivityBright(node.activity, 0.86, 0.2)
-    : colorFromActivity(node.activity, 0.68);
+    ? softHighlightColor(0.9)
+    : (errorActive ? 'rgba(255,102,102,0.95)' : colorFromActivity(node.activity, 0.68));
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.arc(px, py, outer, start, end);
@@ -1703,8 +2227,8 @@ function drawSubmoduleNode(node) {
   if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
     const step = (end - start) / 3;
     ctx.strokeStyle = isSelected
-      ? colorFromActivityBright(node.activity, 0.62, 0.18)
-      : colorFromActivity(node.activity, 0.4);
+      ? softHighlightColor(0.7)
+      : (errorActive ? 'rgba(255,122,122,0.85)' : colorFromActivity(node.activity, 0.4));
     ctx.lineWidth = 0.8;
     for (let i = 1; i <= 2; i += 1) {
       const a = start + (step * i);
@@ -1770,6 +2294,7 @@ function drawLinks(scene) {
     const errW = clamp(Number(link.error_weight || 0), 0, 1);
     const errActive = errW > 0.045;
     const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78));
+    const baseLineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
     if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
       if (errActive) {
         ctx.shadowColor = `rgba(255,78,78,${0.24 + (errW * 0.4)})`;
@@ -1783,10 +2308,10 @@ function drawLinks(scene) {
     }
     if (errActive) {
       ctx.strokeStyle = `rgba(255,72,72,${clamp(0.14 + alpha + (errW * 0.55), 0.08, 0.96)})`;
-      ctx.lineWidth = (0.95 + (link.activity * 1.1) + (errW * 2.2)) * (0.35 + (introScale * 0.65));
+      ctx.lineWidth = baseLineWidth;
     } else {
       ctx.strokeStyle = colorFromActivity(link.activity, alpha);
-      ctx.lineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
+      ctx.lineWidth = baseLineWidth;
     }
     ctx.beginPath();
     ctx.moveTo(link.p0.x, link.p0.y);
@@ -1965,8 +2490,38 @@ function describeLinkProcess(link) {
   return 'Cross-module process path';
 }
 
+function renderIncidentBanner() {
+  const banner = byId('incidentBanner');
+  const badge = byId('incidentBadge');
+  if (!banner || !badge) return;
+  const incident = normalizeIntegrityIncident(state.payload);
+  const active = incident.active === true;
+  const severity = String(incident.severity || (active ? 'critical' : 'ok')).toLowerCase();
+  banner.classList.remove('show', 'severity-critical', 'severity-warning', 'severity-recent', 'severity-ok');
+  badge.classList.remove('show', 'severity-critical', 'severity-warning', 'severity-recent', 'severity-ok');
+  if (!active) {
+    banner.textContent = '';
+    badge.textContent = 'Integrity: OK';
+    badge.classList.add('show', 'severity-ok');
+    return;
+  }
+  const violationText = `${fmtNum(incident.violation_total)} mismatch${incident.violation_total === 1 ? '' : 'es'}`;
+  const title = severity === 'critical' ? 'SPINE INTEGRITY ALERT' : 'SPINE INTEGRITY WARNING';
+  const topFile = Array.isArray(incident.top_files) && incident.top_files.length
+    ? ` · ${incident.top_files[0]}`
+    : '';
+  banner.textContent = `${title} · ${violationText}${topFile}`;
+  badge.textContent = `Integrity: ${String(severity || 'critical').toUpperCase()} (${violationText})`;
+  const severityClass = severity === 'critical'
+    ? 'severity-critical'
+    : (severity === 'warning' ? 'severity-warning' : 'severity-recent');
+  banner.classList.add('show', severityClass);
+  badge.classList.add('show', severityClass);
+}
+
 function renderStats() {
   const payload = state.payload || {};
+  const integrityIncident = normalizeIntegrityIncident(payload);
   const summary = payload.summary && typeof payload.summary === 'object' ? payload.summary : {};
   const holoMetrics = payload.holo && payload.holo.metrics && typeof payload.holo.metrics === 'object'
     ? payload.holo.metrics
@@ -1989,6 +2544,28 @@ function renderStats() {
     : null;
   const titleEl = byId('statsTitle');
   let rows = [];
+  const selectedIntegrityRows = integrityRowsForSelection(integrityIncident, selectedType, selectedNode);
+  const sceneChange = scene && scene.change_summary && typeof scene.change_summary === 'object'
+    ? scene.change_summary
+    : {};
+  const selectedChangeState = (selectedType === 'spine' || selectedType === 'system')
+    ? normalizeChangeState({
+        active_write: Number(sceneChange.active_write_files_total || 0) > 0,
+        dirty: Number(sceneChange.dirty_files_total || 0) > 0,
+        staged: Number(sceneChange.staged_files_total || 0) > 0,
+        pending_push: sceneChange.pending_push === true || Number(sceneChange.ahead_count || 0) > 0,
+        just_pushed: sceneChange.just_pushed === true,
+        changed: Number(sceneChange.active_write_files_total || 0) > 0
+          || Number(sceneChange.dirty_files_total || 0) > 0
+          || Number(sceneChange.staged_files_total || 0) > 0
+          || sceneChange.pending_push === true
+          || sceneChange.just_pushed === true,
+        file_count: Number(sceneChange.top_files && sceneChange.top_files.length || 0),
+        top_files: Array.isArray(sceneChange.top_files) ? sceneChange.top_files : [],
+        last_push_ts: String(sceneChange.last_push_ts || '')
+      })
+    : normalizeChangeState(selectedNode && selectedNode.change_state);
+  const selectedChangeRows = changeRowsForSelection(selectedChangeState, selectedType, selectedNode);
 
   if (selectedLink && scene && scene.node_by_id) {
     const fromNode = scene.node_by_id[String(selectedLink.from_id || '')];
@@ -2015,6 +2592,18 @@ function renderStats() {
       ['Error Weight', `${fmtNum(errWeight * 100)}%`],
       ['Packet Count', fmtNum(selectedLink.count || 0)]
     ];
+  } else if (selectedType === 'spine' && scene) {
+    if (titleEl) titleEl.textContent = 'Preview Pane';
+    rows = [
+      ['Mode', 'Core Integrity Overview'],
+      ['Core', String((selectedNode && selectedNode.name) || 'Spine Core')],
+      ['Core Path', String((selectedNode && selectedNode.rel) || SPINE_NODE_PATH)],
+      ['Integrity', integrityIncident.active
+        ? `${String(integrityIncident.severity || 'critical').toUpperCase()} (${fmtNum(integrityIncident.violation_total)} mismatches)`
+        : 'OK'],
+      ...selectedChangeRows,
+      ...selectedIntegrityRows
+    ];
   } else if (selectedType === 'system' && scene && Array.isArray(scene.links)) {
     const processCounts = Object.create(null);
     for (const link of scene.links) {
@@ -2034,6 +2623,8 @@ function renderStats() {
       ['Mode', 'System Process Overview'],
       ['Scope', 'All shells + children'],
       ['Total Links', fmtNum(scene.links.length)],
+      ...selectedChangeRows,
+      ...selectedIntegrityRows,
       ...processRows
     ];
     if (!processRows.length) rows.push(['Process/none', '0']);
@@ -2118,6 +2709,8 @@ function renderStats() {
       ['Module Path', String(selectedNode.rel || moduleId)],
       ['Fractals', fmtNum(submoduleIds.length)],
       ['Total Child Links', fmtNum(relevantLinks.length)],
+      ...selectedChangeRows,
+      ...selectedIntegrityRows,
       ...processRows
     ];
     if (!processRows.length) rows.push(['Process/none', '0']);
@@ -2151,6 +2744,8 @@ function renderStats() {
       ['Module', String((moduleNode && moduleNode.name) || moduleId || 'n/a')],
       ['Shell', String((layerNode && layerNode.name) || layerId || 'n/a')],
       ['Direct Links', fmtNum(relevantLinks.length)],
+      ...selectedChangeRows,
+      ...selectedIntegrityRows,
       ...processRows
     ];
     if (!processRows.length) rows.push(['Process/none', '0']);
@@ -2171,14 +2766,36 @@ function renderStats() {
       ['Links', fmtNum(linkCount)]
     ];
   }
-  byId('statsGrid').innerHTML = rows.map(([k, v]) => (
-    `<div class="item"><div class="k">${k}</div><div class="v">${v}</div></div>`
-  )).join('');
+  const integrityLabel = integrityIncident.active
+    ? `${String(integrityIncident.severity || 'critical').toUpperCase()} (${fmtNum(integrityIncident.violation_total)} mismatches)`
+    : 'OK';
+  rows.push(['Integrity', integrityLabel]);
+  if (integrityIncident.active) {
+    const topFiles = Array.isArray(integrityIncident.top_files)
+      ? integrityIncident.top_files.slice(0, 2)
+      : [];
+    if (topFiles.length) rows.push(['Integrity Files', topFiles.join(' | ')]);
+    if (integrityIncident.last_violation_ts) {
+      rows.push(['Last Violation', new Date(integrityIncident.last_violation_ts).toLocaleString()]);
+    }
+  } else if (integrityIncident.last_reseal_ts) {
+    rows.push(['Last Reseal', new Date(integrityIncident.last_reseal_ts).toLocaleString()]);
+  }
+  byId('statsGrid').innerHTML = rows.map(([k, v]) => {
+    const errorRow = isPreviewErrorRow(k);
+    const itemClass = errorRow ? 'item item-error' : 'item';
+    const valueClass = errorRow ? 'v v-error' : 'v';
+    return `<div class="${itemClass}"><div class="k">${escapeHtml(String(k))}</div><div class="${valueClass}">${escapeHtml(String(v))}</div></div>`;
+  }).join('');
   const pulseSuffix = state.spine_event_top
     ? ` | spine ${fmtNum(state.spine_event_count)} evt (${state.spine_event_top})`
     : ` | spine ${fmtNum(state.spine_event_count)} evt`;
   const linkPreviewSuffix = selectedLink ? ` | preview: ${String(selectedLink.from_id || '?')} -> ${String(selectedLink.to_id || '?')}` : '';
-  byId('metaLine').textContent = `Updated ${new Date(payload.generated_at || Date.now()).toLocaleString()} | ${state.transport} | zoom ${fmtNum(state.camera.zoom)}x | fallback ${Math.round(state.refresh_ms / 1000)}s${pulseSuffix}${linkPreviewSuffix}`;
+  const integritySuffix = integrityIncident.active
+    ? ` | integrity ${String(integrityIncident.severity || 'critical')} ${fmtNum(integrityIncident.violation_total)}`
+    : ' | integrity ok';
+  byId('metaLine').textContent = `Updated ${new Date(payload.generated_at || Date.now()).toLocaleString()} | ${state.transport} | zoom ${fmtNum(state.camera.zoom)}x | fallback ${Math.round(state.refresh_ms / 1000)}s${pulseSuffix}${linkPreviewSuffix}${integritySuffix}`;
+  renderIncidentBanner();
 }
 
 function renderSelectionTag() {
@@ -2423,7 +3040,20 @@ function normalizeHitForCurrentLevel(scene, hit) {
     const selectedLayerId = String(selectedNode.id || '');
     const shellZoomed = isLayerFocusZoomed(scene, selectedLayerId);
     if (!shellZoomed) {
-      if (nodeType === 'module' || nodeType === 'submodule') return mapToLayer();
+      if (nodeType === 'module') {
+        if (String(node.parent_id || '') === selectedLayerId) {
+          return hitTargetFromNode(scene, String(node.id || ''), 'circle') || hit;
+        }
+        return mapToLayer();
+      }
+      if (nodeType === 'submodule') {
+        const parentId = String(node.parent_id || '');
+        const parentNode = scene.node_by_id ? scene.node_by_id[parentId] : null;
+        if (parentNode && String(parentNode.parent_id || '') === selectedLayerId) {
+          return hitTargetFromNode(scene, parentId, 'circle') || hit;
+        }
+        return mapToLayer();
+      }
       return hit;
     }
     if (nodeType === 'module' && String(node.parent_id || '') !== selectedLayerId) {
@@ -2478,7 +3108,9 @@ function isHitAllowedForCurrentLevel(scene, hit) {
     const shellZoomed = isLayerFocusZoomed(scene, selectedLayerId);
     if (targetType === 'spine') return true;
     if (isShellHit && targetType === 'layer') return true;
-    if (!shellZoomed) return false;
+    if (!shellZoomed) {
+      return targetType === 'module' && String(targetNode.parent_id || '') === selectedLayerId;
+    }
     return targetType === 'module' && String(targetNode.parent_id || '') === selectedLayerId;
   }
 
@@ -2510,6 +3142,7 @@ function isHitAllowedForCurrentLevel(scene, hit) {
 function onCanvasClick(evt) {
   if (isShellIntroActive(performance.now())) return;
   if (state.camera.drag_px > 5) return;
+  syncCameraTransition(performance.now());
   const rect = state.canvas.getBoundingClientRect();
   const x = evt.clientX - rect.left;
   const y = evt.clientY - rect.top;
@@ -2523,7 +3156,7 @@ function onCanvasClick(evt) {
   const normalizedHit = rawHit ? normalizeHitForCurrentLevel(scene, rawHit) : null;
   const hit = normalizedHit && isHitAllowedForCurrentLevel(scene, normalizedHit) ? normalizedHit : null;
   const linkHit = linksInteractiveForSelection() ? hitTestLink(x, y, 12) : null;
-  const preferLine = shouldPreferLinkSelection(scene, hit, linkHit);
+  const preferLine = linkHit ? (state.camera.map_mode || shouldPreferLinkSelection(scene, hit, linkHit)) : false;
   const activeFocusId = String(state.camera.focus_target_id || '');
   const activeFocusNode = activeFocusId && scene && scene.node_by_id
     ? scene.node_by_id[activeFocusId]
@@ -2556,9 +3189,39 @@ function onCanvasClick(evt) {
     }
     return;
   }
+  if (!hit && !linkHit && (selectedType === 'module' || selectedType === 'submodule')) {
+    let parentLayerId = '';
+    if (selectedType === 'module') {
+      parentLayerId = String(selectedNode && selectedNode.parent_id || '');
+    } else {
+      const parentModuleId = String(selectedNode && selectedNode.parent_id || '');
+      const parentModule = parentModuleId && scene && scene.node_by_id
+        ? scene.node_by_id[parentModuleId]
+        : null;
+      parentLayerId = String(parentModule && parentModule.parent_id || '');
+    }
+    const layerNode = parentLayerId && scene && scene.node_by_id ? scene.node_by_id[parentLayerId] : null;
+    if (layerNode && String(layerNode.type || '') === 'layer') {
+      const layerTarget = hitTargetFromNode(scene, parentLayerId, 'ring');
+      state.selected = {
+        id: String(parentLayerId),
+        name: String((layerTarget && layerTarget.name) || layerNode.name || parentLayerId),
+        path: String((layerTarget && layerTarget.path) || layerNode.rel || ''),
+        kind: String((layerTarget && layerTarget.kind) || 'ring'),
+        type: 'layer'
+      };
+      state.selected_link = null;
+      zoomIntoLayer(parentLayerId);
+      applySelectionFocus(true);
+      renderSelectionTag();
+      renderStats();
+      return;
+    }
+  }
   const hitId = String(hit && hit.id || '');
   const hitNode = hitId && scene && scene.node_by_id ? scene.node_by_id[hitId] : null;
   const hitType = String((hitNode && hitNode.type) || '').toLowerCase();
+  const hitLayerId = hitNode ? String(layerIdForNode(scene, hitNode) || '') : '';
   const clickingFocusedModule = Boolean(
     hit && !preferLine
     && activeFocusId
@@ -2575,7 +3238,43 @@ function onCanvasClick(evt) {
     && activeFocusId !== hitId
   );
   const linePreviewClick = Boolean(preferLine && linkHit);
-  if ((clickedDifferentLayerWhileFocusedLayer || (!clickingFocusedModule && !linePreviewClick)) && state.camera.focus_mode) {
+  if (state.camera.map_mode && !linePreviewClick) {
+    const restored = exitMapModeToCenteredSelection();
+    if (restored) {
+      const ownerId = String(state.camera.focus_target_id || '').trim();
+      const ownerNode = ownerId && scene && scene.node_by_id ? scene.node_by_id[ownerId] : null;
+      if (ownerNode) {
+        state.selected = {
+          id: ownerId,
+          name: String(ownerNode.name || ownerId),
+          path: String(ownerNode.rel || ''),
+          kind: 'circle',
+          type: String(ownerNode.type || '').toLowerCase()
+        };
+      }
+      state.selected_link = null;
+      applySelectionFocus(true);
+      renderSelectionTag();
+      renderStats();
+      return;
+    }
+  }
+  const keepFocusForHit = Boolean(
+    hit && !preferLine && (
+      (activeFocusId && hitId && activeFocusId === hitId)
+      || (activeFocusType === 'layer'
+        && (hitType === 'module' || hitType === 'submodule')
+        && hitLayerId
+        && hitLayerId === activeFocusId)
+      || (activeFocusType === 'module'
+        && hitType === 'submodule'
+        && String(hitNode && hitNode.parent_id || '') === activeFocusId)
+    )
+  );
+  if (state.camera.focus_mode
+    && !linePreviewClick
+    && !keepFocusForHit
+    && (clickedDifferentLayerWhileFocusedLayer || !clickingFocusedModule)) {
     restoreCameraFocus();
   }
   const suppressAutoLayerZoom = clickedDifferentLayerWhileFocusedLayer;
@@ -2615,7 +3314,6 @@ function onCanvasClick(evt) {
     if (sameNode && targetNode) {
       const targetType = String(targetNode.type || '').toLowerCase();
       if (targetType === 'module') {
-        zoomIntoModule(targetNode.id);
         state.selected = {
           id: targetId,
           name: targetName,
@@ -2633,7 +3331,6 @@ function onCanvasClick(evt) {
         };
         if (targetType === 'layer' && !suppressAutoLayerZoom) zoomIntoLayer(targetNode.id);
       } else if (targetType === 'submodule') {
-        zoomIntoSubmodule(targetNode.id);
         state.selected = {
           id: targetId,
           name: targetName,
@@ -2653,6 +3350,18 @@ function onCanvasClick(evt) {
         type: selectionTypeFrom(targetNode, targetKind)
       };
     }
+    const selectedTypeFinal = String(state.selected && state.selected.type || '').toLowerCase();
+    const cameFromModuleDepth = selectedType === 'module' || selectedType === 'submodule';
+    if (selectedTypeFinal === 'module' || selectedTypeFinal === 'submodule') {
+      centerOnSelectionNoZoom(String(state.selected.id || ''));
+    } else if (selectedTypeFinal === 'layer') {
+      if (cameFromModuleDepth) {
+        zoomIntoLayer(String(state.selected.id || ''));
+      }
+      clearMapMode();
+    } else {
+      clearMapMode();
+    }
     state.selected_link = null;
   } else {
     if (linkHit) {
@@ -2665,9 +3374,16 @@ function onCanvasClick(evt) {
         from_id: linkHit.from_id,
         to_id: linkHit.to_id
       };
+      const mapOwnerId = (selectedType === 'module' || selectedType === 'submodule')
+        ? selectedId
+        : '';
+      if (state.selected_link && mapOwnerId) {
+        enterMapModeForSelection(mapOwnerId);
+      }
     } else {
       state.selected = null;
       state.selected_link = null;
+      clearMapMode();
     }
   }
   applySelectionFocus(true);
@@ -2680,6 +3396,7 @@ function updateHoverAtCanvasPoint(x, y) {
     state.hover = null;
     return;
   }
+  syncCameraTransition(performance.now());
   const scene = state.scene;
   if (!scene) {
     state.hover = null;
@@ -2718,6 +3435,7 @@ function updateHoverAtCanvasPoint(x, y) {
 }
 
 function animate(ts) {
+  syncCameraTransition(ts);
   if (!state.last_frame_ts) state.last_frame_ts = ts;
   const dtMs = Math.max(1, ts - state.last_frame_ts);
   state.last_frame_ts = ts;
@@ -2753,14 +3471,46 @@ function requestRefresh() {
   }
 }
 
-function restoreCameraFocus() {
+function restoreCameraFocus(options = {}) {
   const cam = state.camera;
   if (!cam.focus_mode) return;
-  cam.zoom = clamp(cam.restore_zoom, cam.min_zoom, cam.max_zoom);
-  cam.pan_x = Number(cam.restore_pan_x || 0);
-  cam.pan_y = Number(cam.restore_pan_y || 0);
+  const instant = Boolean(options && options.instant);
+  const zoomTarget = clamp(cam.restore_zoom, cam.min_zoom, cam.max_zoom);
+  const panXTarget = Number(cam.restore_pan_x || 0);
+  const panYTarget = Number(cam.restore_pan_y || 0);
+  startCameraTransition(zoomTarget, panXTarget, panYTarget, instant ? 1 : 170);
   cam.focus_mode = false;
   cam.focus_target_id = null;
+  cam.map_mode = false;
+  cam.map_owner_id = '';
+}
+
+function clearMapMode() {
+  const cam = state.camera;
+  cam.map_mode = false;
+  cam.map_owner_id = '';
+}
+
+function centerOnSelectionNoZoom(nodeId) {
+  const id = String(nodeId || '').trim();
+  if (!id || !state.scene || !state.scene.node_by_id) return false;
+  const node = state.scene.node_by_id[id];
+  if (!node) return false;
+  const cam = state.camera;
+  syncCameraTransition(performance.now());
+  if (!cam.focus_mode || String(cam.focus_target_id || '') !== id) {
+    cam.restore_zoom = cam.zoom;
+    cam.restore_pan_x = cam.pan_x;
+    cam.restore_pan_y = cam.pan_y;
+  }
+  const z = clamp(Number(cam.zoom || 1), cam.min_zoom, cam.max_zoom);
+  const panX = (state.width * 0.5) - (Number(node.x || 0) * z);
+  const panY = (state.height * 0.5) - (Number(node.y || 0) * z);
+  startCameraTransition(z, panX, panY, 145);
+  cam.focus_mode = true;
+  cam.focus_target_id = id;
+  clearMapMode();
+  return true;
 }
 
 function layerShellBounds(scene, layerId) {
@@ -2799,6 +3549,7 @@ function zoomIntoLayer(layerId) {
   const bounds = layerShellBounds(scene, layerId);
   if (!bounds) return false;
   const cam = state.camera;
+  syncCameraTransition(performance.now());
   const id = String(bounds.id || '');
   if (!cam.focus_mode || String(cam.focus_target_id || '') !== id) {
     cam.restore_zoom = cam.zoom;
@@ -2809,11 +3560,149 @@ function zoomIntoLayer(layerId) {
   const shellOuter = Math.max(16, Number(bounds.outer || 0));
   const desiredZoom = targetOuterScreenRadius / shellOuter;
   const zoomTarget = clamp(Math.max(1.02, desiredZoom), cam.min_zoom, cam.max_zoom);
-  cam.zoom = zoomTarget;
-  cam.pan_x = (state.width * 0.5) - (Number(bounds.cx || 0) * zoomTarget);
-  cam.pan_y = (state.height * 0.5) - (Number(bounds.cy || 0) * zoomTarget);
+  const panX = (state.width * 0.5) - (Number(bounds.cx || 0) * zoomTarget);
+  const panY = (state.height * 0.5) - (Number(bounds.cy || 0) * zoomTarget);
+  startCameraTransition(zoomTarget, panX, panY, 175);
   cam.focus_mode = true;
   cam.focus_target_id = id;
+  return true;
+}
+
+function selectionFocusBounds(scene, selectedId) {
+  if (!scene || !scene.node_by_id || !selectedId) return null;
+  const focus = computeSelectionFocus(scene, selectedId);
+  const ids = focus && focus.nodes instanceof Set
+    ? Array.from(focus.nodes)
+    : [selectedId];
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const rawId of ids) {
+    const id = String(rawId || '').trim();
+    if (!id) continue;
+    const node = scene.node_by_id[id];
+    if (!node) continue;
+    const x = Number(node.x);
+    const y = Number(node.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const type = String(node.type || '').toLowerCase();
+    const radius = Math.max(2, Number(node.radius || 8));
+    let pad = radius + 12;
+    if (type === 'submodule') {
+      pad = Math.max(pad, Number(node.shell_outer || (radius * 3.2)) + 8);
+    } else if (type === 'layer') {
+      pad = Math.max(pad, Number(node.ring_width || 14) + 24);
+    } else if (type === 'module') {
+      pad = Math.max(pad, radius + 16);
+    } else if (type === 'spine') {
+      pad = Math.max(pad, 22);
+    }
+    minX = Math.min(minX, x - pad);
+    maxX = Math.max(maxX, x + pad);
+    minY = Math.min(minY, y - pad);
+    maxY = Math.max(maxY, y + pad);
+  }
+  if (!(maxX > minX) || !(maxY > minY)) return null;
+  return {
+    cx: (minX + maxX) * 0.5,
+    cy: (minY + maxY) * 0.5,
+    width: Math.max(24, maxX - minX),
+    height: Math.max(24, maxY - minY)
+  };
+}
+
+function zoomIntoSelectionMap(nodeId) {
+  const id = String(nodeId || '').trim();
+  if (!id || !state.scene || !state.scene.node_by_id) return false;
+  const node = state.scene.node_by_id[id];
+  if (!node) return false;
+  const type = String(node.type || '').toLowerCase();
+  if (type !== 'module' && type !== 'submodule') return false;
+  const bounds = selectionFocusBounds(state.scene, id);
+  if (!bounds) return false;
+
+  const cam = state.camera;
+  syncCameraTransition(performance.now());
+  if (!cam.focus_mode || String(cam.focus_target_id || '') !== id) {
+    cam.restore_zoom = cam.zoom;
+    cam.restore_pan_x = cam.pan_x;
+    cam.restore_pan_y = cam.pan_y;
+  }
+
+  const fill = 0.9;
+  const zoomX = (Math.max(1, state.width) * fill) / Math.max(1, Number(bounds.width || 1));
+  const zoomY = (Math.max(1, state.height) * fill) / Math.max(1, Number(bounds.height || 1));
+  let zoomTarget = Math.min(zoomX, zoomY);
+  if (!Number.isFinite(zoomTarget) || zoomTarget <= 0) return false;
+
+  if (type === 'module') {
+    zoomTarget = clamp(zoomTarget, Math.max(cam.min_zoom, 1.08), Math.min(cam.max_zoom, 2.3));
+  } else {
+    zoomTarget = clamp(zoomTarget, Math.max(cam.min_zoom, 1.15), Math.min(cam.max_zoom, 2.55));
+  }
+  const panX = (state.width * 0.5) - (Number(bounds.cx || 0) * zoomTarget);
+  const panY = (state.height * 0.5) - (Number(bounds.cy || 0) * zoomTarget);
+  startCameraTransition(zoomTarget, panX, panY, 165);
+  cam.focus_mode = true;
+  cam.focus_target_id = id;
+  return true;
+}
+
+function enterMapModeForSelection(nodeId) {
+  const id = String(nodeId || '').trim();
+  if (!id || !state.scene || !state.scene.node_by_id) return false;
+  const node = state.scene.node_by_id[id];
+  if (!node) return false;
+  const type = String(node.type || '').toLowerCase();
+  if (type !== 'module' && type !== 'submodule') return false;
+  const bounds = selectionFocusBounds(state.scene, id);
+  if (!bounds) return false;
+
+  const cam = state.camera;
+  syncCameraTransition(performance.now());
+  if (!cam.map_mode || String(cam.map_owner_id || '') !== id) {
+    cam.map_return_zoom = cam.zoom;
+    cam.map_return_pan_x = cam.pan_x;
+    cam.map_return_pan_y = cam.pan_y;
+  }
+
+  const fill = 0.94;
+  const fitZoomX = (Math.max(1, state.width) * fill) / Math.max(1, Number(bounds.width || 1));
+  const fitZoomY = (Math.max(1, state.height) * fill) / Math.max(1, Number(bounds.height || 1));
+  const fitZoom = Math.min(fitZoomX, fitZoomY);
+  if (!Number.isFinite(fitZoom) || fitZoom <= 0) return false;
+
+  const zoomTarget = clamp(
+    Math.min(Number(cam.zoom || 1) * 0.95, fitZoom),
+    cam.min_zoom,
+    cam.max_zoom
+  );
+  const panX = (state.width * 0.5) - (Number(bounds.cx || 0) * zoomTarget);
+  const panY = (state.height * 0.5) - (Number(bounds.cy || 0) * zoomTarget);
+  startCameraTransition(zoomTarget, panX, panY, 150);
+  cam.focus_mode = true;
+  cam.focus_target_id = id;
+  cam.map_mode = true;
+  cam.map_owner_id = id;
+  return true;
+}
+
+function exitMapModeToCenteredSelection() {
+  const cam = state.camera;
+  if (!cam.map_mode) return false;
+  const ownerId = String(cam.map_owner_id || '').trim();
+  if (!ownerId || !state.scene || !state.scene.node_by_id || !state.scene.node_by_id[ownerId]) {
+    clearMapMode();
+    return false;
+  }
+  const zoomTarget = clamp(Number(cam.map_return_zoom || cam.zoom), cam.min_zoom, cam.max_zoom);
+  const panXTarget = Number(cam.map_return_pan_x || cam.pan_x);
+  const panYTarget = Number(cam.map_return_pan_y || cam.pan_y);
+  startCameraTransition(zoomTarget, panXTarget, panYTarget, 150);
+  cam.focus_mode = true;
+  cam.focus_target_id = ownerId;
+  clearMapMode();
   return true;
 }
 
@@ -2860,7 +3749,7 @@ function zoomIntoModule(nodeId) {
 }
 
 function onCanvasWheel(evt) {
-  if (state.camera.focus_mode) restoreCameraFocus();
+  if (state.camera.focus_mode) restoreCameraFocus({ instant: true });
   evt.preventDefault();
   const rect = state.canvas.getBoundingClientRect();
   const sx = evt.clientX - rect.left;
@@ -2872,7 +3761,8 @@ function onCanvasWheel(evt) {
 function onCanvasMouseDown(evt) {
   const enablePan = evt.button === 0 || evt.button === 1 || evt.button === 2 || evt.shiftKey === true;
   if (!enablePan) return;
-  if (state.camera.focus_mode) restoreCameraFocus();
+  stopCameraTransition();
+  if (state.camera.focus_mode) restoreCameraFocus({ instant: true });
   evt.preventDefault();
   const cam = state.camera;
   cam.panning = true;

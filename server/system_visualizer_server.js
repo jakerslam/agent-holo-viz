@@ -11,6 +11,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { URL } = require('url');
+const { spawnSync } = require('child_process');
 let WebSocketServer = null;
 try {
   ({ WebSocketServer } = require('ws'));
@@ -23,6 +24,8 @@ const REPO_ROOT = process.env.OPENCLAW_WORKSPACE
   : path.resolve(__dirname, '..', '..');
 const RUNS_DIR = path.join(REPO_ROOT, 'state', 'autonomy', 'runs');
 const SPINE_RUNS_DIR = path.join(REPO_ROOT, 'state', 'spine', 'runs');
+const INTEGRITY_POLICY_PATH = path.join(REPO_ROOT, 'config', 'security_integrity_policy.json');
+const INTEGRITY_LOG_PATH = path.join(REPO_ROOT, 'state', 'security', 'integrity_violations.jsonl');
 const STATIC_DIR = path.join(__dirname, '..', 'client');
 
 const DEFAULT_HOST = '127.0.0.1';
@@ -37,6 +40,13 @@ const WS_PING_MS = 15000;
 const MODULE_SCAN_CACHE_TTL_MS = 7000;
 const MAX_LAYER_MODULES = 24;
 const MAX_MODULE_SUBMODULES = 20;
+const MAX_INTEGRITY_FILES = 12;
+const MAX_INTEGRITY_EVENTS = 8;
+const GIT_CMD_TIMEOUT_MS = 1800;
+const CHANGE_STATE_CACHE_TTL_MS = 1200;
+const ACTIVE_WRITE_WINDOW_MS = 14000;
+const JUST_PUSHED_WINDOW_MS = 2600;
+const MAX_CHANGE_FILES = 10;
 
 const LAYER_ROOTS = [
   { key: 'adaptive', label: 'Adaptive', rel: 'adaptive' },
@@ -51,6 +61,17 @@ const LAYER_ROOTS = [
 let MODULE_SCAN_CACHE = {
   ts: 0,
   payload: null
+};
+
+let CHANGE_STATE_CACHE = {
+  ts: 0,
+  payload: null
+};
+
+let PUSH_TRANSITION_STATE = {
+  last_ahead_count: null,
+  just_pushed_until_ms: 0,
+  last_push_ts: ''
 };
 
 const MIME = {
@@ -109,6 +130,202 @@ function safeJsonParse(line) {
 function parseTsMs(ts) {
   const ms = Date.parse(String(ts || ''));
   return Number.isFinite(ms) ? ms : null;
+}
+
+function normalizeRelPath(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/{2,}/g, '/');
+}
+
+function runCmd(cmd, args, timeoutMs = GIT_CMD_TIMEOUT_MS) {
+  const result = spawnSync(String(cmd || ''), Array.isArray(args) ? args : [], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    timeout: Math.max(200, Number(timeoutMs || GIT_CMD_TIMEOUT_MS))
+  });
+  return {
+    ok: result.status === 0,
+    code: result.status == null ? 1 : result.status,
+    stdout: String(result.stdout || ''),
+    stderr: String(result.stderr || ''),
+    error: result.error ? String(result.error && result.error.message ? result.error.message : result.error) : ''
+  };
+}
+
+function parsePathLines(raw, limit = 5000) {
+  const lines = String(raw || '').split('\n');
+  const out = [];
+  for (const line of lines) {
+    if (out.length >= limit) break;
+    const rel = normalizeRelPath(line);
+    if (!rel) continue;
+    out.push(rel);
+  }
+  return Array.from(new Set(out));
+}
+
+function parseGitStatusPorcelain(raw) {
+  const staged = new Set();
+  const dirty = new Set();
+  const lines = String(raw || '').split('\n');
+  for (const line of lines) {
+    const row = String(line || '');
+    if (!row.trim() || row.length < 3) continue;
+    const x = row[0];
+    const y = row[1];
+    let rel = normalizeRelPath(row.slice(3));
+    if (!rel) continue;
+    if (rel.includes(' -> ')) {
+      const parts = rel.split(' -> ').map((p) => normalizeRelPath(p)).filter(Boolean);
+      rel = parts.length ? parts[parts.length - 1] : rel;
+    }
+    const stagedFlag = x && x !== ' ' && x !== '?';
+    const dirtyFlag = y && y !== ' ';
+    const untrackedFlag = x === '?' && y === '?';
+    if (stagedFlag) staged.add(rel);
+    if (dirtyFlag || untrackedFlag) dirty.add(rel);
+  }
+  return {
+    staged: Array.from(staged),
+    dirty: Array.from(dirty)
+  };
+}
+
+function gitAheadInfo() {
+  const upstreamRes = runCmd('git', ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+  if (!upstreamRes.ok) {
+    return {
+      has_upstream: false,
+      upstream: '',
+      ahead_count: 0
+    };
+  }
+  const upstream = String(upstreamRes.stdout || '').trim();
+  if (!upstream) {
+    return {
+      has_upstream: false,
+      upstream: '',
+      ahead_count: 0
+    };
+  }
+  const aheadRes = runCmd('git', ['rev-list', '--count', `${upstream}..HEAD`]);
+  const ahead = aheadRes.ok ? Number(String(aheadRes.stdout || '').trim()) : 0;
+  return {
+    has_upstream: true,
+    upstream,
+    ahead_count: Number.isFinite(ahead) && ahead > 0 ? Math.round(ahead) : 0
+  };
+}
+
+function gitLastCommitInfo() {
+  const res = runCmd('git', ['log', '-1', '--name-only', '--pretty=format:%ct']);
+  if (!res.ok) {
+    return {
+      epoch_s: null,
+      ts: '',
+      files: []
+    };
+  }
+  const lines = String(res.stdout || '')
+    .split('\n')
+    .map((row) => String(row || '').trim())
+    .filter(Boolean);
+  if (!lines.length) {
+    return {
+      epoch_s: null,
+      ts: '',
+      files: []
+    };
+  }
+  const epoch = Number(lines[0]);
+  const epochS = Number.isFinite(epoch) && epoch > 0 ? Math.round(epoch) : null;
+  return {
+    epoch_s: epochS,
+    ts: epochS ? new Date(epochS * 1000).toISOString() : '',
+    files: Array.from(new Set(lines.slice(1).map((row) => normalizeRelPath(row)).filter(Boolean)))
+  };
+}
+
+function collectRecentWriteFiles(rows, windowMs = ACTIVE_WRITE_WINDOW_MS) {
+  const files = Array.isArray(rows) ? rows : [];
+  const nowMs = Date.now();
+  const out = [];
+  for (const relRaw of files) {
+    const rel = normalizeRelPath(relRaw);
+    if (!rel) continue;
+    const abs = path.join(REPO_ROOT, rel);
+    try {
+      const stat = fs.statSync(abs);
+      const mtimeMs = Number(stat.mtimeMs || 0);
+      if (!Number.isFinite(mtimeMs) || mtimeMs <= 0) continue;
+      if ((nowMs - mtimeMs) <= Math.max(1000, Number(windowMs || ACTIVE_WRITE_WINDOW_MS))) {
+        out.push(rel);
+      }
+    } catch {
+      // ignore missing files (deleted/renamed)
+    }
+  }
+  return Array.from(new Set(out));
+}
+
+function relMatchesPath(relPath, filePath) {
+  const rel = normalizeRelPath(relPath).toLowerCase();
+  const file = normalizeRelPath(filePath).toLowerCase();
+  if (!rel || !file) return false;
+  if (file === rel) return true;
+  if (file.startsWith(`${rel}/`)) return true;
+  if (rel.startsWith(`${file}/`)) return true;
+  return false;
+}
+
+function collectMatchingFiles(files, relPath, limit = MAX_CHANGE_FILES) {
+  const src = Array.isArray(files) ? files : [];
+  const out = [];
+  for (const file of src) {
+    if (out.length >= limit) break;
+    if (!relMatchesPath(relPath, file)) continue;
+    out.push(normalizeRelPath(file));
+  }
+  return out;
+}
+
+function buildNodeChangeState(relPath, sets, options = {}) {
+  const dirtyFiles = collectMatchingFiles(sets.dirty, relPath, MAX_CHANGE_FILES);
+  const stagedFiles = collectMatchingFiles(sets.staged, relPath, MAX_CHANGE_FILES);
+  const activeWriteFiles = collectMatchingFiles(sets.active_write, relPath, MAX_CHANGE_FILES);
+  const pendingPushFiles = collectMatchingFiles(sets.pending_push, relPath, MAX_CHANGE_FILES);
+  const justPushedFiles = collectMatchingFiles(sets.just_pushed, relPath, MAX_CHANGE_FILES);
+  const files = Array.from(new Set([
+    ...activeWriteFiles,
+    ...dirtyFiles,
+    ...stagedFiles,
+    ...pendingPushFiles,
+    ...justPushedFiles
+  ])).slice(0, MAX_CHANGE_FILES);
+  const activeWrite = activeWriteFiles.length > 0;
+  const dirty = dirtyFiles.length > 0;
+  const staged = stagedFiles.length > 0;
+  const pendingPush = pendingPushFiles.length > 0;
+  const justPushed = justPushedFiles.length > 0 && !pendingPush;
+  const changed = activeWrite || dirty || staged || pendingPush || justPushed;
+  return {
+    active_write: activeWrite,
+    dirty,
+    staged,
+    pending_push: pendingPush,
+    just_pushed: justPushed,
+    changed,
+    file_count: files.length,
+    dirty_file_count: dirtyFiles.length,
+    staged_file_count: stagedFiles.length,
+    pending_push_file_count: pendingPushFiles.length,
+    active_write_file_count: activeWriteFiles.length,
+    top_files: files,
+    last_push_ts: String(options.last_push_ts || '')
+  };
 }
 
 function listJsonlFilesDesc(absDir) {
@@ -180,12 +397,150 @@ function loadRecentSpineEvents(hours = DEFAULT_HOURS, maxEvents = 600) {
         status: String(evt.status || ''),
         outcome: String(evt.outcome || ''),
         reason: String(evt.reason || ''),
-        objective_id: String(evt.objective_id || '')
+        objective_id: String(evt.objective_id || ''),
+        violation_counts: evt && typeof evt.violation_counts === 'object'
+          ? evt.violation_counts
+          : {}
       });
       if (events.length >= cap) return events;
     }
   }
   return events;
+}
+
+function safeCountMap(raw) {
+  if (!raw || typeof raw !== 'object') return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const key = String(k || '').trim();
+    const count = Number(v || 0);
+    if (!key || !Number.isFinite(count) || count <= 0) continue;
+    out[key] = Math.round(count);
+  }
+  return out;
+}
+
+function sumCountMap(raw) {
+  let total = 0;
+  for (const count of Object.values(safeCountMap(raw))) {
+    total += Number(count || 0);
+  }
+  return total;
+}
+
+function compactIntegrityViolations(violations, limit = MAX_INTEGRITY_FILES) {
+  const rows = Array.isArray(violations) ? violations : [];
+  const out = [];
+  for (const row of rows) {
+    if (out.length >= limit) break;
+    const type = String(row && row.type || 'unknown').trim() || 'unknown';
+    const file = String(row && row.file || '').trim();
+    const detail = String(row && row.detail || '').trim();
+    out.push({
+      type,
+      file,
+      detail: detail ? detail.slice(0, 160) : ''
+    });
+  }
+  return out;
+}
+
+function loadRecentIntegrityEvents(hours = DEFAULT_HOURS, maxEvents = MAX_INTEGRITY_EVENTS) {
+  if (!fs.existsSync(INTEGRITY_LOG_PATH)) return [];
+  const h = clampNumber(hours, 1, 24 * 30, DEFAULT_HOURS);
+  const cap = clampNumber(maxEvents, 1, 64, MAX_INTEGRITY_EVENTS);
+  const cutoffMs = Date.now() - (h * 60 * 60 * 1000);
+  const events = [];
+  const lines = String(fs.readFileSync(INTEGRITY_LOG_PATH, 'utf8') || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = String(lines[i] || '').trim();
+    if (!line) continue;
+    const evt = safeJsonParse(line);
+    if (!evt || typeof evt !== 'object') continue;
+    const type = String(evt.type || '').trim();
+    if (type !== 'integrity_violation_block' && type !== 'integrity_reseal_apply') continue;
+    const ms = parseTsMs(evt.ts);
+    if (ms != null && ms < cutoffMs) break;
+    events.push({
+      ts: String(evt.ts || ''),
+      type,
+      policy_version: String(evt.policy_version || ''),
+      policy_path: String(evt.policy_path || ''),
+      violation_counts: safeCountMap(evt.violation_counts),
+      violations: compactIntegrityViolations(evt.violations, Math.min(6, MAX_INTEGRITY_FILES)),
+      verify_ok_after: evt.verify_ok_after === true
+    });
+    if (events.length >= cap) break;
+  }
+  return events;
+}
+
+function loadIntegrityStatus(hours = DEFAULT_HOURS) {
+  const recentEvents = loadRecentIntegrityEvents(hours, MAX_INTEGRITY_EVENTS);
+  const latestViolation = recentEvents.find((evt) => evt && evt.type === 'integrity_violation_block') || null;
+  const latestReseal = recentEvents.find((evt) => evt && evt.type === 'integrity_reseal_apply' && evt.verify_ok_after === true) || null;
+  const fallback = {
+    available: false,
+    ok: null,
+    active_alert: false,
+    severity: latestViolation ? 'warning' : 'ok',
+    policy_path: latestViolation ? String(latestViolation.policy_path || '') : '',
+    policy_version: latestViolation ? String(latestViolation.policy_version || '') : '',
+    checked_present_files: null,
+    expected_files: null,
+    violation_total: latestViolation ? sumCountMap(latestViolation.violation_counts) : 0,
+    violation_counts: latestViolation ? safeCountMap(latestViolation.violation_counts) : {},
+    top_files: latestViolation
+      ? compactIntegrityViolations(latestViolation.violations, MAX_INTEGRITY_FILES).map((row) => String(row.file || '')).filter(Boolean)
+      : [],
+    violations: latestViolation ? compactIntegrityViolations(latestViolation.violations, MAX_INTEGRITY_FILES) : [],
+    last_violation_ts: latestViolation ? String(latestViolation.ts || '') : '',
+    last_reseal_ts: latestReseal ? String(latestReseal.ts || '') : '',
+    recent_events: recentEvents
+  };
+  try {
+    const { verifyIntegrity } = require(path.join(REPO_ROOT, 'lib', 'security_integrity'));
+    const policyPath = String(process.env.SPINE_INTEGRITY_POLICY || INTEGRITY_POLICY_PATH).trim() || INTEGRITY_POLICY_PATH;
+    const verify = verifyIntegrity(policyPath);
+    const violationCounts = safeCountMap(verify && verify.violation_counts);
+    const violations = compactIntegrityViolations(verify && verify.violations, MAX_INTEGRITY_FILES);
+    const topFiles = violations
+      .map((row) => String(row.file || '').trim())
+      .filter(Boolean)
+      .slice(0, MAX_INTEGRITY_FILES);
+    const activeAlert = !(verify && verify.ok === true);
+    return {
+      available: true,
+      ok: verify && verify.ok === true,
+      active_alert: activeAlert,
+      severity: activeAlert ? 'critical' : (latestViolation ? 'recent' : 'ok'),
+      policy_path: String(verify && verify.policy_path || policyPath),
+      policy_version: String(verify && verify.policy_version || ''),
+      checked_present_files: Number(verify && verify.checked_present_files || 0),
+      expected_files: Number(verify && verify.expected_files || 0),
+      violation_total: sumCountMap(violationCounts),
+      violation_counts: violationCounts,
+      top_files: topFiles,
+      violations,
+      last_violation_ts: latestViolation ? String(latestViolation.ts || '') : '',
+      last_reseal_ts: latestReseal ? String(latestReseal.ts || '') : '',
+      recent_events: recentEvents
+    };
+  } catch {
+    const hasLatestViolation = !!latestViolation;
+    const latestViolationMs = latestViolation ? Number(parseTsMs(latestViolation.ts)) : null;
+    const latestResealMs = latestReseal ? Number(parseTsMs(latestReseal.ts)) : null;
+    const resealedAfterViolation = Number.isFinite(latestViolationMs)
+      && Number.isFinite(latestResealMs)
+      && latestResealMs >= latestViolationMs;
+    return {
+      ...fallback,
+      active_alert: hasLatestViolation && !resealedAfterViolation,
+      severity: hasLatestViolation
+        ? (resealedAfterViolation ? 'recent' : 'critical')
+        : 'ok'
+    };
+  }
 }
 
 function loadDirectiveSummary() {
@@ -447,6 +802,160 @@ function loadLayerModelCached() {
   return cloneJson(payload);
 }
 
+function loadChangeStateSnapshot(layers) {
+  const nowMs = Date.now();
+  if (
+    CHANGE_STATE_CACHE.payload
+    && (nowMs - Number(CHANGE_STATE_CACHE.ts || 0)) < CHANGE_STATE_CACHE_TTL_MS
+  ) {
+    return cloneJson(CHANGE_STATE_CACHE.payload);
+  }
+  const statusRes = runCmd('git', ['status', '--porcelain=v1', '-uall']);
+  const parsedStatus = statusRes.ok
+    ? parseGitStatusPorcelain(statusRes.stdout)
+    : { staged: [], dirty: [] };
+  const aheadInfo = gitAheadInfo();
+  const pendingPushFiles = (aheadInfo.has_upstream && aheadInfo.upstream && aheadInfo.ahead_count > 0)
+    ? parsePathLines(runCmd('git', ['diff', '--name-only', `${aheadInfo.upstream}..HEAD`]).stdout)
+    : [];
+  const lastCommit = gitLastCommitInfo();
+
+  if (
+    Number.isFinite(Number(PUSH_TRANSITION_STATE.last_ahead_count))
+    && Number(PUSH_TRANSITION_STATE.last_ahead_count) > 0
+    && aheadInfo.ahead_count === 0
+  ) {
+    PUSH_TRANSITION_STATE.just_pushed_until_ms = nowMs + JUST_PUSHED_WINDOW_MS;
+    PUSH_TRANSITION_STATE.last_push_ts = nowIso();
+  }
+  if (!Number.isFinite(Number(PUSH_TRANSITION_STATE.last_ahead_count))) {
+    PUSH_TRANSITION_STATE.last_ahead_count = aheadInfo.ahead_count;
+  } else {
+    PUSH_TRANSITION_STATE.last_ahead_count = aheadInfo.ahead_count;
+  }
+  const justPushedActive = nowMs <= Number(PUSH_TRANSITION_STATE.just_pushed_until_ms || 0);
+  const justPushedFiles = justPushedActive ? lastCommit.files : [];
+
+  const fileUniverse = Array.from(new Set([
+    ...parsedStatus.staged,
+    ...parsedStatus.dirty,
+    ...pendingPushFiles,
+    ...justPushedFiles
+  ]));
+  const recentWriteFiles = collectRecentWriteFiles(fileUniverse, ACTIVE_WRITE_WINDOW_MS);
+  const sets = {
+    staged: parsedStatus.staged,
+    dirty: parsedStatus.dirty,
+    pending_push: pendingPushFiles,
+    active_write: recentWriteFiles,
+    just_pushed: justPushedFiles
+  };
+
+  const moduleByRel = {};
+  const submoduleByRel = {};
+  let activeModules = 0;
+  let activeSubmodules = 0;
+  for (const layer of layers || []) {
+    for (const mod of layer.modules || []) {
+      const modRel = normalizeRelPath(mod && mod.rel || '');
+      if (!modRel) continue;
+      const modState = buildNodeChangeState(modRel, sets, {
+        last_push_ts: PUSH_TRANSITION_STATE.last_push_ts
+      });
+      moduleByRel[modRel] = modState;
+      if (modState.changed) activeModules += 1;
+      for (const sub of mod.submodules || []) {
+        const subRel = normalizeRelPath(sub && sub.rel || '');
+        if (!subRel) continue;
+        const subState = buildNodeChangeState(subRel, sets, {
+          last_push_ts: PUSH_TRANSITION_STATE.last_push_ts
+        });
+        submoduleByRel[subRel] = subState;
+        if (subState.changed) activeSubmodules += 1;
+      }
+    }
+  }
+  const summary = {
+    dirty_files_total: Number(parsedStatus.dirty.length || 0),
+    staged_files_total: Number(parsedStatus.staged.length || 0),
+    pending_push_files_total: Number(pendingPushFiles.length || 0),
+    active_write_files_total: Number(recentWriteFiles.length || 0),
+    ahead_count: Number(aheadInfo.ahead_count || 0),
+    pending_push: Number(aheadInfo.ahead_count || 0) > 0,
+    just_pushed: justPushedActive,
+    active_modules: activeModules,
+    active_submodules: activeSubmodules,
+    top_files: fileUniverse.slice(0, MAX_CHANGE_FILES),
+    has_upstream: aheadInfo.has_upstream === true,
+    upstream: String(aheadInfo.upstream || ''),
+    last_push_ts: String(PUSH_TRANSITION_STATE.last_push_ts || ''),
+    last_commit_ts: String(lastCommit.ts || '')
+  };
+  const payload = {
+    generated_at: nowIso(),
+    summary,
+    module_by_rel: moduleByRel,
+    submodule_by_rel: submoduleByRel
+  };
+  CHANGE_STATE_CACHE = {
+    ts: nowMs,
+    payload
+  };
+  return cloneJson(payload);
+}
+
+function applyChangeStateToLayers(layers, changeSnapshot) {
+  const moduleByRel = changeSnapshot && changeSnapshot.module_by_rel && typeof changeSnapshot.module_by_rel === 'object'
+    ? changeSnapshot.module_by_rel
+    : {};
+  const submoduleByRel = changeSnapshot && changeSnapshot.submodule_by_rel && typeof changeSnapshot.submodule_by_rel === 'object'
+    ? changeSnapshot.submodule_by_rel
+    : {};
+  for (const layer of layers || []) {
+    for (const mod of layer.modules || []) {
+      const modRel = normalizeRelPath(mod && mod.rel || '');
+      mod.change_state = modRel && moduleByRel[modRel]
+        ? moduleByRel[modRel]
+        : {
+            active_write: false,
+            dirty: false,
+            staged: false,
+            pending_push: false,
+            just_pushed: false,
+            changed: false,
+            file_count: 0,
+            dirty_file_count: 0,
+            staged_file_count: 0,
+            pending_push_file_count: 0,
+            active_write_file_count: 0,
+            top_files: [],
+            last_push_ts: ''
+          };
+      for (const sub of mod.submodules || []) {
+        const subRel = normalizeRelPath(sub && sub.rel || '');
+        sub.change_state = subRel && submoduleByRel[subRel]
+          ? submoduleByRel[subRel]
+          : {
+              active_write: false,
+              dirty: false,
+              staged: false,
+              pending_push: false,
+              just_pushed: false,
+              changed: false,
+              file_count: 0,
+              dirty_file_count: 0,
+              staged_file_count: 0,
+              pending_push_file_count: 0,
+              active_write_file_count: 0,
+              top_files: [],
+              last_push_ts: ''
+            };
+      }
+    }
+  }
+  return layers;
+}
+
 function edgeKey(from, to, label) {
   return `${String(from)}|${String(to)}|${String(label || '')}`;
 }
@@ -490,7 +999,7 @@ function topCounts(rows, limit = 10) {
     .slice(0, limit);
 }
 
-function buildSummary(runs, audits, windowHours) {
+function buildSummary(runs, audits, windowHours, integrityStatus = null) {
   const resultCounts = {};
   const capabilityCounts = {};
   const proposalTypeCounts = {};
@@ -532,6 +1041,13 @@ function buildSummary(runs, audits, windowHours) {
   }
 
   const totalRuns = runs.length;
+  const integrity = integrityStatus && typeof integrityStatus === 'object' ? integrityStatus : {};
+  const integrityOk = integrity.ok === true;
+  const integrityAlert = integrity.active_alert === true;
+  const integrityCounts = safeCountMap(integrity.violation_counts);
+  const integrityTopFiles = Array.isArray(integrity.top_files)
+    ? integrity.top_files.map((v) => String(v || '').trim()).filter(Boolean).slice(0, MAX_INTEGRITY_FILES)
+    : [];
   return {
     generated_at: nowIso(),
     window_hours: windowHours,
@@ -544,6 +1060,18 @@ function buildSummary(runs, audits, windowHours) {
     policy_holds: policyHolds,
     confidence_fallback: confidenceFallback,
     route_blocked: routeBlocked,
+    integrity_ok: integrityOk,
+    integrity_active_alert: integrityAlert,
+    integrity_severity: String(integrity.severity || (integrityAlert ? 'critical' : 'ok')),
+    integrity_violation_total: Number(integrity.violation_total || sumCountMap(integrityCounts)),
+    integrity_violation_counts: integrityCounts,
+    integrity_checked_present_files: Number(integrity.checked_present_files || 0),
+    integrity_expected_files: Number(integrity.expected_files || 0),
+    integrity_policy_path: String(integrity.policy_path || ''),
+    integrity_policy_version: String(integrity.policy_version || ''),
+    integrity_top_files: integrityTopFiles,
+    integrity_last_violation_ts: String(integrity.last_violation_ts || ''),
+    integrity_last_reseal_ts: String(integrity.last_reseal_ts || ''),
     top_results: topCounts(resultCounts, 12),
     top_capabilities: topCounts(capabilityCounts, 10),
     top_proposal_types: topCounts(proposalTypeCounts, 10),
@@ -887,6 +1415,11 @@ function buildHoloLinks(layers, summary, runs, aliasToId) {
 function buildHoloModel(runs, summary) {
   const scanned = loadLayerModelCached();
   const layers = assignLayerActivity(scanned.layers || [], runs || [], summary || {}, scanned.alias_to_id || {});
+  const changeSnapshot = loadChangeStateSnapshot(layers);
+  applyChangeStateToLayers(layers, changeSnapshot);
+  const changeSummary = changeSnapshot && changeSnapshot.summary && typeof changeSnapshot.summary === 'object'
+    ? changeSnapshot.summary
+    : {};
   const io = {
     inputs: [
       {
@@ -930,12 +1463,32 @@ function buildHoloModel(runs, summary) {
   const noChange = Number(summary && summary.no_change || 0);
   const yieldRate = executed > 0 ? shipped / executed : 0;
   const driftRate = executed > 0 ? noChange / executed : 0;
+  const integrityAlert = summary && summary.integrity_active_alert === true ? 1 : 0;
+  const integrityViolationTotal = Number(summary && summary.integrity_violation_total || 0);
+  const pendingPush = changeSummary.pending_push === true ? 1 : 0;
+  const justPushed = changeSummary.just_pushed === true ? 1 : 0;
 
   return {
     generated_at: nowIso(),
     layers,
     links,
     io,
+    change: {
+      dirty_files_total: Number(changeSummary.dirty_files_total || 0),
+      staged_files_total: Number(changeSummary.staged_files_total || 0),
+      pending_push_files_total: Number(changeSummary.pending_push_files_total || 0),
+      active_write_files_total: Number(changeSummary.active_write_files_total || 0),
+      active_modules: Number(changeSummary.active_modules || 0),
+      active_submodules: Number(changeSummary.active_submodules || 0),
+      ahead_count: Number(changeSummary.ahead_count || 0),
+      pending_push: changeSummary.pending_push === true,
+      just_pushed: changeSummary.just_pushed === true,
+      top_files: Array.isArray(changeSummary.top_files) ? changeSummary.top_files.slice(0, MAX_CHANGE_FILES) : [],
+      has_upstream: changeSummary.has_upstream === true,
+      upstream: String(changeSummary.upstream || ''),
+      last_push_ts: String(changeSummary.last_push_ts || ''),
+      last_commit_ts: String(changeSummary.last_commit_ts || '')
+    },
     metrics: {
       run_events: Number(summary && summary.run_events || 0),
       executed,
@@ -944,7 +1497,16 @@ function buildHoloModel(runs, summary) {
       reverted: Number(summary && summary.reverted || 0),
       policy_holds: Number(summary && summary.policy_holds || 0),
       yield_rate: Number(yieldRate.toFixed(4)),
-      drift_proxy: Number(driftRate.toFixed(4))
+      drift_proxy: Number(driftRate.toFixed(4)),
+      integrity_alert: integrityAlert,
+      integrity_violation_total: integrityViolationTotal,
+      integrity_severity: String(summary && summary.integrity_severity || (integrityAlert ? 'critical' : 'ok')),
+      change_pending_push: pendingPush,
+      change_just_pushed: justPushed,
+      change_active_modules: Number(changeSummary.active_modules || 0),
+      change_dirty_files_total: Number(changeSummary.dirty_files_total || 0),
+      change_staged_files_total: Number(changeSummary.staged_files_total || 0),
+      change_ahead_count: Number(changeSummary.ahead_count || 0)
     }
   };
 }
@@ -953,7 +1515,8 @@ function buildPayload(hours) {
   const telemetry = loadRecentTelemetry(hours, MAX_EVENTS);
   const directives = loadDirectiveSummary();
   const strategy = loadStrategySummary();
-  const summary = buildSummary(telemetry.runs, telemetry.audits, telemetry.window_hours);
+  const integrity = loadIntegrityStatus(telemetry.window_hours);
+  const summary = buildSummary(telemetry.runs, telemetry.audits, telemetry.window_hours, integrity);
   const graph = buildGraph(telemetry.runs, directives, strategy);
   const holo = buildHoloModel(telemetry.runs, summary);
   return {
@@ -961,7 +1524,10 @@ function buildPayload(hours) {
     generated_at: nowIso(),
     summary,
     graph,
-    holo
+    holo,
+    incidents: {
+      integrity
+    }
   };
 }
 
@@ -1006,6 +1572,7 @@ function createHoloSnapshot(hours, reason) {
     generated_at: payload.generated_at,
     summary: payload.summary,
     holo: payload.holo,
+    incidents: payload.incidents || {},
     spine_pulse: buildSpinePulse(h)
   };
 }
@@ -1209,7 +1776,8 @@ function main() {
           ok: true,
           generated_at: payload.generated_at,
           summary: payload.summary,
-          holo: payload.holo
+          holo: payload.holo,
+          incidents: payload.incidents || {}
         });
       } catch (err) {
         sendJson(res, 500, {
