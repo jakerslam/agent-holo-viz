@@ -6,7 +6,7 @@ import { EffectComposer, Bloom, ChromaticAberration } from '@react-three/postpro
 import { useRef, useMemo, useState, useEffect } from 'react';
 import * as THREE from 'three';
 
-// GPU Detection
+// GPU Detection - aggressive downgrade for integrated graphics
 function useGPUStats() {
   const [gpuTier, setGpuTier] = useState<'low' | 'medium' | 'high'>('medium');
   
@@ -18,21 +18,45 @@ function useGPUStats() {
       return;
     }
     
+    // Default to low for safety, upgrade only if strong GPU detected
+    let detectedTier: 'low' | 'medium' | 'high' = 'low';
+    
     const debugInfo = (gl as any).getExtension('WEBGL_debug_renderer_info');
     if (debugInfo) {
       const renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
-      if (renderer.includes('Apple') || renderer.includes('Intel')) {
-        setGpuTier('medium');
-      } else if (renderer.includes('M1') || renderer.includes('M2') || renderer.includes('M3')) {
-        setGpuTier('high');
-      } else if (renderer.includes('NVIDIA') || renderer.includes('AMD')) {
-        setGpuTier('high');
+      const vendor = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL);
+      
+      // Discrete GPUs only for high tier
+      if (renderer.includes('NVIDIA') || renderer.includes('AMD') || renderer.includes('RTX')) {
+        detectedTier = 'high';
+      }
+      // Apple Silicon M-series PRO/MAX/ULTRA only = medium tier
+      else if (renderer.includes('M1 Pro') || renderer.includes('M1 Max') || renderer.includes('M1 Ultra') ||
+               renderer.includes('M2 Pro') || renderer.includes('M2 Max') || renderer.includes('M2 Ultra') ||
+               renderer.includes('M3 Pro') || renderer.includes('M3 Max') || renderer.includes('M3 Ultra')) {
+        detectedTier = 'medium';
+      }
+      // All other Apple Silicon = LOW (better performance on laptops)
+      else if (renderer.includes('Apple') || renderer.includes('Apple M1') || renderer.includes('Apple M2') || renderer.includes('Apple M3')) {
+        detectedTier = 'low';
+      }
+      // Intel integrated = low
+      else if (renderer.includes('Intel') || vendor.includes('Intel')) {
+        detectedTier = 'low';
+      }
+      // Unknown / other = low for safety
+      else {
+        detectedTier = 'low';
       }
     }
     
+    // Memory check - further downgrade if low RAM
     if ('deviceMemory' in navigator && (navigator as any).deviceMemory < 8) {
-      setGpuTier('low');
+      if (detectedTier === 'high') detectedTier = 'medium';
+      else if (detectedTier === 'medium') detectedTier = 'low';
     }
+    
+    setGpuTier(detectedTier);
   }, []);
   
   return gpuTier;
@@ -337,6 +361,7 @@ export default function ProtheusAdaptiveViz() {
   ];
   
   const connections = useMemo(() => {
+    const maxConnections = gpuTier === 'low' ? 10 : gpuTier === 'medium' ? 15 : 21;
     const conns = [];
     for (let i = 0; i < modules.length; i++) {
       for (let j = i + 1; j < modules.length; j++) {
@@ -347,7 +372,7 @@ export default function ProtheusAdaptiveViz() {
         });
       }
     }
-    return conns;
+    return conns.slice(0, maxConnections);
   }, [modules, gpuTier]);
   
   const ioNodes = useMemo(() => {
@@ -374,29 +399,19 @@ export default function ProtheusAdaptiveViz() {
   };
 
   return (
-    <div className="w-full h-screen bg-black overflow-hidden relative">
-      <div className="absolute top-6 left-6 z-50 font-mono">
-        <div className="text-2xl mb-2 tracking-widest" style={{ color: colors.modules }}>
-          PROTHEUS_OS_V1
-        </div>
-        <div className="space-y-1 text-sm opacity-80 text-white">
-          <div>GPU: {gpuTier.toUpperCase()}</div>
-          <div>Drift: <span className="text-red-400">{stats.drift}%</span></div>
-          <div>MODULES: {modules.length}</div>
-          <div>CONDUITS: {connections.length}</div>
-          <div>VIEW: {selectedModule || 'NONE'}</div>
-        </div>
-      </div>
-      
-      <Canvas
+    <div className="w-screen h-screen bg-black flex flex-col">
+      {/* Main Canvas Area - takes up remaining space */}
+      <div className="flex-1 relative min-h-0">
+        <Canvas
         camera={{ position: [0, 30, 60], fov: 45 }}
-        gl={{ antialias: gpuTier !== 'low' }}
-        dpr={gpuTier === 'low' ? 1 : gpuTier === 'medium' ? 1.5 : 2}
+        gl={{ antialias: gpuTier === 'high', powerPreference: gpuTier === 'low' ? 'low-power' : 'high-performance' }}
+        dpr={gpuTier === 'low' ? [1, 1] : gpuTier === 'medium' ? [1, 1.5] : [1, 2]}
+        style={{ width: '100%', height: '100%' }}
       >
-        <color attach="background" args={['#000510']} />
-        <ambientLight intensity={gpuTier === 'low' ? 0.3 : 0.2} />
-        <pointLight position={[50, 50, 50]} color={colors.modules} intensity={gpuTier === 'low' ? 3 : 2} />
-        <pointLight position={[-50, 30, -50]} color={colors.packets} intensity={1} />
+        <color attach="background" args={['#000208']} />
+        <ambientLight intensity={gpuTier === 'low' ? 0.4 : 0.2} />
+        <pointLight position={[30, 40, 30]} color={colors.modules} intensity={gpuTier === 'low' ? 2 : 1} />
+        <pointLight position={[-30, 20, -30]} color={colors.packets} intensity={0.5} />
         
         {/* Floor grid */}
         <group rotation={[-Math.PI / 2, 0, 0]} position={[0, -20, 0]}>
@@ -444,7 +459,7 @@ export default function ProtheusAdaptiveViz() {
         ))}
         
         {/* I/O */}
-        {ioNodes.map((io, i) => (
+        {ioNodes.slice(0, gpuTier === 'low' ? 3 : 6).map((io, i) => (
           <IONode
             key={i}
             position={io.pos}
@@ -454,10 +469,10 @@ export default function ProtheusAdaptiveViz() {
           />
         ))}
         
-        {gpuTier === 'high' && <Stars radius={400} depth={50} count={6000} />}
+        {gpuTier === 'high' && <Stars radius={300} depth={30} count={2000} />}
         
-        <OrbitControls autoRotate autoRotateSpeed={0.1} enablePan enableZoom />
-        <Environment preset="night" />
+        <OrbitControls autoRotate autoRotateSpeed={gpuTier === 'low' ? 0.02 : 0.05} enablePan enableZoom />
+        {gpuTier !== 'low' && <Environment preset="night" />}
         
         {gpuTier !== 'low' && (
           <EffectComposer>
@@ -465,7 +480,38 @@ export default function ProtheusAdaptiveViz() {
             <ChromaticAberration offset={[0.0008, 0.0008]} />
           </EffectComposer>
         )}
-      </Canvas>
+        </Canvas>
+      </div>
+      
+      {/* Analytics Panel - fixed height bar at bottom */}
+      <div className="h-20 bg-black/90 border-t border-gray-800 flex items-center justify-between px-8 font-mono text-sm text-white z-50">
+        <div className="flex items-center gap-8">
+          <div className="text-xl tracking-widest font-bold" style={{ color: colors.modules }}>
+            PROTHEUS_OS_V1
+          </div>
+          <div className="text-gray-400">
+            GPU: <span className="text-white">{gpuTier.toUpperCase()}</span>
+          </div>
+        </div>
+        
+        <div className="flex items-center gap-8">
+          <div>
+            DRIFT: <span className="text-red-400 font-bold">{stats.drift}%</span>
+          </div>
+          <div>
+            MODULES: <span className="text-white">{modules.length}</span>
+          </div>
+          <div>
+            CONDUITS: <span className="text-white">{connections.length}</span>
+          </div>
+          <div>
+            VIEW: <span className="text-yellow-400">{selectedModule || 'NONE'}</span>
+          </div>
+          <div className="text-gray-500">
+            {gpuTier === 'high' ? '●' : '○'} BLOOM
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
