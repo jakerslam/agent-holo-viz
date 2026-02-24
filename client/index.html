@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Protheus Holographic System Visualizer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-0: #050910;
+      --bg-1: #091525;
+      --teal: #5df7ff;
+      --blue: #1c8cff;
+      --orange: #ff9f1f;
+      --panel: rgba(6, 14, 24, 0.72);
+      --line: rgba(93, 247, 255, 0.26);
+      --ink: #d7f9ff;
+      --muted: rgba(215, 249, 255, 0.74);
+    }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; }
+    body {
+      overflow: hidden;
+      background:
+        radial-gradient(1200px 700px at 20% 15%, rgba(28, 140, 255, 0.22), transparent 65%),
+        radial-gradient(900px 520px at 84% 80%, rgba(255, 159, 31, 0.18), transparent 63%),
+        linear-gradient(150deg, var(--bg-0), var(--bg-1));
+      color: var(--ink);
+      font-family: "Orbitron", sans-serif;
+      letter-spacing: 0.04em;
+    }
+    #holoCanvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      touch-action: none;
+      cursor: crosshair;
+    }
+    #titleBlock {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      pointer-events: none;
+      text-shadow: 0 0 22px rgba(93, 247, 255, 0.35);
+    }
+    #titleBlock h1 {
+      margin: 0;
+      font-size: clamp(0.86rem, 1.8vw, 1.18rem);
+      font-weight: 700;
+    }
+    #titleBlock p {
+      margin: 6px 0 0;
+      font-size: clamp(0.64rem, 1.3vw, 0.76rem);
+      color: var(--muted);
+      font-family: "Share Tech Mono", monospace;
+      letter-spacing: 0.07em;
+    }
+    #controlBar {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 12;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(5, 13, 22, 0.66);
+      backdrop-filter: blur(8px);
+      box-shadow: 0 0 34px rgba(28, 140, 255, 0.18);
+    }
+    #controlBar label {
+      font-size: 0.64rem;
+      font-family: "Share Tech Mono", monospace;
+      color: var(--muted);
+    }
+    #controlBar select, #controlBar button {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(7, 20, 32, 0.9);
+      color: var(--ink);
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.72rem;
+      padding: 6px 8px;
+    }
+    #controlBar button {
+      cursor: pointer;
+      background: rgba(21, 126, 196, 0.88);
+    }
+    #controlBar button:hover { filter: brightness(1.08); }
+    #qualityBadge {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 0.64rem;
+      font-family: "Share Tech Mono", monospace;
+      color: var(--muted);
+      background: rgba(8, 20, 32, 0.62);
+    }
+    #selectedTag {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      z-index: 12;
+      max-width: min(52vw, 520px);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-size: 0.74rem;
+      font-family: "Share Tech Mono", monospace;
+      color: var(--ink);
+      background: rgba(5, 14, 24, 0.74);
+      box-shadow: 0 0 24px rgba(93, 247, 255, 0.15);
+      opacity: 0;
+      transform: translateY(8px);
+      transition: opacity 140ms ease, transform 140ms ease;
+      pointer-events: none;
+    }
+    #selectedTag.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    #statsPanel {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      z-index: 12;
+      width: min(420px, 92vw);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 0 34px rgba(93, 247, 255, 0.12);
+    }
+    #statsPanel h2 {
+      margin: 0 0 8px;
+      font-size: 0.74rem;
+      color: var(--muted);
+      letter-spacing: 0.1em;
+    }
+    #statsGrid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(120px, 1fr));
+      gap: 8px;
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.72rem;
+    }
+    #statsGrid .item {
+      border: 1px dashed rgba(93, 247, 255, 0.24);
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: rgba(9, 25, 40, 0.58);
+    }
+    #statsGrid .k {
+      color: rgba(215, 249, 255, 0.65);
+      font-size: 0.62rem;
+    }
+    #statsGrid .v {
+      margin-top: 2px;
+      color: var(--ink);
+      font-size: 0.78rem;
+    }
+    #metaLine {
+      margin-top: 8px;
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.64rem;
+      color: rgba(215, 249, 255, 0.72);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="holoCanvas"></canvas>
+
+  <section id="titleBlock">
+    <h1>Protheus Holographic Spine</h1>
+    <p>Layered live system map with packet flow</p>
+  </section>
+
+  <section id="controlBar">
+    <label for="hours">Window</label>
+    <select id="hours">
+      <option value="6">6h</option>
+      <option value="12">12h</option>
+      <option value="24" selected>24h</option>
+      <option value="72">72h</option>
+      <option value="168">7d</option>
+    </select>
+    <button id="refresh">Refresh</button>
+    <span id="qualityBadge">GPU: Detecting</span>
+  </section>
+
+  <section id="statsPanel">
+    <h2>System Stats</h2>
+    <div id="statsGrid"></div>
+    <div id="metaLine">Booting hologram...</div>
+  </section>
+
+  <aside id="selectedTag"></aside>
+  <script src="/app.js"></script>
+</body>
+</html>

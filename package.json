@@ -1,33 +1,12 @@
 {
   "name": "agent-holo-viz",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "private": true,
+  "description": "Holographic live visualizer for OpenClaw/Protheus system internals",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+    "start": "node server/system_visualizer_server.js --host 127.0.0.1 --port 8787 --hours 24"
   },
   "dependencies": {
-    "next": "14.2.15",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "three": "^0.169.0",
-    "@react-three/fiber": "^8.17.0",
-    "@react-three/drei": "^9.115.0",
-    "@react-three/postprocessing": "^2.16.0",
-    "three-stdlib": "^2.35.13",
-    "socket.io-client": "^4.8.1",
-    "tailwind-merge": "^2.5.4",
-    "framer-motion": "^11.11.9",
-    "zustand": "^4.5.0"
-  },
-  "devDependencies": {
-    "@types/node": "^22",
-    "@types/react": "^19",
-    "@types/three": "^0.169.0",
-    "autoprefixer": "^10",
-    "postcss": "^8",
-    "tailwindcss": "^3",
-    "typescript": "^5"
+    "ws": "^8.19.0"
   }
 }

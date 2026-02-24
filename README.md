@@ -1,42 +1,31 @@
-# agent-holo-viz — Ultron Interface for 160k LOC Agentic OS
+# Agent Holo Viz
 
-The definitive holographic visualizer for the most stable autonomous operating system on Earth.
+Sidecar repository for the full-screen holographic system visualizer.
 
-- 6-month runtime visualized with live 3% drift fractures
-- Golden JARVIS-style OS Kernel at center
-- Hierarchical subsystems → thousands of agents
-- Real-time particle message flows
-- Gesture + voice ready (MediaPipe + Web Speech)
-- Pepper's Ghost physical hologram ready
+## What it does
 
-Built for the creator of the immortal 3%-drift OS.
+- Renders layered module topology (adaptive/systems/memory/habits/lib/config/state).
+- Streams live updates over WebSocket from autonomy + spine run events.
+- Falls back to HTTP polling if WebSocket disconnects.
+- Auto-scales rendering tier based on detected GPU capacity.
 
-## Install & Run
+## Run
 
 ```bash
-git clone https://github.com/jakerslam/agent-holo-viz.git
-cd agent-holo-viz
+cd /Users/jay/.openclaw/workspace/agent-holo-viz
 npm install
-npm run dev
+npm run start
 ```
 
-Open http://localhost:3000 — you're standing in your OS.
+Open:
 
-## Connect Your OS
+- `http://127.0.0.1:8787`
 
-Update `src/lib/os-websocket.ts` with your telemetry endpoint:
+## Wiring
 
-```typescript
-const socket = io('http://localhost:8000'); // Your OS endpoint
-```
+- API snapshot: `GET /api/holo?hours=24`
+- Live stream: `ws://127.0.0.1:8787/ws/holo`
 
-## Structure
+## Workspace compatibility
 
-- `src/components/` — 3D visualization components
-- `src/lib/os-websocket.ts` — WebSocket bridge to your OS
-- `src/shaders/` — Holographic GLSL shaders
-- `public/` — Assets (optional HDR environment)
-
-## License
-
-MIT — Built with React Three Fiber, Three.js, and 🔥
+The workspace entrypoint `systems/ops/system_visualizer_server.js` is a launcher that delegates to this sidecar server.
