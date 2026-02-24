@@ -36,19 +36,30 @@ const holographicFragmentShader = `
   }
 `;
 
-const HolographicMaterial = ({ color = '#ff8800', opacity = 0.75 }) => (
-  <shaderMaterial
-    vertexShader={holographicVertexShader}
-    fragmentShader={holographicFragmentShader}
-    uniforms={{
-      time: { value: 0 },
-      color: { value: new THREE.Color(color) },
-      opacity: { value: opacity }
-    }}
-    transparent
-    side={THREE.DoubleSide}
-  />
-);
+function HolographicMaterial({ color = '#ff8800', opacity = 0.75 }) {
+  const materialRef = useRef<THREE.ShaderMaterial>(null);
+
+  useFrame((state) => {
+    if (materialRef.current) {
+      materialRef.current.uniforms.time.value = state.clock.elapsedTime;
+    }
+  });
+
+  return (
+    <shaderMaterial
+      ref={materialRef}
+      vertexShader={holographicVertexShader}
+      fragmentShader={holographicFragmentShader}
+      uniforms={{
+        time: { value: 0 },
+        color: { value: new THREE.Color(color) },
+        opacity: { value: opacity }
+      }}
+      transparent
+      side={THREE.DoubleSide}
+    />
+  );
+}
 
 // ====================== TRAVELING PARTICLES ALONG TENDRILS ======================
 function FlowingParticles({ subsystems }: { subsystems: any[] }) {
