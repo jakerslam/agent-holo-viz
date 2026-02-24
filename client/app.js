@@ -52,6 +52,11 @@ const SPINE_NODE_ID = 'spine:core';
 const SPINE_NODE_PATH = 'systems/spine';
 const SYSTEM_ROOT_ID = 'system:root';
 const WORKSPACE_ROOT_PATH = '/Users/jay/.openclaw/workspace';
+const PACKET_RADIUS_FLOOR = 0.45;
+const PACKET_RADIUS_CEILING = 3.8;
+const MODULE_RADIUS_MIN = 10;
+const MODULE_RADIUS_MAX = 34;
+const MODULE_RADIUS_SIZE_BLEND = 0.42;
 const SHELL_ORDER_SWAP_COOLDOWN_MS = 10 * 60 * 1000;
 const SHELL_INTRO_INITIAL_DELAY_MS = 110;
 const SHELL_INTRO_LAYER_DELAY_MS = 70;
@@ -872,9 +877,73 @@ function integrityRowsForSelection(incident, selectedType, selectedNode) {
 function isPreviewErrorRow(key) {
   const k = String(key || '').trim();
   if (!k) return false;
+  if (k === 'Errors') return true;
+  if (k === 'Error Source') return true;
+  if (k === 'Error Reason') return true;
+  if (k === 'Error State') return true;
   if (k === 'Integrity Errors') return true;
   if (/^Error\s+\d+$/i.test(k)) return true;
   return false;
+}
+
+function isPreviewWarningRow(key, value) {
+  const k = String(key || '').trim().toLowerCase();
+  const v = String(value == null ? '' : value).trim().toLowerCase();
+  if (!k && !v) return false;
+  if (isPreviewErrorRow(key)) return false;
+  if (k === 'integrity' && (v.includes('warning') || v.includes('recent'))) return true;
+  if (k === 'health' && v.includes('watch')) return true;
+  if (k === 'flow status' && (v.includes('degraded') || v.includes('partial') || v.includes('blocked'))) return true;
+  if (k.includes('warning') || k.includes('warn')) return true;
+  if (v.includes('warning') || v.includes('warn')) return true;
+  if (v.includes('watch')) return true;
+  if (v.includes('recent')) return true;
+  return false;
+}
+
+function nodeErrorRowsForSelection(node, integrityRows = [], errorSignal = 0) {
+  const out = [];
+  const row = node && typeof node === 'object' ? node : null;
+  if (!row) return out;
+  const hasIntegrityRows = Array.isArray(integrityRows) && integrityRows.length > 0;
+  const hasNodeError = row.error_state_active === true || row.integrity_alert === true;
+  if (!hasNodeError || hasIntegrityRows) return out;
+
+  const source = row.integrity_alert === true
+    ? 'integrity'
+    : 'runtime';
+  const reason = source === 'integrity'
+    ? 'Integrity alert active for selected path.'
+    : 'Selected node is in active error state (runtime signal).';
+
+  out.push(['Errors', 'Active']);
+  out.push(['Error Source', source]);
+  out.push(['Error Reason', reason]);
+  const hint = clamp(Number(row.error_hint || 0), 0, 1);
+  if (hint > 0) out.push(['Error Hint', `${fmtNum(hint * 100)}%`]);
+  const signal = clamp(Number(errorSignal || 0), 0, 1);
+  if (signal > 0) out.push(['Error Signal', `${fmtNum(signal * 100)}%`]);
+  return out;
+}
+
+function linkErrorRowsForSelection(link) {
+  const out = [];
+  const row = link && typeof link === 'object' ? link : null;
+  if (!row) return out;
+  const errWeight = clamp(Number(row.error_weight || 0), 0, 1);
+  const blockedRatio = clamp(Number(row.blocked_ratio || 0), 0, 1);
+  const blocked = row.flow_blocked === true || blockedRatio > 0.02;
+  const degraded = errWeight >= 0.045;
+  if (!blocked && !degraded) return out;
+
+  out.push(['Errors', blocked ? 'Blocked Flow' : 'Degraded Flow']);
+  out.push(['Error Source', blocked ? 'flow_block' : 'error_weight']);
+  if (blocked) {
+    out.push(['Error Reason', String(row.block_reason || 'Blocked by policy/gate/route guard.')]);
+  } else {
+    out.push(['Error Reason', `Link error weight ${fmtNum(errWeight * 100)}% exceeded watch threshold.`]);
+  }
+  return out;
 }
 
 function normalizeChangeState(raw) {
@@ -1289,30 +1358,77 @@ function buildScene(payload) {
         ? mod.submodules.slice(0, profile.max_submodules_per_module)
         : [];
       const fractalCount = subs.length;
-      const moduleBaseRadius = Math.max(10, Math.min(28, nominalRingStep * 0.62));
-      const fractionScale = 1 + Math.min(0.62, fractalCount * 0.052);
-      const moduleRadius = Math.max(10, Math.min(44, moduleBaseRadius * fractionScale));
+      const moduleBaseRadius = Math.max(MODULE_RADIUS_MIN, Math.min(MODULE_RADIUS_MAX, nominalRingStep * 0.62));
+      const fractalScale = 1 + Math.min(0.62, fractalCount * 0.052);
+      const fractalRadius = clamp(
+        moduleBaseRadius * fractalScale,
+        MODULE_RADIUS_MIN,
+        MODULE_RADIUS_MAX
+      );
+      const codebaseSizeBytes = Math.max(0, Number(mod && mod.codebase_size_bytes || 0) || 0);
       return {
         mod,
         subs,
         fractal_count: fractalCount,
-        module_radius: moduleRadius
+        module_radius: fractalRadius,
+        codebase_size_bytes: codebaseSizeBytes,
+        codebase_size_norm: 0.5
       };
     });
-    const maxModuleRadius = preparedModules.reduce((acc, row) => Math.max(acc, Number(row.module_radius || 0)), 0);
-    const requiredCirc = preparedModules.reduce(
-      (acc, row) => acc + (Math.max(8, Number(row.module_radius || 0)) * 2) + 9,
-      0
-    );
-    const minByCirc = requiredCirc > 0 ? (requiredCirc / (Math.PI * 2)) : 0;
     return {
       layer,
       index: li,
       prepared_modules: preparedModules,
-      max_module_radius: maxModuleRadius,
-      min_by_circ: minByCirc
+      max_module_radius: 0,
+      min_by_circ: 0
     };
   });
+
+  let minCodebaseSize = Infinity;
+  let maxCodebaseSize = 0;
+  for (const row of preparedLayers) {
+    for (const modRow of row.prepared_modules) {
+      const size = Math.max(0, Number(modRow.codebase_size_bytes || 0));
+      if (size <= 0) continue;
+      minCodebaseSize = Math.min(minCodebaseSize, size);
+      maxCodebaseSize = Math.max(maxCodebaseSize, size);
+    }
+  }
+  if (!Number.isFinite(minCodebaseSize) || minCodebaseSize <= 0 || maxCodebaseSize <= 0) {
+    minCodebaseSize = 1;
+    maxCodebaseSize = 1;
+  }
+  const codebaseSpan = Math.max(0, maxCodebaseSize - minCodebaseSize);
+
+  for (const row of preparedLayers) {
+    for (const modRow of row.prepared_modules) {
+      const codeSize = Math.max(0, Number(modRow.codebase_size_bytes || 0));
+      const sizeNorm = codebaseSpan > 0
+        ? clamp((codeSize - minCodebaseSize) / codebaseSpan, 0, 1)
+        : 0.5;
+      const sizeRadius = MODULE_RADIUS_MIN + ((MODULE_RADIUS_MAX - MODULE_RADIUS_MIN) * sizeNorm);
+      const fractalRadius = clamp(
+        Number(modRow.module_radius || MODULE_RADIUS_MIN),
+        MODULE_RADIUS_MIN,
+        MODULE_RADIUS_MAX
+      );
+      modRow.codebase_size_norm = sizeNorm;
+      modRow.module_radius = clamp(
+        (fractalRadius * (1 - MODULE_RADIUS_SIZE_BLEND)) + (sizeRadius * MODULE_RADIUS_SIZE_BLEND),
+        MODULE_RADIUS_MIN,
+        MODULE_RADIUS_MAX
+      );
+    }
+    const maxModuleRadius = row.prepared_modules.reduce((acc, modRow) => (
+      Math.max(acc, Number(modRow.module_radius || 0))
+    ), 0);
+    const requiredCirc = row.prepared_modules.reduce(
+      (acc, modRow) => acc + (Math.max(8, Number(modRow.module_radius || 0)) * 2) + 9,
+      0
+    );
+    row.max_module_radius = maxModuleRadius;
+    row.min_by_circ = requiredCirc > 0 ? (requiredCirc / (Math.PI * 2)) : 0;
+  }
 
   const plannedRadii = [];
   for (let li = 0; li < preparedLayers.length; li += 1) {
@@ -1403,7 +1519,10 @@ function buildScene(payload) {
       const mod = modRow.mod;
       const subs = modRow.subs;
       const angle = phase + ((mi / count) * Math.PI * 2);
-      const moduleRadius = Number(modRow.module_radius || Math.max(10, Math.min(28, layerNode.ring_width * 0.62)));
+      const moduleRadius = Number(
+        modRow.module_radius
+        || Math.max(MODULE_RADIUS_MIN, Math.min(MODULE_RADIUS_MAX, layerNode.ring_width * 0.62))
+      );
       const x = center.x + (Math.cos(angle) * layerRadius);
       const y = center.y + (Math.sin(angle) * layerRadius);
       const modId = String(mod.id || `${layerId}/m${mi}`);
@@ -1431,6 +1550,8 @@ function buildScene(payload) {
           : 0,
         spin_angle: spinBase,
         fractal_count: modRow.fractal_count,
+        codebase_size_bytes: Math.max(0, Number(modRow.codebase_size_bytes || 0)),
+        codebase_size_norm: clamp(Number(modRow.codebase_size_norm || 0.5), 0, 1),
         child_ids: [],
         activity: clamp(mod.activity, 0, 1),
         error_hint: computeNodeErrorHint(modId, modRel, mod.name, layerNode.name),
@@ -1599,6 +1720,11 @@ function buildScene(payload) {
       p3: { x: Number(to.x || 0), y: Number(to.y || 0) },
       activity: clamp(row.activity, 0, 1),
       count: Number(row.count || 0),
+      packet_size_tokens: Math.max(0, Number(row.packet_size_tokens || 0) || 0),
+      packet_size_norm: clamp(Number(row.packet_size_norm || 0), 0, 1),
+      blocked_ratio: clamp(Number(row.blocked_ratio || 0), 0, 1),
+      flow_blocked: row.flow_blocked === true,
+      block_reason: String(row.block_reason || '').trim(),
       kind,
       arc_side: (stableHash(`${row.from}|${row.to}|${kind}`) % 2) ? 1 : -1
     };
@@ -1618,6 +1744,9 @@ function buildScene(payload) {
     link.error_weight = channelHint > 0
       ? clamp(errorSignal * channelHint * (0.7 + (link.activity * 0.3)), 0, 1)
       : 0;
+    if (link.flow_blocked || link.blocked_ratio > 0.01) {
+      link.error_weight = Math.max(link.error_weight, clamp(0.16 + (link.blocked_ratio * 0.74), 0.16, 0.96));
+    }
     if (integrityPathAlert) {
       link.error_weight = Math.max(link.error_weight, clamp(0.52 + (link.activity * 0.38), 0.52, 0.95));
     }
@@ -1672,17 +1801,58 @@ function rebuildParticles() {
   }
   for (let i = 0; i < targetCount; i += 1) {
     const link = links[i % links.length];
+    const flowPenalty = clamp(Number(link.blocked_ratio || 0), 0, 1);
     const p = {
       id: i,
       link_id: link.id,
       t: ((stableHash(`${link.id}:${i}`) % 1000) / 1000),
-      speed: 0.045 + (link.activity * 0.12) + (((i % 7) * 0.004)),
-      radius: 1.1 + ((i % 3) * 0.45),
+      speed: (0.045 + (link.activity * 0.12) + (((i % 7) * 0.004))) * (1 - (flowPenalty * 0.75)),
+      radius: PACKET_RADIUS_FLOOR,
       trail: []
     };
     particles.push(p);
   }
   state.particles = particles;
+}
+
+function packetMetricForLink(link) {
+  const row = link && typeof link === 'object' ? link : {};
+  const packetTokens = Number(row.packet_size_tokens || 0);
+  if (Number.isFinite(packetTokens) && packetTokens > 0) return packetTokens;
+  const count = Number(row.count || 0);
+  if (Number.isFinite(count) && count > 0) return 100 + (count * 120);
+  return 0;
+}
+
+function packetMetricRange(links) {
+  const rows = Array.isArray(links) ? links : [];
+  let min = Infinity;
+  let max = 0;
+  for (const link of rows) {
+    const metric = packetMetricForLink(link);
+    if (!Number.isFinite(metric) || metric <= 0) continue;
+    min = Math.min(min, metric);
+    max = Math.max(max, metric);
+  }
+  if (!Number.isFinite(min) || min <= 0 || max <= 0) {
+    return { min: 1, max: 1, span: 0 };
+  }
+  return {
+    min,
+    max,
+    span: Math.max(0, max - min)
+  };
+}
+
+function packetRadiusForLink(link, range) {
+  const metric = packetMetricForLink(link);
+  if (!Number.isFinite(metric) || metric <= 0) return PACKET_RADIUS_FLOOR;
+  const r = range && typeof range === 'object' ? range : { min: 1, max: 1, span: 0 };
+  const span = Math.max(0, Number(r.span || 0));
+  const t = span > 0
+    ? clamp((metric - Number(r.min || metric)) / span, 0, 1)
+    : 0.5;
+  return PACKET_RADIUS_FLOOR + ((PACKET_RADIUS_CEILING - PACKET_RADIUS_FLOOR) * t);
 }
 
 function visibleLinksForScene(scene) {
@@ -2269,6 +2439,7 @@ function drawIoNode(node, ts) {
 function drawLinks(scene) {
   const ctx = state.ctx;
   const profile = state.quality_profile;
+  const nowTs = performance.now();
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
   const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
     ? scene.node_by_id
@@ -2293,10 +2464,12 @@ function drawLinks(scene) {
     }
     const errW = clamp(Number(link.error_weight || 0), 0, 1);
     const errActive = errW > 0.045;
+    const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
+    const blockedActive = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
     const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78));
     const baseLineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
     if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
-      if (errActive) {
+      if (errActive || blockedActive) {
         ctx.shadowColor = `rgba(255,78,78,${0.24 + (errW * 0.4)})`;
         ctx.shadowBlur = (8 + (errW * 22)) * (0.2 + (introScale * 0.8));
       } else {
@@ -2317,6 +2490,32 @@ function drawLinks(scene) {
     ctx.moveTo(link.p0.x, link.p0.y);
     ctx.bezierCurveTo(link.p1.x, link.p1.y, link.p2.x, link.p2.y, link.p3.x, link.p3.y);
     ctx.stroke();
+
+    if (blockedActive) {
+      const blockedAlpha = clamp((0.24 + (blockedRatio * 0.64)) * (0.22 + (introScale * 0.78)), 0.12, 0.92);
+      ctx.save();
+      ctx.setLineDash([4.5 + (blockedRatio * 6.5), 4.5]);
+      ctx.lineDashOffset = -(nowTs * (0.013 + (blockedRatio * 0.018)));
+      ctx.strokeStyle = `rgba(255,158,76,${blockedAlpha})`;
+      ctx.lineWidth = Math.max(0.8, baseLineWidth * 0.88);
+      ctx.beginPath();
+      ctx.moveTo(link.p0.x, link.p0.y);
+      ctx.bezierCurveTo(link.p1.x, link.p1.y, link.p2.x, link.p2.y, link.p3.x, link.p3.y);
+      ctx.stroke();
+      ctx.restore();
+
+      const mid = bezierPoint(link, 0.52);
+      const markerR = 2.1 + (blockedRatio * 3.1);
+      ctx.strokeStyle = `rgba(255,108,108,${clamp(0.45 + (blockedRatio * 0.4), 0.45, 0.92)})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(mid.x, mid.y, markerR, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(mid.x - markerR * 0.72, mid.y + markerR * 0.72);
+      ctx.lineTo(mid.x + markerR * 0.72, mid.y - markerR * 0.72);
+      ctx.stroke();
+    }
   }
   ctx.shadowBlur = 0;
 }
@@ -2326,7 +2525,8 @@ function drawParticles(dt) {
   if (!scene || !state.particles.length) return;
   const ctx = state.ctx;
   const trailLength = state.quality_profile.trail_length;
-  const burstBoost = performance.now() < state.spine_burst_until ? 1.45 : 1;
+  const nowTs = performance.now();
+  const burstBoost = nowTs < state.spine_burst_until ? 1.45 : 1;
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
   const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
     ? scene.node_by_id
@@ -2334,6 +2534,10 @@ function drawParticles(dt) {
 
   const linkById = {};
   for (const link of scene.links) linkById[link.id] = link;
+  const linksForSizing = focusLinks
+    ? scene.links.filter((link) => focusLinks.has(String(link && link.id || '')))
+    : scene.links;
+  const packetRange = packetMetricRange(linksForSizing);
 
   const linkIntroScaleById = Object.create(null);
   for (const link of scene.links) {
@@ -2354,8 +2558,29 @@ function drawParticles(dt) {
       p.trail.length = 0;
       continue;
     }
-    p.t += p.speed * Math.max(0.001, dt) * (0.5 + link.activity) * burstBoost;
+    p.radius = packetRadiusForLink(link, packetRange);
+    const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
+    const blockedFlow = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
+    const moveGain = blockedFlow ? (0.14 + ((1 - blockedRatio) * 0.22)) : 1;
+    p.t += p.speed * Math.max(0.001, dt) * (0.5 + link.activity) * burstBoost * moveGain;
     if (p.t > 1) p.t -= 1;
+    if (blockedFlow) {
+      const failEnd = 0.86;
+      const failStart = Math.max(0.42, failEnd - (0.16 + (blockedRatio * 0.22)));
+      const failSpan = Math.max(0.001, failEnd - failStart);
+      p.fail_progress = clamp((p.t - failStart) / failSpan, 0, 1);
+      p.fail_ratio = blockedRatio;
+      p.fail_active = p.fail_progress > 0.001;
+      if (p.t > failEnd) {
+        p.t = 0.06 + ((p.id % 12) * 0.006);
+        p.fail_progress = 0;
+        p.fail_active = false;
+      }
+    } else {
+      p.fail_progress = 0;
+      p.fail_ratio = 0;
+      p.fail_active = false;
+    }
     const pt = bezierPoint(link, p.t);
     if (trailLength > 0) {
       p.trail.push(pt);
@@ -2372,12 +2597,25 @@ function drawParticles(dt) {
     if (introScale <= 0.03) continue;
     if (focusLinks && !focusLinks.has(link.id)) continue;
     if (trailLength <= 0 || p.trail.length < 2) continue;
+    const failProgress = clamp(Number(p.fail_progress || 0), 0, 1);
+    const failActive = p.fail_active === true && failProgress > 0;
+    const failRatio = clamp(Number(p.fail_ratio || 0), 0, 1);
     for (let i = 1; i < p.trail.length; i += 1) {
       const a = p.trail[i - 1];
       const b = p.trail[i];
-      const alpha = (i / p.trail.length) * 0.3 * (0.2 + (introScale * 0.8));
-      ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
-      ctx.lineWidth = 0.8;
+      const alphaBase = (i / p.trail.length) * 0.3 * (0.2 + (introScale * 0.8));
+      if (failActive) {
+        const flicker = 0.32 + (0.68 * Math.abs(Math.sin((nowTs * (0.028 + (failRatio * 0.016))) + (p.id * 1.97) + (i * 0.75))));
+        const fade = clamp(1 - (failProgress * 0.9), 0.04, 1);
+        const alpha = clamp(alphaBase * flicker * fade, 0.03, 0.9);
+        const redMix = failProgress;
+        const g = Math.round(255 - (redMix * 215));
+        const bCh = Math.round(255 - (redMix * 215));
+        ctx.strokeStyle = `rgba(255,${g},${bCh},${alpha})`;
+      } else {
+        ctx.strokeStyle = `rgba(255,255,255,${alphaBase})`;
+      }
+      ctx.lineWidth = Math.max(0.55, Number(p.radius || 1.2) * 0.42);
       ctx.beginPath();
       ctx.moveTo(a.x, a.y);
       ctx.lineTo(b.x, b.y);
@@ -2392,9 +2630,25 @@ function drawParticles(dt) {
     if (introScale <= 0.03) continue;
     if (focusLinks && !focusLinks.has(link.id)) continue;
     const pt = bezierPoint(link, p.t);
-    ctx.fillStyle = `rgba(255,255,255,${(0.45 + (link.activity * 0.5)) * (0.25 + (introScale * 0.75))})`;
+    const failProgress = clamp(Number(p.fail_progress || 0), 0, 1);
+    const failActive = p.fail_active === true && failProgress > 0;
+    const failRatio = clamp(Number(p.fail_ratio || 0), 0, 1);
+    let alpha = (0.45 + (link.activity * 0.5)) * (0.25 + (introScale * 0.75));
+    let radius = Math.max(PACKET_RADIUS_FLOOR, Number(p.radius || PACKET_RADIUS_FLOOR));
+    if (failActive) {
+      const flicker = 0.2 + (0.8 * Math.abs(Math.sin((nowTs * (0.035 + (failRatio * 0.02))) + (p.id * 2.17))));
+      const fade = clamp(1 - (failProgress * 0.94), 0.02, 1);
+      alpha = clamp(alpha * flicker * fade, 0.02, 0.96);
+      radius = Math.max(PACKET_RADIUS_FLOOR * 0.75, radius * (1 - (failProgress * 0.38)));
+      const redMix = failProgress;
+      const g = Math.round(255 - (redMix * 225));
+      const bCh = Math.round(255 - (redMix * 225));
+      ctx.fillStyle = `rgba(255,${g},${bCh},${alpha})`;
+    } else {
+      ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    }
     ctx.beginPath();
-    ctx.arc(pt.x, pt.y, p.radius, 0, Math.PI * 2);
+    ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
     ctx.fill();
   }
 }
@@ -2545,6 +2799,7 @@ function renderStats() {
   const titleEl = byId('statsTitle');
   let rows = [];
   const selectedIntegrityRows = integrityRowsForSelection(integrityIncident, selectedType, selectedNode);
+  const selectedNodeErrorRows = nodeErrorRowsForSelection(selectedNode, selectedIntegrityRows, errorSignal);
   const sceneChange = scene && scene.change_summary && typeof scene.change_summary === 'object'
     ? scene.change_summary
     : {};
@@ -2575,6 +2830,13 @@ function renderStats() {
     const fromPath = String((fromNode && fromNode.rel) || selectedLink.from_id || '');
     const toPath = String((toNode && toNode.rel) || selectedLink.to_id || '');
     const errWeight = clamp(Number(selectedLink.error_weight || 0), 0, 1);
+    const blockedRatio = clamp(Number(selectedLink.blocked_ratio || 0), 0, 1);
+    const blocked = Boolean(selectedLink.flow_blocked === true || blockedRatio > 0.02);
+    const packetSizeTokens = Math.max(0, Number(selectedLink.packet_size_tokens || 0));
+    const packetSizeLabel = packetSizeTokens > 0
+      ? `${fmtNum(packetSizeTokens)} tokens avg`
+      : 'n/a';
+    const linkErrorRows = linkErrorRowsForSelection(selectedLink);
     const health = errWeight >= 0.35 ? 'Degraded'
       : errWeight >= 0.12 ? 'Watch'
       : 'Nominal';
@@ -2588,9 +2850,13 @@ function renderStats() {
       ['Channel Kind', String(selectedLink.kind || 'flow')],
       ['Process', describeLinkProcess(selectedLink)],
       ['Health', health],
+      ['Flow Status', blocked ? `Blocked (${fmtNum(blockedRatio * 100)}%)` : 'Clear'],
+      ['Block Reason', blocked ? (String(selectedLink.block_reason || 'error gate / policy hold')) : 'n/a'],
+      ...linkErrorRows,
       ['Activity', `${fmtNum(Number(selectedLink.activity || 0) * 100)}%`],
       ['Error Weight', `${fmtNum(errWeight * 100)}%`],
-      ['Packet Count', fmtNum(selectedLink.count || 0)]
+      ['Packet Count', fmtNum(selectedLink.count || 0)],
+      ['Packet Size', packetSizeLabel]
     ];
   } else if (selectedType === 'spine' && scene) {
     if (titleEl) titleEl.textContent = 'Preview Pane';
@@ -2602,6 +2868,7 @@ function renderStats() {
         ? `${String(integrityIncident.severity || 'critical').toUpperCase()} (${fmtNum(integrityIncident.violation_total)} mismatches)`
         : 'OK'],
       ...selectedChangeRows,
+      ...selectedNodeErrorRows,
       ...selectedIntegrityRows
     ];
   } else if (selectedType === 'system' && scene && Array.isArray(scene.links)) {
@@ -2624,6 +2891,7 @@ function renderStats() {
       ['Scope', 'All shells + children'],
       ['Total Links', fmtNum(scene.links.length)],
       ...selectedChangeRows,
+      ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
       ...processRows
     ];
@@ -2671,6 +2939,8 @@ function renderStats() {
       ['Modules', fmtNum(moduleIds.length)],
       ['Fractals', fmtNum(submoduleIds.length)],
       ['Total Child Links', fmtNum(relevantLinks.length)],
+      ...selectedNodeErrorRows,
+      ...selectedIntegrityRows,
       ...processRows
     ];
     if (!processRows.length) {
@@ -2710,6 +2980,7 @@ function renderStats() {
       ['Fractals', fmtNum(submoduleIds.length)],
       ['Total Child Links', fmtNum(relevantLinks.length)],
       ...selectedChangeRows,
+      ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
       ...processRows
     ];
@@ -2745,6 +3016,7 @@ function renderStats() {
       ['Shell', String((layerNode && layerNode.name) || layerId || 'n/a')],
       ['Direct Links', fmtNum(relevantLinks.length)],
       ...selectedChangeRows,
+      ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
       ...processRows
     ];
@@ -2783,8 +3055,13 @@ function renderStats() {
   }
   byId('statsGrid').innerHTML = rows.map(([k, v]) => {
     const errorRow = isPreviewErrorRow(k);
-    const itemClass = errorRow ? 'item item-error' : 'item';
-    const valueClass = errorRow ? 'v v-error' : 'v';
+    const warningRow = !errorRow && isPreviewWarningRow(k, v);
+    const itemClass = errorRow
+      ? 'item item-error'
+      : (warningRow ? 'item item-warning' : 'item');
+    const valueClass = errorRow
+      ? 'v v-error'
+      : (warningRow ? 'v v-warning' : 'v');
     return `<div class="${itemClass}"><div class="k">${escapeHtml(String(k))}</div><div class="${valueClass}">${escapeHtml(String(v))}</div></div>`;
   }).join('');
   const pulseSuffix = state.spine_event_top

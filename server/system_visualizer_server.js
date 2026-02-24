@@ -47,6 +47,26 @@ const CHANGE_STATE_CACHE_TTL_MS = 1200;
 const ACTIVE_WRITE_WINDOW_MS = 14000;
 const JUST_PUSHED_WINDOW_MS = 2600;
 const MAX_CHANGE_FILES = 10;
+const CODEBASE_SIZE_MAX_FILES = 2400;
+const CODEBASE_SIZE_MAX_DEPTH = 10;
+const CODEBASE_SIZE_EXTS = new Set([
+  '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
+  '.json', '.md', '.yaml', '.yml',
+  '.py', '.go', '.rs', '.java', '.kt', '.swift',
+  '.rb', '.php', '.sh', '.zsh', '.bash',
+  '.html', '.css', '.scss', '.sass',
+  '.sql', '.toml', '.ini'
+]);
+const CODEBASE_SKIP_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.next',
+  'dist',
+  'build',
+  'out',
+  'coverage',
+  '.turbo'
+]);
 
 const LAYER_ROOTS = [
   { key: 'adaptive', label: 'Adaptive', rel: 'adaptive' },
@@ -648,6 +668,69 @@ function isPolicyHoldResult(result) {
     || r === 'score_only_fallback_low_execution_confidence';
 }
 
+function eventPacketTokens(evt) {
+  const row = evt && typeof evt === 'object' ? evt : {};
+  const usage = row.token_usage && typeof row.token_usage === 'object'
+    ? row.token_usage
+    : {};
+  const routeSummary = row.route_summary && typeof row.route_summary === 'object'
+    ? row.route_summary
+    : {};
+  const routeBudget = routeSummary.route_budget && typeof routeSummary.route_budget === 'object'
+    ? routeSummary.route_budget
+    : {};
+  const candidates = [
+    usage.effective_tokens,
+    usage.actual_total_tokens,
+    usage.estimated_tokens,
+    routeBudget.request_tokens_est
+  ];
+  for (const cand of candidates) {
+    const n = Number(cand);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
+function flowBlockReason(evt) {
+  const row = evt && typeof evt === 'object' ? evt : {};
+  const routeSummary = row.route_summary && typeof row.route_summary === 'object'
+    ? row.route_summary
+    : {};
+  const routeReason = String(row.route_block_reason || '').trim().toLowerCase();
+  if (routeReason) return routeReason;
+  const holdReason = String(row.hold_reason || '').trim().toLowerCase();
+  if (holdReason) return holdReason;
+  const budgetReason = String(routeSummary.budget_block_reason || '').trim().toLowerCase();
+  if (budgetReason) return budgetReason;
+  const budgetEnforcement = routeSummary.budget_enforcement && typeof routeSummary.budget_enforcement === 'object'
+    ? routeSummary.budget_enforcement
+    : {};
+  const enforcementReason = String(budgetEnforcement.reason || '').trim().toLowerCase();
+  if (enforcementReason) return enforcementReason;
+  const result = String(row.result || '').trim().toLowerCase();
+  if (result) return result;
+  return '';
+}
+
+function isFlowBlockedEvent(evt) {
+  const row = evt && typeof evt === 'object' ? evt : {};
+  const result = String(row.result || '').trim().toLowerCase();
+  if (result.includes('blocked')) return true;
+  if (result.includes('route_block')) return true;
+  if (result.startsWith('stop_')) return true;
+  if (isPolicyHoldResult(result)) return true;
+  if (row.policy_hold === true) return true;
+  const routeSummary = row.route_summary && typeof row.route_summary === 'object'
+    ? row.route_summary
+    : {};
+  if (routeSummary.budget_blocked === true) return true;
+  if (routeSummary.executable === false) return true;
+  if (String(routeSummary.gate_decision || '').trim().toLowerCase() === 'manual') return true;
+  if (String(row.route_block_reason || '').trim()) return true;
+  return false;
+}
+
 function buildCampaignTypeIndex(campaigns) {
   const map = {};
   for (const c of campaigns || []) {
@@ -705,6 +788,70 @@ function tokenize(text) {
     .filter((s) => s.length >= 3 && s !== 'json' && s !== 'node' && s !== 'test');
 }
 
+function shouldIncludeCodebaseFile(fileName) {
+  const name = String(fileName || '').trim();
+  if (!name || name.startsWith('.')) return false;
+  const ext = path.extname(name).toLowerCase();
+  return CODEBASE_SIZE_EXTS.has(ext);
+}
+
+function codebaseSizeForPath(absPath, opts = {}) {
+  const maxFiles = Math.max(50, Number(opts.max_files || CODEBASE_SIZE_MAX_FILES));
+  const maxDepth = Math.max(1, Number(opts.max_depth || CODEBASE_SIZE_MAX_DEPTH));
+  const result = {
+    bytes: 0,
+    files: 0,
+    truncated: false
+  };
+
+  if (!absPath || !fs.existsSync(absPath)) return result;
+
+  const stack = [{ abs: absPath, depth: 0 }];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (!cur || result.files >= maxFiles) {
+      result.truncated = true;
+      break;
+    }
+    let stat = null;
+    try {
+      stat = fs.statSync(cur.abs);
+    } catch {
+      stat = null;
+    }
+    if (!stat) continue;
+
+    if (stat.isFile()) {
+      const base = path.basename(cur.abs);
+      if (!shouldIncludeCodebaseFile(base)) continue;
+      result.bytes += Math.max(0, Number(stat.size || 0));
+      result.files += 1;
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    if (cur.depth >= maxDepth) {
+      result.truncated = true;
+      continue;
+    }
+
+    const entries = safeReadDirWithTypes(cur.abs);
+    for (const ent of entries) {
+      const name = String(ent && ent.name || '').trim();
+      if (!name || name.startsWith('.')) continue;
+      if (ent.isDirectory()) {
+        if (CODEBASE_SKIP_DIRS.has(name.toLowerCase())) continue;
+      } else if (!ent.isFile()) {
+        continue;
+      }
+      stack.push({
+        abs: path.join(cur.abs, name),
+        depth: cur.depth + 1
+      });
+    }
+  }
+  return result;
+}
+
 function scanLayerModelRaw() {
   const layers = [];
   const aliasToId = {};
@@ -741,13 +888,20 @@ function scanLayerModelRaw() {
         rel: modRel,
         type: ent.isDirectory() ? 'dir' : 'file',
         activity: 0,
-        submodules: []
+        submodules: [],
+        codebase_size_bytes: 0,
+        codebase_file_count: 0,
+        codebase_truncated: false
       };
       aliasToId[`${layerDef.key}/${modName}`.toLowerCase()] = modId;
       aliasToId[modName.toLowerCase()] = aliasToId[modName.toLowerCase()] || modId;
 
       if (ent.isDirectory()) {
         const modAbs = path.join(layerAbs, modName);
+        const modSize = codebaseSizeForPath(modAbs);
+        moduleNode.codebase_size_bytes = Math.max(0, Number(modSize.bytes || 0));
+        moduleNode.codebase_file_count = Math.max(0, Number(modSize.files || 0));
+        moduleNode.codebase_truncated = modSize.truncated === true;
         const subEntries = safeReadDirWithTypes(modAbs)
           .filter((sub) => shouldIncludeSubEntry(sub))
           .sort(direntSort)
@@ -763,10 +917,35 @@ function scanLayerModelRaw() {
             name: subName,
             rel: `${modRel}/${subName}`,
             type: sub.isDirectory() ? 'dir' : 'file',
-            activity: 0
+            activity: 0,
+            codebase_size_bytes: 0,
+            codebase_file_count: 0
           };
+          if (sub.isFile()) {
+            try {
+              const subAbs = path.join(modAbs, subName);
+              const stat = fs.statSync(subAbs);
+              if (stat && stat.isFile() && shouldIncludeCodebaseFile(subName)) {
+                subNode.codebase_size_bytes = Math.max(0, Number(stat.size || 0));
+                subNode.codebase_file_count = 1;
+              }
+            } catch {
+              // ignore stat errors for sidecar sizing metadata
+            }
+          }
           moduleNode.submodules.push(subNode);
           aliasToId[`${layerDef.key}/${modName}/${subName}`.toLowerCase()] = subId;
+        }
+      } else {
+        const modAbs = path.join(layerAbs, modName);
+        try {
+          const stat = fs.statSync(modAbs);
+          if (stat && stat.isFile() && shouldIncludeCodebaseFile(modName)) {
+            moduleNode.codebase_size_bytes = Math.max(0, Number(stat.size || 0));
+            moduleNode.codebase_file_count = 1;
+          }
+        } catch {
+          // ignore stat errors for sidecar sizing metadata
         }
       }
 
@@ -1333,23 +1512,70 @@ function assignLayerActivity(layers, runs, summary, aliasToId) {
 
 function buildHoloLinks(layers, summary, runs, aliasToId) {
   const edgeMap = {};
-  const add = (from, to, count, kind) => {
+  const add = (from, to, count, kind, meta = null) => {
     const f = String(from || '').trim();
     const t = String(to || '').trim();
     if (!f || !t || f === t) return;
     const key = `${f}|${t}|${String(kind || 'flow')}`;
     if (!edgeMap[key]) {
-      edgeMap[key] = { from: f, to: t, count: 0, kind: String(kind || 'flow') };
+      edgeMap[key] = {
+        from: f,
+        to: t,
+        count: 0,
+        kind: String(kind || 'flow'),
+        packet_tokens_total: 0,
+        packet_samples: 0,
+        blocked_count: 0,
+        event_count: 0,
+        block_reason: ''
+      };
     }
-    edgeMap[key].count += Math.max(0.2, Number(count || 0));
+    const edge = edgeMap[key];
+    edge.count += Math.max(0.2, Number(count || 0));
+    if (meta && typeof meta === 'object') {
+      const packetTokens = Number(meta.packet_tokens || 0);
+      if (Number.isFinite(packetTokens) && packetTokens > 0) {
+        edge.packet_tokens_total += packetTokens;
+        edge.packet_samples += 1;
+      }
+      const events = Number(meta.event_count || 0);
+      if (Number.isFinite(events) && events > 0) {
+        edge.event_count += events;
+      }
+      if (meta.blocked === true) {
+        edge.blocked_count += 1;
+      }
+      const blockReason = String(meta.block_reason || '').trim().toLowerCase();
+      if (blockReason && !edge.block_reason) {
+        edge.block_reason = blockReason;
+      }
+    }
   };
   const byAlias = (alias) => aliasToId[String(alias || '').toLowerCase()] || null;
 
   for (const layer of layers || []) {
     for (const mod of layer.modules || []) {
-      add(layer.id, mod.id, Math.max(0.5, Number(mod.activity || 0) * 3), 'hierarchy');
+      add(
+        layer.id,
+        mod.id,
+        Math.max(0.5, Number(mod.activity || 0) * 3),
+        'hierarchy',
+        {
+          packet_tokens: Math.max(180, Number(mod.activity || 0) * 1200),
+          event_count: 1
+        }
+      );
       for (const sub of mod.submodules || []) {
-        add(mod.id, sub.id, Math.max(0.3, Number(sub.activity || 0) * 2), 'hierarchy');
+        add(
+          mod.id,
+          sub.id,
+          Math.max(0.3, Number(sub.activity || 0) * 2),
+          'hierarchy',
+          {
+            packet_tokens: Math.max(90, Number(sub.activity || 0) * 700),
+            event_count: 1
+          }
+        );
       }
     }
   }
@@ -1366,7 +1592,12 @@ function buildHoloLinks(layers, summary, runs, aliasToId) {
   for (const [a, b, c] of staticPairs) {
     const from = byAlias(a);
     const to = byAlias(b);
-    if (from && to) add(from, to, c, 'route');
+    if (from && to) {
+      add(from, to, c, 'route', {
+        packet_tokens: Math.max(220, Number(c || 0) * 180),
+        event_count: 1
+      });
+    }
   }
 
   const adaptiveLayer = byAlias('adaptive') || byAlias('systems');
@@ -1378,12 +1609,38 @@ function buildHoloLinks(layers, summary, runs, aliasToId) {
   const revertedCount = Number(summary && summary.reverted || 0);
   const policyHoldCount = Number(summary && summary.policy_holds || 0);
 
-  if (adaptiveLayer) add('io:input:sensory', adaptiveLayer, Math.max(0.8, runCount * 0.3), 'ingress');
-  if (systemsLayer) add('io:input:directive', systemsLayer, Math.max(0.7, policyHoldCount * 0.35), 'ingress');
-  if (stateLayer) add('io:input:directive', stateLayer, Math.max(0.5, policyHoldCount * 0.25), 'ingress');
-  if (systemsLayer) add(systemsLayer, 'io:output:shipped', Math.max(0.5, shippedCount * 0.42), 'egress');
-  if (systemsLayer) add(systemsLayer, 'io:output:no_change', Math.max(0.3, noChangeCount * 0.35), 'egress');
-  if (systemsLayer) add(systemsLayer, 'io:output:reverted', Math.max(0.2, revertedCount * 0.45), 'egress');
+  if (adaptiveLayer) {
+    add('io:input:sensory', adaptiveLayer, Math.max(0.8, runCount * 0.3), 'ingress', {
+      packet_tokens: Math.max(260, runCount * 40),
+      event_count: Math.max(1, runCount)
+    });
+  }
+  if (systemsLayer) {
+    add('io:input:directive', systemsLayer, Math.max(0.7, policyHoldCount * 0.35), 'ingress', {
+      packet_tokens: Math.max(220, policyHoldCount * 65),
+      event_count: Math.max(1, policyHoldCount)
+    });
+  }
+  if (stateLayer) {
+    add('io:input:directive', stateLayer, Math.max(0.5, policyHoldCount * 0.25), 'ingress', {
+      packet_tokens: Math.max(180, policyHoldCount * 52),
+      event_count: Math.max(1, policyHoldCount)
+    });
+  }
+  if (systemsLayer) {
+    add(systemsLayer, 'io:output:shipped', Math.max(0.5, shippedCount * 0.42), 'egress', {
+      packet_tokens: Math.max(200, shippedCount * 70),
+      event_count: Math.max(1, shippedCount)
+    });
+    add(systemsLayer, 'io:output:no_change', Math.max(0.3, noChangeCount * 0.35), 'egress', {
+      packet_tokens: Math.max(180, noChangeCount * 66),
+      event_count: Math.max(1, noChangeCount)
+    });
+    add(systemsLayer, 'io:output:reverted', Math.max(0.2, revertedCount * 0.45), 'egress', {
+      packet_tokens: Math.max(180, revertedCount * 68),
+      event_count: Math.max(1, revertedCount)
+    });
+  }
 
   const runRows = Array.isArray(runs) ? runs.slice(0, 1200) : [];
   for (const evt of runRows) {
@@ -1399,15 +1656,46 @@ function buildHoloLinks(layers, summary, runs, aliasToId) {
     if (result === 'executed' && outcome === 'no_change') to = 'io:output:no_change';
     if (result === 'executed' && outcome === 'reverted') to = 'io:output:reverted';
     if (result.includes('memory')) to = byAlias('memory') || to;
-    add(from, to, 1, 'flow');
+    add(from, to, 1, 'flow', {
+      packet_tokens: eventPacketTokens(evt),
+      event_count: 1,
+      blocked: isFlowBlockedEvent(evt),
+      block_reason: flowBlockReason(evt)
+    });
   }
 
   const links = Object.values(edgeMap);
   let maxCount = 0;
   for (const link of links) maxCount = Math.max(maxCount, Number(link.count || 0));
   if (maxCount <= 0) maxCount = 1;
+  let minPacketTokens = Infinity;
+  let maxPacketTokens = 0;
+  for (const link of links) {
+    const samples = Math.max(0, Number(link.packet_samples || 0));
+    const avg = samples > 0
+      ? Number(link.packet_tokens_total || 0) / samples
+      : Math.max(90, Number(link.count || 0) * 140);
+    link.packet_size_tokens = Number.isFinite(avg) && avg > 0 ? avg : 90;
+    if (link.packet_size_tokens > 0) {
+      minPacketTokens = Math.min(minPacketTokens, link.packet_size_tokens);
+      maxPacketTokens = Math.max(maxPacketTokens, link.packet_size_tokens);
+    }
+    const eventCount = Math.max(0, Number(link.event_count || 0));
+    const blockedCount = Math.max(0, Number(link.blocked_count || 0));
+    link.blocked_ratio = eventCount > 0
+      ? Number((blockedCount / eventCount).toFixed(4))
+      : 0;
+    link.flow_blocked = blockedCount > 0;
+  }
+  if (!Number.isFinite(minPacketTokens) || minPacketTokens <= 0) minPacketTokens = 90;
+  if (!Number.isFinite(maxPacketTokens) || maxPacketTokens <= 0) maxPacketTokens = minPacketTokens;
+  const minPacketLog = Math.log1p(minPacketTokens);
+  const maxPacketLog = Math.log1p(maxPacketTokens);
+  const denomPacket = Math.max(0.000001, maxPacketLog - minPacketLog);
   for (const link of links) {
     link.activity = Number((0.08 + (0.92 * (Number(link.count || 0) / maxCount))).toFixed(4));
+    const packetLog = Math.log1p(Math.max(0, Number(link.packet_size_tokens || 0)));
+    link.packet_size_norm = Number(clampNumber((packetLog - minPacketLog) / denomPacket, 0, 1, 0).toFixed(4));
   }
   return links;
 }
