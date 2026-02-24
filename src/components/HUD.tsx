@@ -58,8 +58,7 @@ export default function HUD({ drift }: HUDProps) {
       )}
 
       {/* Bottom metrics */}
-      <div className="absolute bottom-6 left-6 right-6 flex justify-between font-mono text-xs text-cyan-700"
-003e
+      <div className="absolute bottom-6 left-6 right-6 flex justify-between font-mono text-xs text-cyan-700">
         <div>
           <div>Status: OPERATIONAL</div>
           <div>Subsystems: 11 ACTIVE</div>

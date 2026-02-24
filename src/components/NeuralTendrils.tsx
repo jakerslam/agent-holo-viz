@@ -2,6 +2,7 @@
 
 import { useRef, useMemo } from 'react';
 import { useFrame } from '@react-three/fiber';
+import { Line } from '@react-three/drei';
 import * as THREE from 'three';
 
 export default function NeuralTendrils() {
@@ -9,7 +10,7 @@ export default function NeuralTendrils() {
   
   const tendrils = useMemo(() => {
     return Array.from({ length: 50 }, (_, i) => {
-      const points = [];
+      const points: THREE.Vector3[] = [];
       const startAngle = (i / 50) * Math.PI * 2;
       
       for (let j = 0; j < 20; j++) {
@@ -25,7 +26,11 @@ export default function NeuralTendrils() {
         ));
       }
       
-      return points;
+      return {
+        id: i,
+        points,
+        opacity: 0.15 + Math.sin(i * 0.5) * 0.1
+      };
     });
   }, []);
 
@@ -37,17 +42,15 @@ export default function NeuralTendrils() {
 
   return (
     <group ref={linesRef}>
-      {tendrils.map((points, i) => (
-        <line key={i}>
-          <geometry>
-            {<> { new THREE.BufferGeometry().setFromPoints(points) } >}
-          </geometry>
-          <lineBasicMaterial
-            color="#00d4ff"
-            transparent
-            opacity={0.15 + Math.sin(i * 0.5) * 0.1}
-          />
-        </line>
+      {tendrils.map((tendril) => (
+        <Line
+          key={tendril.id}
+          points={tendril.points}
+          color="#00d4ff"
+          lineWidth={0.5}
+          transparent
+          opacity={tendril.opacity}
+        />
       ))}
     </group>
   );
