@@ -52,6 +52,10 @@ const SPINE_NODE_ID = 'spine:core';
 const SPINE_NODE_PATH = 'systems/spine';
 const SYSTEM_ROOT_ID = 'system:root';
 const WORKSPACE_ROOT_PATH = '/Users/jay/.openclaw/workspace';
+const SHELL_ORDER_SWAP_COOLDOWN_MS = 10 * 60 * 1000;
+const SHELL_INTRO_INITIAL_DELAY_MS = 110;
+const SHELL_INTRO_LAYER_DELAY_MS = 70;
+const SHELL_INTRO_LAYER_DURATION_MS = 240;
 
 const state = {
   canvas: null,
@@ -86,6 +90,19 @@ const state = {
   orbit_lock: {
     layer_id: '',
     runtime_by_layer: Object.create(null)
+  },
+  layer_order_lock: {
+    order: [],
+    last_swap_ms: 0
+  },
+  shell_intro: {
+    started: false,
+    played: false,
+    start_ts: 0,
+    initial_delay_ms: SHELL_INTRO_INITIAL_DELAY_MS,
+    layer_delay_ms: SHELL_INTRO_LAYER_DELAY_MS,
+    layer_duration_ms: SHELL_INTRO_LAYER_DURATION_MS,
+    layer_ids: []
   },
   focus: null,
   particle_signature: '',
@@ -132,12 +149,165 @@ function mix(a, b, t) {
   return a + (b - a) * t;
 }
 
-function colorFromActivity(activity, alpha = 1) {
+function easeOutCubic(v) {
+  const t = clamp(v, 0, 1);
+  return 1 - Math.pow(1 - t, 3);
+}
+
+function activityRgb(activity) {
   const t = clamp(activity, 0, 1);
-  const r = Math.round(mix(BASE_ORANGE[0], BASE_BLUE[0], t));
-  const g = Math.round(mix(BASE_ORANGE[1], BASE_BLUE[1], t));
-  const b = Math.round(mix(BASE_ORANGE[2], BASE_BLUE[2], t));
+  return {
+    r: Math.round(mix(BASE_ORANGE[0], BASE_BLUE[0], t)),
+    g: Math.round(mix(BASE_ORANGE[1], BASE_BLUE[1], t)),
+    b: Math.round(mix(BASE_ORANGE[2], BASE_BLUE[2], t))
+  };
+}
+
+function colorFromActivity(activity, alpha = 1) {
+  const { r, g, b } = activityRgb(activity);
   return `rgba(${r},${g},${b},${clamp(alpha, 0, 1)})`;
+}
+
+function colorFromActivityBright(activity, alpha = 1, amount = 0.12) {
+  const { r: br, g: bg, b: bb } = activityRgb(activity);
+  const boost = clamp(amount, 0, 1);
+  const r = Math.round(mix(br, 255, boost));
+  const g = Math.round(mix(bg, 255, boost));
+  const b = Math.round(mix(bb, 255, boost));
+  return `rgba(${r},${g},${b},${clamp(alpha, 0, 1)})`;
+}
+
+function brightenChannel(value, amount = 0.12) {
+  return Math.round(mix(Number(value || 0), 255, clamp(amount, 0, 1)));
+}
+
+function layerStableId(layer, fallback = '') {
+  return String(
+    (layer && (layer.id || layer.key || layer.name))
+    || fallback
+    || ''
+  ).trim();
+}
+
+function applyLayerOrderLock(layerRows, nowMs = Date.now()) {
+  const rows = Array.isArray(layerRows) ? layerRows.slice() : [];
+  if (rows.length <= 1) return rows;
+  const lock = state.layer_order_lock && typeof state.layer_order_lock === 'object'
+    ? state.layer_order_lock
+    : (state.layer_order_lock = { order: [], last_swap_ms: 0 });
+  const byId = new Map();
+  const desiredIds = [];
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    const id = layerStableId(row, `layer:${i}`);
+    if (!id) continue;
+    desiredIds.push(id);
+    if (!byId.has(id)) byId.set(id, row);
+  }
+  if (!desiredIds.length) return rows;
+
+  const prevIdsRaw = Array.isArray(lock.order) ? lock.order : [];
+  const prevIds = prevIdsRaw
+    .map((id) => String(id || '').trim())
+    .filter((id) => id && byId.has(id));
+  const prevSet = new Set(prevIds);
+  const appended = desiredIds.filter((id) => !prevSet.has(id));
+  const preservedOrderIds = [...prevIds, ...appended];
+  const hasReorder = preservedOrderIds.length === desiredIds.length
+    && preservedOrderIds.some((id, idx) => id !== desiredIds[idx]);
+  const now = Number(nowMs || Date.now());
+
+  if (!hasReorder || prevIds.length === 0) {
+    lock.order = desiredIds.slice();
+    if (!Number.isFinite(Number(lock.last_swap_ms)) || Number(lock.last_swap_ms) <= 0) {
+      lock.last_swap_ms = now;
+    }
+    return rows;
+  }
+
+  const canSwap = (now - Number(lock.last_swap_ms || 0)) >= SHELL_ORDER_SWAP_COOLDOWN_MS;
+  if (canSwap) {
+    lock.order = desiredIds.slice();
+    lock.last_swap_ms = now;
+    return rows;
+  }
+
+  lock.order = preservedOrderIds.slice();
+  return preservedOrderIds.map((id) => byId.get(id)).filter(Boolean);
+}
+
+function primeShellIntro(scene, ts = performance.now()) {
+  const intro = state.shell_intro && typeof state.shell_intro === 'object'
+    ? state.shell_intro
+    : (state.shell_intro = {
+      started: false,
+      played: false,
+      start_ts: 0,
+      initial_delay_ms: SHELL_INTRO_INITIAL_DELAY_MS,
+      layer_delay_ms: SHELL_INTRO_LAYER_DELAY_MS,
+      layer_duration_ms: SHELL_INTRO_LAYER_DURATION_MS,
+      layer_ids: []
+    });
+  if (intro.played || intro.started || !scene) return;
+  const nodes = Array.isArray(scene.nodes) ? scene.nodes : [];
+  const orderedLayerIds = nodes
+    .filter((n) => n && n.type === 'layer')
+    .slice()
+    .sort((a, b) => Number(a.radius || 0) - Number(b.radius || 0))
+    .map((n) => String(n.id || '').trim())
+    .filter(Boolean);
+  if (!orderedLayerIds.length) {
+    intro.played = true;
+    return;
+  }
+  intro.layer_ids = orderedLayerIds;
+  intro.start_ts = Number(ts || performance.now()) + Number(intro.initial_delay_ms || 0);
+  intro.started = true;
+}
+
+function computeLayerIntroScale(scene, ts = performance.now()) {
+  const intro = state.shell_intro && typeof state.shell_intro === 'object' ? state.shell_intro : null;
+  if (!intro || intro.played || !scene) return null;
+  if (!intro.started) primeShellIntro(scene, ts);
+  if (!intro.started) return null;
+  const ids = Array.isArray(intro.layer_ids) ? intro.layer_ids : [];
+  if (!ids.length) {
+    intro.played = true;
+    return null;
+  }
+  const elapsed = Number(ts || performance.now()) - Number(intro.start_ts || 0);
+  const layerDelay = Math.max(1, Number(intro.layer_delay_ms || SHELL_INTRO_LAYER_DELAY_MS));
+  const layerDuration = Math.max(1, Number(intro.layer_duration_ms || SHELL_INTRO_LAYER_DURATION_MS));
+  const layerStride = layerDuration + layerDelay;
+  const scaleById = Object.create(null);
+  let complete = elapsed >= 0;
+  for (let i = 0; i < ids.length; i += 1) {
+    const id = String(ids[i] || '').trim();
+    if (!id) continue;
+    const localElapsed = elapsed - (i * layerStride);
+    const raw = localElapsed / layerDuration;
+    const p = clamp(raw, 0, 1);
+    if (p < 1) complete = false;
+    scaleById[id] = p <= 0 ? 0 : easeOutCubic(p);
+  }
+  if (complete) intro.played = true;
+  return scaleById;
+}
+
+function isShellIntroActive(ts = performance.now()) {
+  const intro = state.shell_intro && typeof state.shell_intro === 'object' ? state.shell_intro : null;
+  if (!intro || intro.played || !intro.started) return false;
+  const ids = Array.isArray(intro.layer_ids) ? intro.layer_ids : [];
+  if (!ids.length) return false;
+  const layerDelay = Math.max(1, Number(intro.layer_delay_ms || SHELL_INTRO_LAYER_DELAY_MS));
+  const layerDuration = Math.max(1, Number(intro.layer_duration_ms || SHELL_INTRO_LAYER_DURATION_MS));
+  const total = (ids.length * layerDuration) + (Math.max(0, ids.length - 1) * layerDelay);
+  const elapsed = Number(ts || performance.now()) - Number(intro.start_ts || 0);
+  if (elapsed >= total) {
+    intro.played = true;
+    return false;
+  }
+  return true;
 }
 
 function fmtNum(v) {
@@ -463,6 +633,21 @@ function updateHitTargetCircle(scene, id, x, y, radius) {
   if (Number.isFinite(radius)) target.r = Number(radius);
 }
 
+function nodeIntroScale(node) {
+  const raw = Number(node && node.intro_scale);
+  if (!Number.isFinite(raw)) return 1;
+  return clamp(raw, 0, 1);
+}
+
+function selectionTypeFrom(node, kindHint = '') {
+  const nodeType = String(node && node.type || '').toLowerCase();
+  if (nodeType) return nodeType;
+  const kind = String(kindHint || '').toLowerCase();
+  if (kind === 'ring' || kind === 'shell_fill') return 'layer';
+  if (kind === 'system') return 'system';
+  return '';
+}
+
 function updateSceneMotion(scene, ts) {
   if (!scene || !Number.isFinite(ts)) return;
   const nodes = Array.isArray(scene.nodes) ? scene.nodes : [];
@@ -473,9 +658,11 @@ function updateSceneMotion(scene, ts) {
   const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
     ? scene.node_by_id
     : Object.create(null);
-  const selectedId = String(state.selected && state.selected.id || '');
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selectedRef && selectedRef.id || '');
   const selectedNode = selectedId ? nodeById[selectedId] : null;
-  const selectedType = String(selectedNode && selectedNode.type || '').toLowerCase();
+  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String(selectedNode && selectedNode.type || '').toLowerCase();
   let frozenLayerId = '';
   if (selectedType === 'layer') {
     frozenLayerId = String(selectedNode && selectedNode.id || '');
@@ -501,10 +688,25 @@ function updateSceneMotion(scene, ts) {
   const prevTs = Number(scene.last_motion_ts || ts);
   const dtMs = clamp(ts - prevTs, 0, 80);
   scene.last_motion_ts = ts;
+  const layerIntroScale = computeLayerIntroScale(scene, ts);
+
+  for (const node of nodes) {
+    if (!node || node.type !== 'layer') continue;
+    const layerId = String(node.id || '');
+    const scale = layerIntroScale && Object.prototype.hasOwnProperty.call(layerIntroScale, layerId)
+      ? clamp(Number(layerIntroScale[layerId]), 0, 1)
+      : 1;
+    node.intro_scale = scale;
+    node.render_radius = Number(node.radius || 0) * scale;
+  }
 
   for (const node of nodes) {
     if (!node || node.type !== 'module') continue;
     const layerId = String(node.parent_id || '');
+    const layerScale = layerIntroScale && Object.prototype.hasOwnProperty.call(layerIntroScale, layerId)
+      ? clamp(Number(layerIntroScale[layerId]), 0, 1)
+      : 1;
+    node.intro_scale = layerScale;
     const orbitSpeed = Number(node.orbit_speed || 0);
     let orbitLayer = layerOrbitState[layerId];
     if (!orbitLayer) {
@@ -539,7 +741,7 @@ function updateSceneMotion(scene, ts) {
       }
       advancedLayers.add(layerId);
     }
-    const orbitRadius = Number(node.orbit_radius || 0);
+    const orbitRadius = Number(node.orbit_radius || 0) * layerScale;
     if (orbitRadius <= 0) continue;
     const orbitAngle = Number(node.base_angle || 0) + Number(orbitLayer.runtime || 0);
     node.angle = orbitAngle;
@@ -582,7 +784,8 @@ function updateSceneMotion(scene, ts) {
       sub.shell_end = end;
       sub.x = node.x + (Math.cos(mid) * shellMid);
       sub.y = node.y + (Math.sin(mid) * shellMid);
-      updateHitTargetCircle(scene, sub.id, sub.x, sub.y, Math.max(8, Number(sub.radius || 0) + 6));
+      sub.intro_scale = layerScale;
+      updateHitTargetCircle(scene, sub.id, sub.x, sub.y, Math.max(12, Number(sub.radius || 0) + 8));
     }
   }
 
@@ -612,7 +815,7 @@ function buildScene(payload) {
     config: 0.62,
     lib: 0.58
   };
-  const layerRows = layersRaw
+  const layerRowsUnordered = layersRaw
     .map((layer) => {
       const key = String(layer && (layer.key || layer.name || '')).toLowerCase();
       const modules = Array.isArray(layer && layer.modules) ? layer.modules : [];
@@ -635,6 +838,7 @@ function buildScene(payload) {
     })
     .slice(0, profile.max_layers)
     .map((row) => row.layer);
+  const layerRows = applyLayerOrderLock(layerRowsUnordered, Date.now());
   const ioIn = Array.isArray(holo.io && holo.io.inputs) ? holo.io.inputs : [];
   const ioOut = Array.isArray(holo.io && holo.io.outputs) ? holo.io.outputs : [];
 
@@ -933,7 +1137,7 @@ function buildScene(payload) {
           subNode.rel,
           subNode.x,
           subNode.y,
-          Math.max(8, subNode.radius + 6)
+          Math.max(12, subNode.radius + 8)
         );
       }
     }
@@ -1276,6 +1480,7 @@ function applySelectionFocus(rebuild = true) {
 function setPayload(payload) {
   state.payload = payload;
   state.scene = buildScene(payload);
+  if (state.scene) primeShellIntro(state.scene, performance.now());
   applySelectionFocus(false);
   syncParticlePool(false);
   renderSelectionTag();
@@ -1315,28 +1520,38 @@ function drawBackground(ts) {
 
 function drawLayerRing(layerNode, ts) {
   const ctx = state.ctx;
-  const selectedId = String(state.selected && state.selected.id || '');
-  const isSelected = selectedId && selectedId === String(layerNode.id || '');
-  const jitter = Math.sin(ts * 0.00035 + layerNode.radius * 0.02) * 1.5;
-  const radius = layerNode.radius + jitter;
+  const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selected && selected.id || '');
+  const selectedType = String(selected && selected.type || '').toLowerCase();
+  const isSelected = selectedId
+    && selectedId === String(layerNode.id || '')
+    && (!selectedType || selectedType === 'layer');
+  const introScale = clamp(Number(layerNode.intro_scale == null ? 1 : layerNode.intro_scale), 0, 1);
+  const baseRadius = Number(layerNode.render_radius || layerNode.radius || 0);
+  if (baseRadius <= 0.5) return;
+  const jitter = Math.sin(ts * 0.00035 + layerNode.radius * 0.02) * 1.5 * introScale;
+  const radius = Math.max(0.2, baseRadius + jitter);
+  const alphaScale = 0.25 + (introScale * 0.75);
+  const primaryAlpha = (0.2 + (layerNode.activity * 0.22)) * alphaScale;
+  const secondaryAlpha = 0.11;
   const stroke = isSelected
-    ? 'rgba(244,246,242,0.96)'
-    : colorFromActivity(layerNode.activity, 0.2 + (layerNode.activity * 0.22));
+    ? colorFromActivityBright(layerNode.activity, primaryAlpha + 0.09, 0.18)
+    : colorFromActivity(layerNode.activity, primaryAlpha);
   ctx.strokeStyle = stroke;
-  ctx.lineWidth = Math.max(1, layerNode.ring_width * 0.08);
+  ctx.lineWidth = Math.max(0.8, layerNode.ring_width * 0.08 * (0.32 + (introScale * 0.68)));
   ctx.beginPath();
   ctx.arc(layerNode.x, layerNode.y, radius, 0, Math.PI * 2);
   ctx.stroke();
 
   ctx.strokeStyle = isSelected
-    ? 'rgba(244,246,242,0.66)'
-    : colorFromActivity(layerNode.activity, 0.11);
-  ctx.lineWidth = Math.max(1, layerNode.ring_width * 0.03);
+    ? colorFromActivityBright(layerNode.activity, secondaryAlpha + 0.1, 0.2)
+    : colorFromActivity(layerNode.activity, secondaryAlpha);
+  ctx.lineWidth = Math.max(0.7, layerNode.ring_width * 0.03 * (0.35 + (introScale * 0.65)));
   for (let i = 0; i < 24; i += 1) {
     const a0 = (i / 24) * Math.PI * 2;
     const a1 = a0 + 0.12;
     ctx.beginPath();
-    ctx.arc(layerNode.x, layerNode.y, radius + (layerNode.ring_width * 0.2), a0, a1);
+    ctx.arc(layerNode.x, layerNode.y, radius + (layerNode.ring_width * 0.2 * (0.2 + (introScale * 0.8))), a0, a1);
     ctx.stroke();
   }
 }
@@ -1344,17 +1559,25 @@ function drawLayerRing(layerNode, ts) {
 function drawSpineHub(scene, ts) {
   const ctx = state.ctx;
   const c = scene.center;
-  const selectedId = String(state.selected && state.selected.id || '');
-  const spineSelected = selectedId && selectedId === SPINE_NODE_ID;
+  const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selected && selected.id || '');
+  const selectedType = String(selected && selected.type || '').toLowerCase();
+  const spineSelected = selectedId
+    && selectedId === SPINE_NODE_ID
+    && (!selectedType || selectedType === 'spine');
   const pulse = 1 + (Math.sin(ts * 0.00125) * 0.08);
   const drift = clamp(Number(scene.metrics && scene.metrics.drift_proxy || 0), 0, 1);
   const base = 13 * pulse;
-  ctx.strokeStyle = spineSelected ? 'rgba(244,246,242,0.98)' : 'rgba(110, 203, 255, 0.72)';
+  ctx.strokeStyle = spineSelected
+    ? `rgba(${brightenChannel(110, 0.2)},${brightenChannel(203, 0.2)},${brightenChannel(255, 0.2)},0.86)`
+    : 'rgba(110, 203, 255, 0.72)';
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(c.x, c.y, base, 0, Math.PI * 2);
   ctx.stroke();
-  ctx.strokeStyle = spineSelected ? 'rgba(244,246,242,0.7)' : 'rgba(110, 203, 255, 0.34)';
+  ctx.strokeStyle = spineSelected
+    ? `rgba(${brightenChannel(110, 0.22)},${brightenChannel(203, 0.22)},${brightenChannel(255, 0.22)},0.5)`
+    : 'rgba(110, 203, 255, 0.34)';
   ctx.beginPath();
   ctx.arc(c.x, c.y, base + 7, 0, Math.PI * 2);
   ctx.stroke();
@@ -1372,7 +1595,8 @@ function drawDriftOverlay(scene, ts) {
   if (drift <= 0.001) return;
   const layerNodes = scene.nodes.filter((n) => n.type === 'layer');
   if (!layerNodes.length) return;
-  const maxR = layerNodes.reduce((acc, n) => Math.max(acc, Number(n.radius || 0)), 0);
+  const maxR = layerNodes.reduce((acc, n) => Math.max(acc, Number(n.render_radius || n.radius || 0)), 0);
+  if (maxR <= 0.5) return;
   const c = scene.center;
   const ringR = maxR + 18;
   const totalSegments = 18;
@@ -1393,26 +1617,38 @@ function drawDriftOverlay(scene, ts) {
 
 function drawModuleNode(node, ts) {
   const ctx = state.ctx;
-  const selectedId = String(state.selected && state.selected.id || '');
-  const isSelected = selectedId && selectedId === String(node.id || '');
+  const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selected && selected.id || '');
+  const selectedType = String(selected && selected.type || '').toLowerCase();
+  const isSelected = selectedId
+    && selectedId === String(node.id || '')
+    && (!selectedType || selectedType === 'module');
+  const introScale = nodeIntroScale(node);
+  if (introScale <= 0.02) return;
   const glow = 0.17 + (node.activity * 0.35);
   const pulse = 0.88 + (Math.sin(ts * 0.001 + node.x * 0.01) * 0.1);
   const r = node.radius * pulse;
   const spinOffset = Number(node.fractal_count || 0) > 0 ? Number(node.spin_angle || 0) * 0.42 : 0;
-  ctx.strokeStyle = isSelected ? 'rgba(244,246,242,0.96)' : colorFromActivity(node.activity, 0.65);
+  ctx.save();
+  ctx.globalAlpha *= (0.2 + (introScale * 0.8));
+  ctx.strokeStyle = isSelected
+    ? colorFromActivityBright(node.activity, 0.82, 0.2)
+    : colorFromActivity(node.activity, 0.65);
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
   ctx.stroke();
 
   ctx.fillStyle = isSelected
-    ? 'rgba(244,246,242,0.24)'
+    ? colorFromActivityBright(node.activity, glow * 0.35, 0.16)
     : colorFromActivity(node.activity, glow * 0.2);
   ctx.beginPath();
   ctx.arc(node.x, node.y, r * 0.72, 0, Math.PI * 2);
   ctx.fill();
 
-  ctx.strokeStyle = isSelected ? 'rgba(244,246,242,0.7)' : colorFromActivity(node.activity, 0.36);
+  ctx.strokeStyle = isSelected
+    ? colorFromActivityBright(node.activity, 0.56, 0.19)
+    : colorFromActivity(node.activity, 0.36);
   ctx.lineWidth = 1;
   for (let i = 0; i < 3; i += 1) {
     const start = ((i / 3) * Math.PI * 2) + (ts * 0.00016) + (stableHash(node.id) % 10) * 0.07 + spinOffset;
@@ -1420,16 +1656,28 @@ function drawModuleNode(node, ts) {
     ctx.arc(node.x, node.y, r * (0.82 + i * 0.09), start, start + 0.78);
     ctx.stroke();
   }
+  ctx.restore();
 }
 
 function drawSubmoduleNode(node) {
   const ctx = state.ctx;
-  const selectedId = String(state.selected && state.selected.id || '');
-  const isSelected = selectedId && selectedId === String(node.id || '');
+  const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selected && selected.id || '');
+  const selectedType = String(selected && selected.type || '').toLowerCase();
+  const isSelected = selectedId
+    && selectedId === String(node.id || '')
+    && (!selectedType || selectedType === 'submodule');
+  const introScale = nodeIntroScale(node);
+  if (introScale <= 0.02) return;
+  ctx.save();
+  ctx.globalAlpha *= (0.18 + (introScale * 0.82));
   if (state.quality_tier === 'low') {
     const s = Math.max(1.4, node.radius * 1.45);
-    ctx.fillStyle = isSelected ? 'rgba(244,246,242,0.95)' : colorFromActivity(node.activity, 0.82);
+    ctx.fillStyle = isSelected
+      ? colorFromActivityBright(node.activity, 0.95, 0.18)
+      : colorFromActivity(node.activity, 0.82);
     ctx.fillRect(node.x - s, node.y - s, s * 2, s * 2);
+    ctx.restore();
     return;
   }
   const px = Number(node.parent_x || node.x);
@@ -1439,10 +1687,10 @@ function drawSubmoduleNode(node) {
   const start = Number(node.shell_start || 0);
   const end = Number(node.shell_end || (Math.PI * 0.4));
   ctx.fillStyle = isSelected
-    ? 'rgba(244,246,242,0.24)'
+    ? colorFromActivityBright(node.activity, 0.3, 0.15)
     : colorFromActivity(node.activity, 0.16 + (node.activity * 0.22));
   ctx.strokeStyle = isSelected
-    ? 'rgba(244,246,242,0.96)'
+    ? colorFromActivityBright(node.activity, 0.86, 0.2)
     : colorFromActivity(node.activity, 0.68);
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -1454,7 +1702,9 @@ function drawSubmoduleNode(node) {
 
   if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
     const step = (end - start) / 3;
-    ctx.strokeStyle = isSelected ? 'rgba(244,246,242,0.72)' : colorFromActivity(node.activity, 0.4);
+    ctx.strokeStyle = isSelected
+      ? colorFromActivityBright(node.activity, 0.62, 0.18)
+      : colorFromActivity(node.activity, 0.4);
     ctx.lineWidth = 0.8;
     for (let i = 1; i <= 2; i += 1) {
       const a = start + (step * i);
@@ -1468,6 +1718,7 @@ function drawSubmoduleNode(node) {
     ctx.arc(px, py, midR, start + 0.04, end - 0.04);
     ctx.stroke();
   }
+  ctx.restore();
 }
 
 function drawIoNode(node, ts) {
@@ -1495,14 +1746,21 @@ function drawLinks(scene) {
   const ctx = state.ctx;
   const profile = state.quality_profile;
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
+  const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
+    ? scene.node_by_id
+    : Object.create(null);
   for (const link of scene.links) {
     if (focusLinks && !focusLinks.has(link.id)) continue;
+    const fromNode = nodeById[String(link.from_id || '')];
+    const toNode = nodeById[String(link.to_id || '')];
+    const introScale = Math.min(nodeIntroScale(fromNode), nodeIntroScale(toNode));
+    if (introScale <= 0.02) continue;
     const kind = String(link.kind || '').toLowerCase();
     if (kind === 'fractal') {
-      const alpha = clamp(0.2 + (Number(link.activity || 0) * 0.35), 0.16, 0.78);
+      const alpha = clamp((0.2 + (Number(link.activity || 0) * 0.35)) * (0.2 + introScale * 0.8), 0.12, 0.8);
       ctx.shadowBlur = 0;
       ctx.strokeStyle = `rgba(196,232,255,${alpha})`;
-      ctx.lineWidth = 0.7 + (Number(link.activity || 0) * 0.95);
+      ctx.lineWidth = (0.7 + (Number(link.activity || 0) * 0.95)) * (0.35 + (introScale * 0.65));
       ctx.beginPath();
       ctx.moveTo(link.p0.x, link.p0.y);
       ctx.bezierCurveTo(link.p1.x, link.p1.y, link.p2.x, link.p2.y, link.p3.x, link.p3.y);
@@ -1511,24 +1769,24 @@ function drawLinks(scene) {
     }
     const errW = clamp(Number(link.error_weight || 0), 0, 1);
     const errActive = errW > 0.045;
-    const alpha = profile.tube_alpha + (link.activity * 0.12);
+    const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78));
     if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
       if (errActive) {
         ctx.shadowColor = `rgba(255,78,78,${0.24 + (errW * 0.4)})`;
-        ctx.shadowBlur = 8 + (errW * 22);
+        ctx.shadowBlur = (8 + (errW * 22)) * (0.2 + (introScale * 0.8));
       } else {
         ctx.shadowColor = colorFromActivity(link.activity, 0.26);
-        ctx.shadowBlur = 8 + (link.activity * 16);
+        ctx.shadowBlur = (8 + (link.activity * 16)) * (0.2 + (introScale * 0.8));
       }
     } else {
       ctx.shadowBlur = 0;
     }
     if (errActive) {
       ctx.strokeStyle = `rgba(255,72,72,${clamp(0.14 + alpha + (errW * 0.55), 0.08, 0.96)})`;
-      ctx.lineWidth = 0.95 + (link.activity * 1.1) + (errW * 2.2);
+      ctx.lineWidth = (0.95 + (link.activity * 1.1) + (errW * 2.2)) * (0.35 + (introScale * 0.65));
     } else {
       ctx.strokeStyle = colorFromActivity(link.activity, alpha);
-      ctx.lineWidth = 0.8 + (link.activity * 1.8);
+      ctx.lineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
     }
     ctx.beginPath();
     ctx.moveTo(link.p0.x, link.p0.y);
@@ -1545,13 +1803,28 @@ function drawParticles(dt) {
   const trailLength = state.quality_profile.trail_length;
   const burstBoost = performance.now() < state.spine_burst_until ? 1.45 : 1;
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
+  const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
+    ? scene.node_by_id
+    : Object.create(null);
 
   const linkById = {};
   for (const link of scene.links) linkById[link.id] = link;
 
+  const linkIntroScaleById = Object.create(null);
+  for (const link of scene.links) {
+    const fromNode = nodeById[String(link.from_id || '')];
+    const toNode = nodeById[String(link.to_id || '')];
+    linkIntroScaleById[link.id] = Math.min(nodeIntroScale(fromNode), nodeIntroScale(toNode));
+  }
+
   for (const p of state.particles) {
     const link = linkById[p.link_id];
     if (!link) continue;
+    const introScale = clamp(Number(linkIntroScaleById[link.id]), 0, 1);
+    if (introScale <= 0.03) {
+      p.trail.length = 0;
+      continue;
+    }
     if (focusLinks && !focusLinks.has(link.id)) {
       p.trail.length = 0;
       continue;
@@ -1570,12 +1843,14 @@ function drawParticles(dt) {
   for (const p of state.particles) {
     const link = linkById[p.link_id];
     if (!link) continue;
+    const introScale = clamp(Number(linkIntroScaleById[link.id]), 0, 1);
+    if (introScale <= 0.03) continue;
     if (focusLinks && !focusLinks.has(link.id)) continue;
     if (trailLength <= 0 || p.trail.length < 2) continue;
     for (let i = 1; i < p.trail.length; i += 1) {
       const a = p.trail[i - 1];
       const b = p.trail[i];
-      const alpha = (i / p.trail.length) * 0.3;
+      const alpha = (i / p.trail.length) * 0.3 * (0.2 + (introScale * 0.8));
       ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
       ctx.lineWidth = 0.8;
       ctx.beginPath();
@@ -1588,9 +1863,11 @@ function drawParticles(dt) {
   for (const p of state.particles) {
     const link = linkById[p.link_id];
     if (!link) continue;
+    const introScale = clamp(Number(linkIntroScaleById[link.id]), 0, 1);
+    if (introScale <= 0.03) continue;
     if (focusLinks && !focusLinks.has(link.id)) continue;
     const pt = bezierPoint(link, p.t);
-    ctx.fillStyle = `rgba(255,255,255,${0.45 + (link.activity * 0.5)})`;
+    ctx.fillStyle = `rgba(255,255,255,${(0.45 + (link.activity * 0.5)) * (0.25 + (introScale * 0.75))})`;
     ctx.beginPath();
     ctx.arc(pt.x, pt.y, p.radius, 0, Math.PI * 2);
     ctx.fill();
@@ -1699,11 +1976,13 @@ function renderStats() {
   const linkCount = scene && Array.isArray(scene.links) ? scene.links.length : 0;
   const errorSignal = scene ? Number(scene.error_signal || 0) : 0;
   const gpuLabel = state.quality_profile.label;
-  const selectedId = String(state.selected && state.selected.id || '');
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selectedRef && selectedRef.id || '');
   const selectedNode = selectedId && scene && scene.node_by_id
     ? scene.node_by_id[selectedId]
     : null;
-  const selectedType = String(selectedNode && selectedNode.type || '').toLowerCase();
+  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String(selectedNode && selectedNode.type || '').toLowerCase();
   const selectedLinkId = String(state.selected_link && state.selected_link.id || '');
   const selectedLink = selectedLinkId && scene && scene.link_by_id
     ? scene.link_by_id[selectedLinkId]
@@ -2104,13 +2383,25 @@ function layerIdForNode(scene, node) {
   return '';
 }
 
+function isLayerFocusZoomed(scene, layerId) {
+  if (!scene || !scene.node_by_id) return false;
+  const id = String(layerId || '').trim();
+  if (!id || !state.camera.focus_mode) return false;
+  const focusId = String(state.camera.focus_target_id || '').trim();
+  if (!focusId || focusId !== id) return false;
+  const focusNode = scene.node_by_id[focusId];
+  return String((focusNode && focusNode.type) || '').toLowerCase() === 'layer';
+}
+
 function normalizeHitForCurrentLevel(scene, hit) {
   if (!scene || !hit) return hit;
   const node = interactionNodeFromHit(scene, hit);
   if (!node) return hit;
-  const sid = String(state.selected && state.selected.id || '').trim();
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const sid = String(selectedRef && selectedRef.id || '').trim();
   const selectedNode = sid && scene.node_by_id ? scene.node_by_id[sid] : null;
-  const selectedType = String((selectedNode && selectedNode.type) || '').toLowerCase();
+  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
   const nodeType = String(node.type || '').toLowerCase();
 
   const mapToLayer = () => {
@@ -2129,12 +2420,22 @@ function normalizeHitForCurrentLevel(scene, hit) {
 
   // Preferred module selector level inside selected shell.
   if (selectedType === 'layer') {
+    const selectedLayerId = String(selectedNode.id || '');
+    const shellZoomed = isLayerFocusZoomed(scene, selectedLayerId);
+    if (!shellZoomed) {
+      if (nodeType === 'module' || nodeType === 'submodule') return mapToLayer();
+      return hit;
+    }
+    if (nodeType === 'module' && String(node.parent_id || '') !== selectedLayerId) {
+      return mapToLayer();
+    }
     if (nodeType === 'submodule') {
       const parentId = String(node.parent_id || '');
       const parentNode = scene.node_by_id ? scene.node_by_id[parentId] : null;
       if (parentNode && String(parentNode.parent_id || '') === String(selectedNode.id || '')) {
         return hitTargetFromNode(scene, parentId, 'circle') || hit;
       }
+      return mapToLayer();
     }
     return hit;
   }
@@ -2148,9 +2449,11 @@ function isHitAllowedForCurrentLevel(scene, hit) {
   const targetType = String((targetNode && targetNode.type) || '').toLowerCase();
   const hitKind = String(hit.kind || '').toLowerCase();
   const isShellHit = hitKind === 'ring' || hitKind === 'shell_fill';
-  const sid = String(state.selected && state.selected.id || '').trim();
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const sid = String(selectedRef && selectedRef.id || '').trim();
   const selectedNode = sid && scene.node_by_id ? scene.node_by_id[sid] : null;
-  const selectedType = String((selectedNode && selectedNode.type) || '').toLowerCase();
+  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
   if (targetType === 'system') return true;
 
   // Root level: only shell (layer ring) interaction.
@@ -2171,9 +2474,12 @@ function isHitAllowedForCurrentLevel(scene, hit) {
   }
 
   if (selectedType === 'layer') {
+    const selectedLayerId = String(selectedNode.id || '');
+    const shellZoomed = isLayerFocusZoomed(scene, selectedLayerId);
     if (targetType === 'spine') return true;
     if (isShellHit && targetType === 'layer') return true;
-    return targetType === 'module' && String(targetNode.parent_id || '') === String(selectedNode.id || '');
+    if (!shellZoomed) return false;
+    return targetType === 'module' && String(targetNode.parent_id || '') === selectedLayerId;
   }
 
   if (selectedType === 'module') {
@@ -2202,14 +2508,17 @@ function isHitAllowedForCurrentLevel(scene, hit) {
 }
 
 function onCanvasClick(evt) {
+  if (isShellIntroActive(performance.now())) return;
   if (state.camera.drag_px > 5) return;
   const rect = state.canvas.getBoundingClientRect();
   const x = evt.clientX - rect.left;
   const y = evt.clientY - rect.top;
   const scene = state.scene;
-  const selectedId = String(state.selected && state.selected.id || '').trim();
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selectedRef && selectedRef.id || '').trim();
   const selectedNode = selectedId && scene && scene.node_by_id ? scene.node_by_id[selectedId] : null;
-  const selectedType = String((selectedNode && selectedNode.type) || '').toLowerCase();
+  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
   const rawHit = hitTest(x, y);
   const normalizedHit = rawHit ? normalizeHitForCurrentLevel(scene, rawHit) : null;
   const hit = normalizedHit && isHitAllowedForCurrentLevel(scene, normalizedHit) ? normalizedHit : null;
@@ -2235,7 +2544,8 @@ function onCanvasClick(evt) {
             id: String(layerTarget.id || rawLayerId),
             name: String(layerTarget.name || rawLayerId),
             path: String(layerTarget.path || ''),
-            kind: String(layerTarget.kind || 'ring')
+            kind: String(layerTarget.kind || 'ring'),
+            type: 'layer'
           };
           state.selected_link = null;
           applySelectionFocus(true);
@@ -2310,14 +2620,16 @@ function onCanvasClick(evt) {
           id: targetId,
           name: targetName,
           path: targetPath,
-          kind: targetKind
+          kind: targetKind,
+          type: targetType
         };
       } else if (targetType === 'layer' || targetType === 'spine' || targetType === 'system') {
         state.selected = {
           id: targetId,
           name: targetName,
           path: targetPath,
-          kind: targetKind
+          kind: targetKind,
+          type: targetType
         };
         if (targetType === 'layer' && !suppressAutoLayerZoom) zoomIntoLayer(targetNode.id);
       } else if (targetType === 'submodule') {
@@ -2326,7 +2638,8 @@ function onCanvasClick(evt) {
           id: targetId,
           name: targetName,
           path: targetPath,
-          kind: targetKind
+          kind: targetKind,
+          type: targetType
         };
       } else {
         state.selected = null;
@@ -2336,7 +2649,8 @@ function onCanvasClick(evt) {
         id: targetId,
         name: targetName,
         path: targetPath,
-        kind: targetKind
+        kind: targetKind,
+        type: selectionTypeFrom(targetNode, targetKind)
       };
     }
     state.selected_link = null;
@@ -2362,6 +2676,10 @@ function onCanvasClick(evt) {
 }
 
 function updateHoverAtCanvasPoint(x, y) {
+  if (isShellIntroActive(performance.now())) {
+    state.hover = null;
+    return;
+  }
   const scene = state.scene;
   if (!scene) {
     state.hover = null;
