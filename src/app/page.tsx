@@ -28,11 +28,9 @@ const holographicFragmentShader = `
     float fresnel = pow(1.0 - dot(vNormal, viewDir), 2.5);
     // Scanlines
     float scan = sin(vPosition.y * 60.0 + time * 12.0) * 0.035 + 0.965;
-    // Subtle noise + glitch
-    float noise = fract(sin(dot(vPosition.xy, vec2(12.9898, 78.233))) * 43758.5453 + time);
-    float glitch = step(0.985, noise) * 0.12;
+    // Clean hologram - no glitch
     vec3 holo = color * (fresnel * 1.8 + 0.6);
-    gl_FragColor = vec4(holo * scan + glitch, opacity * (fresnel + 0.4));
+    gl_FragColor = vec4(holo * scan, opacity * (fresnel + 0.4));
   }
 `;
 
