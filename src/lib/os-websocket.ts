@@ -73,11 +73,44 @@ export const useOSStore = create<OSState>((set) => ({
 //   });
 // });
 
-// For demo: Simulate live drift changes
+// Connect to live Protheus OS telemetry
+let lastDrift = 3.0;
+
 if (typeof window !== 'undefined') {
+  const socket = io('http://localhost:8000');
+
+  socket.on('connect', () => {
+    console.log('🔌 Connected to Protheus OS telemetry');
+  });
+
+  socket.on('os_telemetry', (data: { drift: number; subsystems: any[]; timestamp: string }) => {
+    console.log('📊 Received telemetry:', data);
+    
+    // Update drift
+    useOSStore.getState().setDrift(data.drift);
+    lastDrift = data.drift;
+    
+    // Update subsystems with real data
+    if (data.subsystems) {
+      data.subsystems.forEach((s) => {
+        useOSStore.getState().updateSubsystem(s.id, {
+          activeAgents: s.activeAgents,
+          health: s.health
+        });
+      });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('🔌 Disconnected from telemetry');
+  });
+
+  // Fallback: subtle animation on top of real data
   setInterval(() => {
     const current = useOSStore.getState().drift;
-    const variation = (Math.random() - 0.5) * 0.2;
-    useOSStore.getState().setDrift(Math.max(1, Math.min(25, current + variation)));
-  }, 3000);
+    // Small organic fluctuation around real value
+    const variation = (Math.random() - 0.5) * 0.05;
+    const blended = (current * 0.95) + (lastDrift * 0.05) + variation;
+    useOSStore.getState().setDrift(Math.max(1, Math.min(25, blended)));
+  }, 500);
 }
