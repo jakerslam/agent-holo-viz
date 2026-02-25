@@ -67,6 +67,11 @@ const CONTINUUM_CACHE_TTL_MS = 3000;
 const CODEBASE_SIZE_MAX_FILES = 2400;
 const CODEBASE_SIZE_MAX_DEPTH = 10;
 const CODE_PREVIEW_MAX_BYTES = 180 * 1024;
+const CODEGRAPH_CACHE_TTL_MS = 20000;
+const CODEGRAPH_MAX_FILES = 3200;
+const CODEGRAPH_MAX_DEPTH = 14;
+const CODEGRAPH_MAX_FILE_BYTES = 96 * 1024;
+const CODEGRAPH_DEFAULT_QUERY_LIMIT = 24;
 const CODEBASE_SIZE_EXTS = new Set([
   '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
   '.json', '.md', '.yaml', '.yml',
@@ -84,6 +89,24 @@ const CODEBASE_SKIP_DIRS = new Set([
   'out',
   'coverage',
   '.turbo'
+]);
+const CODEGRAPH_SKIP_DIRS = new Set([
+  ...Array.from(CODEBASE_SKIP_DIRS),
+  '.openclaw',
+  'state',
+  'memory',
+  'logs',
+  'tmp'
+]);
+const CODEGRAPH_FILE_EXTS = new Set([
+  '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
+  '.py', '.go', '.rs', '.java', '.kt', '.swift',
+  '.rb', '.php', '.sh', '.zsh', '.bash',
+  '.json', '.yaml', '.yml', '.toml',
+  '.md', '.sql', '.html', '.css', '.scss', '.sass'
+]);
+const CODEGRAPH_IMPORT_SCAN_EXTS = new Set([
+  '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.py'
 ]);
 
 const LAYER_ROOTS = [
@@ -119,6 +142,16 @@ let FRACTAL_CACHE = {
 let CONTINUUM_CACHE = {
   ts: 0,
   payload: null
+};
+
+let CODEGRAPH_CACHE = {
+  ts: 0,
+  payload: null
+};
+
+let TYPESCRIPT_MODULE_CACHE = {
+  tried: false,
+  mod: null
 };
 
 let PUSH_TRANSITION_STATE = {
@@ -2847,6 +2880,1212 @@ function readCodePreview(rawPath) {
   };
 }
 
+function codegraphNodeId(rel) {
+  return `file:${normalizeRelPath(rel)}`;
+}
+
+function codegraphLayerFromRel(rel) {
+  const clean = normalizeRelPath(rel);
+  if (!clean) return '';
+  const seg = String(clean.split('/')[0] || '').trim();
+  return seg;
+}
+
+function codegraphModuleFromRel(rel) {
+  const clean = normalizeRelPath(rel);
+  if (!clean) return '';
+  const parts = clean.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  if (parts.length === 1) return parts[0];
+  return `${parts[0]}/${parts[1]}`;
+}
+
+function codegraphIsPathLikeToken(text) {
+  const s = String(text || '').trim();
+  if (!s) return false;
+  if (s.includes('/')) return true;
+  if (/\.[a-z0-9]{1,6}$/i.test(s)) return true;
+  return false;
+}
+
+function shouldIncludeCodegraphFile(fileName) {
+  const name = String(fileName || '').trim();
+  if (!name || name.startsWith('.')) return false;
+  const ext = path.extname(name).toLowerCase();
+  if (!ext) return false;
+  return CODEGRAPH_FILE_EXTS.has(ext);
+}
+
+function safeReadTextPrefix(absPath, maxBytes = CODEGRAPH_MAX_FILE_BYTES) {
+  if (!absPath || !fs.existsSync(absPath)) return '';
+  let stat = null;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    stat = null;
+  }
+  if (!stat || !stat.isFile()) return '';
+  const readBytes = Math.max(0, Math.min(Number(stat.size || 0), Number(maxBytes || CODEGRAPH_MAX_FILE_BYTES)));
+  if (readBytes <= 0) return '';
+  let fileBuffer = Buffer.alloc(0);
+  const fd = fs.openSync(absPath, 'r');
+  try {
+    fileBuffer = Buffer.alloc(readBytes);
+    const bytesRead = fs.readSync(fd, fileBuffer, 0, readBytes, 0);
+    if (bytesRead < readBytes) fileBuffer = fileBuffer.slice(0, bytesRead);
+  } catch {
+    return '';
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+  if (!likelyTextBuffer(fileBuffer)) return '';
+  return String(fileBuffer.toString('utf8') || '');
+}
+
+function safeReadTextFullUnderLimit(absPath, maxBytes = CODEGRAPH_MAX_FILE_BYTES) {
+  if (!absPath || !fs.existsSync(absPath)) return '';
+  let stat = null;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    stat = null;
+  }
+  if (!stat || !stat.isFile()) return '';
+  const size = Math.max(0, Number(stat.size || 0));
+  const cap = Math.max(1, Number(maxBytes || CODEGRAPH_MAX_FILE_BYTES));
+  if (size <= 0 || size > cap) return '';
+  let fileBuffer = Buffer.alloc(0);
+  try {
+    fileBuffer = fs.readFileSync(absPath);
+  } catch {
+    return '';
+  }
+  if (!likelyTextBuffer(fileBuffer)) return '';
+  return String(fileBuffer.toString('utf8') || '');
+}
+
+function loadTypeScriptModule() {
+  if (TYPESCRIPT_MODULE_CACHE.tried) return TYPESCRIPT_MODULE_CACHE.mod;
+  TYPESCRIPT_MODULE_CACHE.tried = true;
+  let mod = null;
+  try {
+    mod = require('typescript');
+  } catch {
+    mod = null;
+  }
+  TYPESCRIPT_MODULE_CACHE.mod = mod;
+  return mod;
+}
+
+function tsScriptKindForExt(ts, ext) {
+  const e = String(ext || '').toLowerCase();
+  if (e === '.ts') return ts.ScriptKind.TS;
+  if (e === '.tsx') return ts.ScriptKind.TSX;
+  if (e === '.js') return ts.ScriptKind.JS;
+  if (e === '.jsx') return ts.ScriptKind.JSX;
+  if (e === '.mjs') return ts.ScriptKind.JS;
+  if (e === '.cjs') return ts.ScriptKind.JS;
+  return ts.ScriptKind.Unknown;
+}
+
+function tsNodeHasModifier(ts, node, kind) {
+  if (!node || !Array.isArray(node.modifiers)) return false;
+  for (const mod of node.modifiers) {
+    if (mod && mod.kind === kind) return true;
+  }
+  return false;
+}
+
+function tsCollectBindingNames(ts, nameNode, out) {
+  const rows = Array.isArray(out) ? out : [];
+  if (!nameNode) return rows;
+  if (ts.isIdentifier(nameNode)) {
+    rows.push(String(nameNode.text || '').trim());
+    return rows;
+  }
+  if (ts.isObjectBindingPattern(nameNode) || ts.isArrayBindingPattern(nameNode)) {
+    for (const el of nameNode.elements || []) {
+      if (!el) continue;
+      if (ts.isBindingElement(el)) {
+        tsCollectBindingNames(ts, el.name, rows);
+      }
+    }
+  }
+  return rows;
+}
+
+function parseTsAstInfo(sourceText, ext, fileName = 'file.ts') {
+  const ts = loadTypeScriptModule();
+  const src = String(sourceText || '');
+  const result = {
+    ok: false,
+    imports: [],
+    import_bindings: [],
+    exports: [],
+    symbols: [],
+    call_hints: []
+  };
+  if (!ts || !src.trim()) return result;
+
+  try {
+    const importSet = new Set();
+    const exportSet = new Set();
+    const symbolSet = new Set();
+    const bindingByLocal = {};
+    const callRows = [];
+    const scriptKind = tsScriptKindForExt(ts, ext);
+    const sf = ts.createSourceFile(
+      String(fileName || 'file.ts'),
+      src,
+      ts.ScriptTarget.Latest,
+      true,
+      scriptKind
+    );
+
+    const addImport = (raw) => {
+      const spec = String(raw || '').trim();
+      if (!spec) return;
+      if (spec.startsWith('node:')) return;
+      importSet.add(spec);
+    };
+    const addBinding = (localRaw, specRaw, importedRaw, kindRaw) => {
+      const local = String(localRaw || '').trim();
+      const spec = String(specRaw || '').trim();
+      const imported = String(importedRaw || '').trim();
+      const kind = String(kindRaw || '').trim() || 'named';
+      if (!local || !spec) return;
+      bindingByLocal[local] = {
+        local,
+        spec,
+        imported: imported || local,
+        kind
+      };
+    };
+    const addSymbol = (raw) => {
+      const name = String(raw || '').trim();
+      if (!name) return;
+      symbolSet.add(name);
+    };
+    const addExport = (raw) => {
+      const name = String(raw || '').trim();
+      if (!name) return;
+      exportSet.add(name);
+    };
+    const addCallHint = (payload) => {
+      if (!payload || typeof payload !== 'object') return;
+      const spec = String(payload.spec || '').trim();
+      const imported = String(payload.imported || '').trim();
+      const local = String(payload.local || '').trim();
+      const via = String(payload.via || '').trim() || 'binding';
+      if (!spec) return;
+      callRows.push({
+        spec,
+        imported,
+        local,
+        via,
+        call_name: String(payload.call_name || '').trim()
+      });
+    };
+
+    const visit = (node) => {
+      if (!node) return;
+      if (ts.isImportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+        const spec = String(node.moduleSpecifier.text || '').trim();
+        addImport(spec);
+        const clause = node.importClause;
+        if (clause) {
+          if (clause.name) {
+            addBinding(String(clause.name.text || ''), spec, 'default', 'default');
+          }
+          const named = clause.namedBindings;
+          if (named) {
+            if (ts.isNamespaceImport(named)) {
+              addBinding(String(named.name && named.name.text || ''), spec, '*', 'namespace');
+            } else if (ts.isNamedImports(named)) {
+              for (const el of named.elements || []) {
+                if (!el) continue;
+                const local = String(el.name && el.name.text || '').trim();
+                const imported = String(el.propertyName && el.propertyName.text || el.name && el.name.text || '').trim();
+                addBinding(local, spec, imported, 'named');
+              }
+            }
+          }
+        }
+      } else if (ts.isExportDeclaration(node)) {
+        if (node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+          addImport(String(node.moduleSpecifier.text || ''));
+        }
+        if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+          for (const el of node.exportClause.elements || []) {
+            if (!el) continue;
+            addExport(String(el.name && el.name.text || ''));
+          }
+        }
+      } else if (ts.isFunctionDeclaration(node)) {
+        if (node.name) addSymbol(String(node.name.text || ''));
+        if (tsNodeHasModifier(ts, node, ts.SyntaxKind.ExportKeyword) && node.name) {
+          addExport(String(node.name.text || ''));
+        }
+        if (tsNodeHasModifier(ts, node, ts.SyntaxKind.DefaultKeyword)) addExport('default');
+      } else if (ts.isClassDeclaration(node)) {
+        if (node.name) addSymbol(String(node.name.text || ''));
+        if (tsNodeHasModifier(ts, node, ts.SyntaxKind.ExportKeyword) && node.name) {
+          addExport(String(node.name.text || ''));
+        }
+        if (tsNodeHasModifier(ts, node, ts.SyntaxKind.DefaultKeyword)) addExport('default');
+      } else if (ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEnumDeclaration(node)) {
+        if (node.name) addSymbol(String(node.name.text || ''));
+        if (tsNodeHasModifier(ts, node, ts.SyntaxKind.ExportKeyword) && node.name) {
+          addExport(String(node.name.text || ''));
+        }
+      } else if (ts.isVariableStatement(node)) {
+        const declList = node.declarationList;
+        for (const decl of declList.declarations || []) {
+          if (!decl) continue;
+          const names = tsCollectBindingNames(ts, decl.name, []);
+          for (const name of names) {
+            addSymbol(name);
+            if (tsNodeHasModifier(ts, node, ts.SyntaxKind.ExportKeyword)) addExport(name);
+          }
+          const init = decl.initializer;
+          if (
+            init
+            && ts.isCallExpression(init)
+            && ts.isIdentifier(init.expression)
+            && String(init.expression.text || '').trim() === 'require'
+          ) {
+            const arg = Array.isArray(init.arguments) ? init.arguments[0] : null;
+            if (arg && ts.isStringLiteral(arg)) {
+              const spec = String(arg.text || '').trim();
+              addImport(spec);
+              if (ts.isIdentifier(decl.name)) {
+                addBinding(String(decl.name.text || '').trim(), spec, '*', 'namespace');
+              } else if (ts.isObjectBindingPattern(decl.name)) {
+                for (const el of decl.name.elements || []) {
+                  if (!el || !ts.isBindingElement(el)) continue;
+                  const local = String(el.name && el.name.text || '').trim();
+                  const imported = String(el.propertyName && el.propertyName.text || el.name && el.name.text || '').trim();
+                  addBinding(local, spec, imported || local, 'named');
+                }
+              }
+            }
+          }
+        }
+      } else if (ts.isCallExpression(node)) {
+        if (node.expression && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+          const arg = Array.isArray(node.arguments) ? node.arguments[0] : null;
+          if (arg && ts.isStringLiteral(arg)) addImport(String(arg.text || ''));
+        } else if (ts.isIdentifier(node.expression)) {
+          const callee = String(node.expression.text || '').trim();
+          if (callee === 'require') {
+            const arg = Array.isArray(node.arguments) ? node.arguments[0] : null;
+            if (arg && ts.isStringLiteral(arg)) addImport(String(arg.text || ''));
+          }
+          const binding = bindingByLocal[callee];
+          if (binding) {
+            addCallHint({
+              spec: binding.spec,
+              imported: binding.imported,
+              local: binding.local,
+              via: 'binding',
+              call_name: callee
+            });
+          }
+        } else if (ts.isPropertyAccessExpression(node.expression)) {
+          const expr = node.expression;
+          if (ts.isIdentifier(expr.expression)) {
+            const root = String(expr.expression.text || '').trim();
+            const prop = String(expr.name && expr.name.text || '').trim();
+            const binding = bindingByLocal[root];
+            if (binding && binding.kind === 'namespace') {
+              addCallHint({
+                spec: binding.spec,
+                imported: prop,
+                local: root,
+                via: 'namespace',
+                call_name: `${root}.${prop}`
+              });
+            }
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+
+    result.ok = true;
+    result.imports = Array.from(importSet).slice(0, 220);
+    result.import_bindings = Object.values(bindingByLocal).slice(0, 260);
+    result.exports = Array.from(exportSet).slice(0, 220);
+    result.symbols = Array.from(symbolSet).slice(0, 320);
+    result.call_hints = callRows.slice(0, 320);
+    return result;
+  } catch {
+    return result;
+  }
+}
+
+function scanCodegraphFiles() {
+  const files = [];
+  const stack = [{ abs: REPO_ROOT, rel: '', depth: 0 }];
+  let truncated = false;
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (!cur) continue;
+    if (cur.depth > CODEGRAPH_MAX_DEPTH) {
+      truncated = true;
+      continue;
+    }
+    const entries = safeReadDirWithTypes(cur.abs).sort(direntSort);
+    for (const ent of entries) {
+      if (files.length >= CODEGRAPH_MAX_FILES) {
+        truncated = true;
+        break;
+      }
+      const name = String(ent && ent.name || '').trim();
+      if (!name || name.startsWith('.')) continue;
+      const rel = normalizeRelPath(cur.rel ? `${cur.rel}/${name}` : name);
+      const abs = path.join(cur.abs, name);
+      if (ent.isDirectory()) {
+        if (CODEGRAPH_SKIP_DIRS.has(name.toLowerCase())) continue;
+        stack.push({
+          abs,
+          rel,
+          depth: cur.depth + 1
+        });
+        continue;
+      }
+      if (!ent.isFile()) continue;
+      if (!shouldIncludeCodegraphFile(name)) continue;
+      files.push(rel);
+    }
+    if (truncated) break;
+  }
+  files.sort((a, b) => a.localeCompare(b));
+  return {
+    files: Array.from(new Set(files)),
+    truncated
+  };
+}
+
+function parseImportSpecsFromSource(sourceText, ext) {
+  const src = String(sourceText || '');
+  const out = new Set();
+  if (!src.trim()) return [];
+  const e = String(ext || '').toLowerCase();
+  const push = (raw) => {
+    const spec = String(raw || '').trim();
+    if (!spec) return;
+    if (spec.startsWith('node:')) return;
+    out.add(spec);
+  };
+
+  if (e === '.py') {
+    const fromRe = /^\s*from\s+([a-zA-Z0-9_./-]+)\s+import\s+/gm;
+    const importRe = /^\s*import\s+([a-zA-Z0-9_.,\s/-]+)$/gm;
+    let m = null;
+    while ((m = fromRe.exec(src)) != null) push(m[1]);
+    while ((m = importRe.exec(src)) != null) {
+      const terms = String(m[1] || '').split(',').map((t) => String(t || '').trim()).filter(Boolean);
+      for (const term of terms) push(term);
+    }
+    return Array.from(out).slice(0, 140);
+  }
+
+  const importFromRe = /(?:import|export)\s+(?:[^'"]+?\s+from\s+)?["']([^"']+)["']/g;
+  const requireRe = /require\(\s*["']([^"']+)["']\s*\)/g;
+  const dynamicImportRe = /import\(\s*["']([^"']+)["']\s*\)/g;
+  let m = null;
+  while ((m = importFromRe.exec(src)) != null) push(m[1]);
+  while ((m = requireRe.exec(src)) != null) push(m[1]);
+  while ((m = dynamicImportRe.exec(src)) != null) push(m[1]);
+  return Array.from(out).slice(0, 160);
+}
+
+function resolveCodegraphPathCandidate(candidateRel, relSet) {
+  const raw = normalizeRelPath(candidateRel).replace(/^\//, '');
+  if (!raw) return '';
+  if (relSet.has(raw)) return raw;
+  const ext = path.extname(raw).toLowerCase();
+  if (!ext) {
+    for (const ex of CODEGRAPH_FILE_EXTS) {
+      const withExt = `${raw}${ex}`;
+      if (relSet.has(withExt)) return withExt;
+    }
+    for (const ex of CODEGRAPH_FILE_EXTS) {
+      const idx = `${raw}/index${ex}`;
+      if (relSet.has(idx)) return idx;
+    }
+  }
+  return '';
+}
+
+function resolveCodegraphImport(fromRel, importSpec, relSet) {
+  const spec = String(importSpec || '').trim();
+  if (!spec) return '';
+  if (spec.startsWith('.')) {
+    const baseDir = normalizeRelPath(path.dirname(String(fromRel || '')));
+    const joined = normalizeRelPath(path.join(baseDir, spec));
+    return resolveCodegraphPathCandidate(joined, relSet);
+  }
+  if (spec.startsWith('/')) {
+    return resolveCodegraphPathCandidate(spec, relSet);
+  }
+  const parts = spec.split('/').filter(Boolean);
+  if (!parts.length) return '';
+  const head = String(parts[0] || '').toLowerCase();
+  const layerKnown = LAYER_ROOTS.some((row) => String(row && row.rel || '').toLowerCase() === head);
+  if (layerKnown || codegraphIsPathLikeToken(spec)) {
+    return resolveCodegraphPathCandidate(spec, relSet);
+  }
+  return '';
+}
+
+function codegraphTokenize(text) {
+  return String(text || '')
+    .toLowerCase()
+    .split(/[^a-z0-9_./-]+/g)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 2);
+}
+
+function buildCodegraph() {
+  const scan = scanCodegraphFiles();
+  const files = Array.isArray(scan.files) ? scan.files : [];
+  const relSet = new Set(files);
+  const tsMod = loadTypeScriptModule();
+  const astEnabled = Boolean(tsMod);
+  let astAttemptedFiles = 0;
+  let astParsedFiles = 0;
+  let astFailedFiles = 0;
+  const nodes = [];
+  const edges = [];
+  const externalCounts = {};
+
+  for (const rel of files) {
+    const abs = path.join(REPO_ROOT, rel);
+    let stat = null;
+    try {
+      stat = fs.statSync(abs);
+    } catch {
+      stat = null;
+    }
+    const layer = codegraphLayerFromRel(rel);
+    const moduleName = codegraphModuleFromRel(rel);
+    const fileName = path.basename(rel);
+    const node = {
+      id: codegraphNodeId(rel),
+      rel,
+      abs,
+      layer,
+      module: moduleName,
+      file_name: fileName,
+      ext: path.extname(fileName).toLowerCase(),
+      size_bytes: stat && stat.isFile() ? Math.max(0, Number(stat.size || 0)) : 0,
+      mtime_ms: stat && stat.mtimeMs ? Number(stat.mtimeMs) : 0,
+      parser: 'none',
+      ast_parsed: false,
+      import_specs: [],
+      exports: [],
+      symbols: [],
+      tokens: codegraphTokenize(`${rel} ${layer} ${moduleName} ${fileName}`),
+      imports_count: 0,
+      exports_count: 0,
+      symbols_count: 0
+    };
+    nodes.push(node);
+  }
+
+  const nodeByRel = {};
+  for (const node of nodes) nodeByRel[String(node.rel || '')] = node;
+
+  for (const node of nodes) {
+    const ext = String(node.ext || '').toLowerCase();
+    const canScanImports = CODEGRAPH_IMPORT_SCAN_EXTS.has(ext);
+    if (!canScanImports) continue;
+    let specs = [];
+    let exportsList = [];
+    let symbolsList = [];
+    let callHints = [];
+    let parsedViaAst = false;
+
+    const isTsAstTarget = ext === '.ts'
+      || ext === '.tsx'
+      || ext === '.js'
+      || ext === '.jsx'
+      || ext === '.mjs'
+      || ext === '.cjs';
+    const srcFull = safeReadTextFullUnderLimit(node.abs, CODEGRAPH_MAX_FILE_BYTES);
+    if (isTsAstTarget && astEnabled && srcFull) {
+      astAttemptedFiles += 1;
+      const parsed = parseTsAstInfo(srcFull, ext, node.rel);
+      if (parsed.ok) {
+        parsedViaAst = true;
+        astParsedFiles += 1;
+        specs = Array.isArray(parsed.imports) ? parsed.imports : [];
+        callHints = Array.isArray(parsed.call_hints) ? parsed.call_hints : [];
+        exportsList = Array.isArray(parsed.exports) ? parsed.exports : [];
+        symbolsList = Array.isArray(parsed.symbols) ? parsed.symbols : [];
+      } else {
+        astFailedFiles += 1;
+      }
+    }
+    if (!parsedViaAst) {
+      const src = srcFull || safeReadTextPrefix(node.abs, CODEGRAPH_MAX_FILE_BYTES);
+      if (!src) continue;
+      specs = parseImportSpecsFromSource(src, ext);
+    }
+
+    node.parser = parsedViaAst ? 'typescript_ast' : 'regex_fallback';
+    node.ast_parsed = parsedViaAst;
+    node.import_specs = Array.from(new Set(specs.map((v) => String(v || '').trim()).filter(Boolean))).slice(0, 260);
+    node.exports = Array.from(new Set(exportsList.map((v) => String(v || '').trim()).filter(Boolean))).slice(0, 260);
+    node.symbols = Array.from(new Set(symbolsList.map((v) => String(v || '').trim()).filter(Boolean))).slice(0, 420);
+    node.imports_count = node.import_specs.length;
+    node.exports_count = node.exports.length;
+    node.symbols_count = node.symbols.length;
+    if (node.symbols.length || node.exports.length) {
+      node.tokens = codegraphTokenize([
+        `${node.rel} ${node.layer} ${node.module} ${node.file_name}`,
+        node.symbols.join(' '),
+        node.exports.join(' ')
+      ].join(' '));
+    }
+
+    for (const spec of node.import_specs) {
+      const resolvedRel = resolveCodegraphImport(node.rel, spec, relSet);
+      if (resolvedRel) {
+        const toNode = nodeByRel[resolvedRel];
+        if (!toNode) continue;
+        edges.push({
+          id: `${node.id}->${toNode.id}|import|${String(spec || '')}`,
+          kind: 'import',
+          from_id: node.id,
+          to_id: toNode.id,
+          from_rel: node.rel,
+          to_rel: toNode.rel,
+          spec: String(spec || '')
+        });
+      } else {
+        const key = String(spec.split('/')[0] || spec || '').trim().toLowerCase();
+        if (!key) continue;
+        externalCounts[key] = Number(externalCounts[key] || 0) + 1;
+      }
+    }
+
+    if (callHints.length > 0) {
+      for (const hint of callHints) {
+        const spec = String(hint && hint.spec || '').trim();
+        if (!spec) continue;
+        const resolvedRel = resolveCodegraphImport(node.rel, spec, relSet);
+        if (!resolvedRel) continue;
+        const toNode = nodeByRel[resolvedRel];
+        if (!toNode) continue;
+        const symbol = String(hint && hint.imported || '').trim();
+        edges.push({
+          id: `${node.id}->${toNode.id}|call|${symbol || 'unknown'}`,
+          kind: 'call',
+          from_id: node.id,
+          to_id: toNode.id,
+          from_rel: node.rel,
+          to_rel: toNode.rel,
+          spec,
+          symbol,
+          via: String(hint && hint.via || '').trim() || 'binding',
+          call_name: String(hint && hint.call_name || '').trim()
+        });
+      }
+    }
+  }
+
+  const dedup = {};
+  const uniqEdges = [];
+  for (const edge of edges) {
+    const key = `${edge.from_id}|${edge.to_id}|${edge.kind}|${String(edge.spec || '')}|${String(edge.symbol || '')}`;
+    if (dedup[key]) continue;
+    dedup[key] = true;
+    uniqEdges.push(edge);
+  }
+  const importEdgeCount = uniqEdges.filter((row) => String(row && row.kind || '') === 'import').length;
+  const callEdgeCount = uniqEdges.filter((row) => String(row && row.kind || '') === 'call').length;
+
+  const externalTop = Object.keys(externalCounts)
+    .map((key) => [key, Number(externalCounts[key] || 0)])
+    .sort((a, b) => {
+      if (Math.abs(Number(a[1] || 0) - Number(b[1] || 0)) > 0.0001) return Number(b[1] || 0) - Number(a[1] || 0);
+      return String(a[0] || '').localeCompare(String(b[0] || ''));
+    })
+    .slice(0, 24)
+    .map(([name, count]) => ({ name, count }));
+
+  return {
+    generated_at: nowIso(),
+    nodes,
+    edges: uniqEdges,
+    external_top: externalTop,
+    files_scanned: files.length,
+    files_truncated: scan.truncated === true,
+    import_edge_count: importEdgeCount,
+    call_edge_count: callEdgeCount,
+    ast_enabled: astEnabled,
+    ast_attempted_files: astAttemptedFiles,
+    ast_parsed_files: astParsedFiles,
+    ast_failed_files: astFailedFiles
+  };
+}
+
+function loadCodegraphCached(force = false) {
+  const nowMs = Date.now();
+  if (
+    !force
+    && CODEGRAPH_CACHE.payload
+    && (nowMs - Number(CODEGRAPH_CACHE.ts || 0)) < CODEGRAPH_CACHE_TTL_MS
+  ) {
+    return cloneJson(CODEGRAPH_CACHE.payload);
+  }
+  const payload = buildCodegraph();
+  CODEGRAPH_CACHE = {
+    ts: nowMs,
+    payload
+  };
+  return cloneJson(payload);
+}
+
+function scoreCodegraphNode(node, queryLower, queryTokens) {
+  const rel = String(node && node.rel || '').toLowerCase();
+  const layer = String(node && node.layer || '').toLowerCase();
+  const moduleName = String(node && node.module || '').toLowerCase();
+  const fileName = String(node && node.file_name || '').toLowerCase();
+  const symbols = Array.isArray(node && node.symbols) ? node.symbols : [];
+  const exportsList = Array.isArray(node && node.exports) ? node.exports : [];
+  const symbolsText = symbols.map((v) => String(v || '').toLowerCase()).join(' ');
+  const exportsText = exportsList.map((v) => String(v || '').toLowerCase()).join(' ');
+  const all = `${rel} ${layer} ${moduleName} ${fileName} ${symbolsText} ${exportsText}`;
+  let score = 0;
+  if (queryLower && rel.includes(queryLower)) score += 8;
+  if (queryLower && fileName.includes(queryLower)) score += 4;
+  if (queryLower && symbolsText.includes(queryLower)) score += 4.2;
+  if (queryLower && exportsText.includes(queryLower)) score += 4.6;
+  for (const tok of queryTokens) {
+    if (!tok) continue;
+    if (rel.includes(tok)) score += 2.6;
+    else if (all.includes(tok)) score += 1.2;
+    if (fileName.startsWith(tok)) score += 1.4;
+    if (symbolsText.includes(tok)) score += 1.8;
+    if (exportsText.includes(tok)) score += 1.9;
+  }
+  if (codegraphIsPathLikeToken(queryLower) && rel.endsWith(queryLower)) score += 4;
+  return score;
+}
+
+function inferCodegraphMode(query, modeRaw) {
+  const mode = String(modeRaw || '').trim().toLowerCase();
+  if (mode === 'search' || mode === 'callers' || mode === 'callees') return mode;
+  const q = String(query || '').toLowerCase();
+  if (/(callers?\s+of|used\s+by|imports?\s+of|depends?\s+on\s+me|who\s+calls?|called\s+by)/.test(q)) return 'callers';
+  if (/(dependencies?\s+of|what\s+does.+import|imports?\s+from|outgoing|callees?\s+of|what\s+does.+call|calls?\s+from)/.test(q)) return 'callees';
+  if (/(who|which)\s+.*(imports?|uses?|depends?|calls?)/.test(q)) return 'callers';
+  return 'search';
+}
+
+function inferCodegraphRelationKindHint(query) {
+  const q = String(query || '').toLowerCase();
+  if (!q) return '';
+  if (/\b(call|calls|called|callee|callees|outgoing call)\b/.test(q)) return 'call';
+  if (/\b(import|imports|dependency|dependencies|depends)\b/.test(q)) return 'import';
+  return '';
+}
+
+function extractQueryQuotedTerm(query) {
+  const q = String(query || '');
+  const match = q.match(/["'`](.+?)["'`]/);
+  if (!match) return '';
+  return String(match[1] || '').trim();
+}
+
+function extractRelationTarget(query, mode) {
+  const q = String(query || '').trim();
+  if (!q) return '';
+  const quoted = extractQueryQuotedTerm(q);
+  if (quoted) return quoted;
+  const lower = q.toLowerCase();
+  if (String(mode || '').toLowerCase() === 'callees') {
+    const m = lower.match(/\b(?:calls?\s+from|callees?\s+of|dependencies?\s+of|imports?\s+from)\s+([a-z0-9_./-]+(?:\.[a-z0-9_]+)?)/i);
+    if (m && m[1]) return String(m[1]).trim();
+  }
+  if (String(mode || '').toLowerCase() === 'callers') {
+    const m = lower.match(/\b(?:callers?\s+of|called\s+by|used\s+by|imports?\s+of)\s+([a-z0-9_./-]+(?:\.[a-z0-9_]+)?)/i);
+    if (m && m[1]) return String(m[1]).trim();
+  }
+  const callMatch = lower.match(/\b(?:calls?|called\s+by|uses?|imports?|depends?\s+on)\s+([a-z0-9_./-]+(?:\.[a-z0-9_]+)?)/i);
+  if (callMatch && callMatch[1]) return String(callMatch[1]).trim();
+  const ofMatch = lower.match(/\bof\s+([a-z0-9_./-]+(?:\.[a-z0-9_]+)?)/i);
+  if (ofMatch && ofMatch[1]) return String(ofMatch[1]).trim();
+  const byMatch = lower.match(/\bby\s+([a-z0-9_./-]+(?:\.[a-z0-9_]+)?)/i);
+  if (mode === 'callers' && byMatch && byMatch[1]) return String(byMatch[1]).trim();
+  const pathLike = q
+    .split(/\s+/g)
+    .map((row) => String(row || '').trim().replace(/[),.;:!?]+$/g, ''))
+    .filter((row) => codegraphIsPathLikeToken(row))
+    .sort((a, b) => b.length - a.length);
+  if (pathLike.length) return pathLike[0];
+  return q;
+}
+
+function scoreNodeRows(nodes, queryText, queryTokens) {
+  const qLower = String(queryText || '').toLowerCase();
+  const out = [];
+  for (const node of nodes) {
+    const score = scoreCodegraphNode(node, qLower, queryTokens);
+    if (score <= 0) continue;
+    out.push({
+      id: String(node.id || ''),
+      rel: String(node.rel || ''),
+      layer: String(node.layer || ''),
+      module: String(node.module || ''),
+      file_name: String(node.file_name || ''),
+      size_bytes: Math.max(0, Number(node.size_bytes || 0)),
+      score: Number(score.toFixed(3))
+    });
+  }
+  out.sort((a, b) => {
+    if (Math.abs(Number(a.score || 0) - Number(b.score || 0)) > 0.0001) return Number(b.score || 0) - Number(a.score || 0);
+    return String(a.rel || '').localeCompare(String(b.rel || ''));
+  });
+  return out;
+}
+
+function edgeRowsFromScope(graph, scopeNodeIds, direction, limit, kindHint = '') {
+  const nodeScope = new Set(Array.isArray(scopeNodeIds) ? scopeNodeIds.map((id) => String(id || '')) : []);
+  const rows = [];
+  const byId = {};
+  const kindNeed = String(kindHint || '').trim().toLowerCase();
+  for (const node of graph.nodes || []) byId[String(node.id || '')] = node;
+  for (const edge of graph.edges || []) {
+    const fromId = String(edge && edge.from_id || '');
+    const toId = String(edge && edge.to_id || '');
+    if (!fromId || !toId) continue;
+    if (kindNeed && String(edge && edge.kind || '').toLowerCase() !== kindNeed) continue;
+    if (direction === 'callers' && !nodeScope.has(toId)) continue;
+    if (direction === 'callees' && !nodeScope.has(fromId)) continue;
+    const fromNode = byId[fromId];
+    const toNode = byId[toId];
+    rows.push({
+      id: String(edge.id || ''),
+      kind: String(edge.kind || 'import'),
+      from_id: fromId,
+      to_id: toId,
+      from_rel: String((fromNode && fromNode.rel) || edge.from_rel || ''),
+      to_rel: String((toNode && toNode.rel) || edge.to_rel || ''),
+      spec: String(edge.spec || ''),
+      score: 1
+    });
+    if (rows.length >= limit) break;
+  }
+  return rows;
+}
+
+function queryCodegraph(graph, options = {}) {
+  const query = String(options.query || '').trim();
+  const mode = inferCodegraphMode(query, options.mode);
+  const limit = clampNumber(options.limit, 1, 160, CODEGRAPH_DEFAULT_QUERY_LIMIT);
+  const queryTokens = codegraphTokenize(query).slice(0, 18);
+  const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph && graph.edges) ? graph.edges : [];
+  const summary = {
+    files_scanned: Math.max(0, Number(graph && graph.files_scanned || 0)),
+    files_truncated: graph && graph.files_truncated === true,
+    node_count: nodes.length,
+    edge_count: edges.length,
+    import_edge_count: Math.max(0, Number(graph && graph.import_edge_count || 0)),
+    call_edge_count: Math.max(0, Number(graph && graph.call_edge_count || 0)),
+    ast_enabled: graph && graph.ast_enabled === true,
+    ast_attempted_files: Math.max(0, Number(graph && graph.ast_attempted_files || 0)),
+    ast_parsed_files: Math.max(0, Number(graph && graph.ast_parsed_files || 0)),
+    ast_failed_files: Math.max(0, Number(graph && graph.ast_failed_files || 0))
+  };
+  if (!query) {
+    return {
+      ok: true,
+      generated_at: nowIso(),
+      mode: 'summary',
+      query: '',
+      summary,
+      matches: {
+        nodes: [],
+        links: [],
+        explanation: 'no_query_supplied',
+        top_external: Array.isArray(graph && graph.external_top) ? graph.external_top.slice(0, 10) : []
+      }
+    };
+  }
+
+  const scoredNodes = scoreNodeRows(nodes, query, queryTokens);
+  if (mode === 'callers' || mode === 'callees') {
+    const target = extractRelationTarget(query, mode);
+    const kindHint = inferCodegraphRelationKindHint(query);
+    const targetRows = scoreNodeRows(nodes, target || query, codegraphTokenize(target || query).slice(0, 18)).slice(0, 8);
+    const targetIds = targetRows.map((row) => String(row.id || ''));
+    let edgeRows = edgeRowsFromScope(graph, targetIds, mode, Math.max(limit * 2, 24), kindHint);
+    if (edgeRows.length === 0 && kindHint) {
+      edgeRows = edgeRowsFromScope(graph, targetIds, mode, Math.max(limit * 2, 24), '');
+    }
+    const nodeById = {};
+    for (const node of nodes) nodeById[String(node.id || '')] = node;
+    const relationNodeIds = new Set(targetIds);
+    for (const edge of edgeRows) {
+      relationNodeIds.add(String(edge.from_id || ''));
+      relationNodeIds.add(String(edge.to_id || ''));
+    }
+    const relationNodes = [];
+    for (const id of relationNodeIds) {
+      const node = nodeById[id];
+      if (!node) continue;
+      relationNodes.push({
+        id: String(node.id || ''),
+        rel: String(node.rel || ''),
+        layer: String(node.layer || ''),
+        module: String(node.module || ''),
+        file_name: String(node.file_name || ''),
+        size_bytes: Math.max(0, Number(node.size_bytes || 0)),
+        score: targetIds.includes(id) ? 1.2 : 1
+      });
+    }
+    relationNodes.sort((a, b) => String(a.rel || '').localeCompare(String(b.rel || '')));
+    return {
+      ok: true,
+      generated_at: nowIso(),
+      mode,
+      query,
+      summary,
+      matches: {
+        target: target || query,
+        nodes: relationNodes.slice(0, Math.max(limit, 10)),
+        links: edgeRows.slice(0, Math.max(limit, 10)),
+        explanation: `${mode}_query`,
+        top_external: Array.isArray(graph && graph.external_top) ? graph.external_top.slice(0, 10) : []
+      }
+    };
+  }
+
+  const topNodes = scoredNodes.slice(0, Math.max(limit * 2, 20));
+  const nodeScoreById = {};
+  for (const row of topNodes) nodeScoreById[String(row.id || '')] = Number(row.score || 0);
+  const edgeRows = [];
+  for (const edge of edges) {
+    const fromScore = Number(nodeScoreById[String(edge && edge.from_id || '')] || 0);
+    const toScore = Number(nodeScoreById[String(edge && edge.to_id || '')] || 0);
+    let score = (fromScore * 0.52) + (toScore * 0.65);
+    if (query && String(edge && edge.spec || '').toLowerCase().includes(query.toLowerCase())) score += 2;
+    if (score <= 0) continue;
+    edgeRows.push({
+      id: String(edge.id || ''),
+      kind: String(edge.kind || 'import'),
+      from_id: String(edge.from_id || ''),
+      to_id: String(edge.to_id || ''),
+      from_rel: String(edge.from_rel || ''),
+      to_rel: String(edge.to_rel || ''),
+      spec: String(edge.spec || ''),
+      score: Number(score.toFixed(3))
+    });
+  }
+  edgeRows.sort((a, b) => {
+    if (Math.abs(Number(a.score || 0) - Number(b.score || 0)) > 0.0001) return Number(b.score || 0) - Number(a.score || 0);
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+
+  return {
+    ok: true,
+    generated_at: nowIso(),
+    mode: 'search',
+    query,
+    summary,
+    matches: {
+      nodes: topNodes.slice(0, limit),
+      links: edgeRows.slice(0, limit),
+      explanation: 'token_ranked_search',
+      top_external: Array.isArray(graph && graph.external_top) ? graph.external_top.slice(0, 10) : []
+    }
+  };
+}
+
+function codegraphIndexMaps(graph) {
+  const nodeById = {};
+  const outById = {};
+  const inById = {};
+  const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph && graph.edges) ? graph.edges : [];
+  for (const node of nodes) {
+    const id = String(node && node.id || '').trim();
+    if (!id) continue;
+    nodeById[id] = node;
+    if (!outById[id]) outById[id] = [];
+    if (!inById[id]) inById[id] = [];
+  }
+  for (const edge of edges) {
+    const fromId = String(edge && edge.from_id || '').trim();
+    const toId = String(edge && edge.to_id || '').trim();
+    if (!fromId || !toId) continue;
+    if (!outById[fromId]) outById[fromId] = [];
+    if (!inById[toId]) inById[toId] = [];
+    outById[fromId].push(edge);
+    inById[toId].push(edge);
+  }
+  return {
+    node_by_id: nodeById,
+    out_by_id: outById,
+    in_by_id: inById
+  };
+}
+
+function resolveImpactTargetRows(graph, targetText, limit = 8) {
+  const target = String(targetText || '').trim();
+  if (!target) return [];
+  const nodes = Array.isArray(graph && graph.nodes) ? graph.nodes : [];
+  const byPath = normalizeRelPath(target).toLowerCase();
+  const exactRows = [];
+  for (const node of nodes) {
+    const rel = normalizeRelPath(node && node.rel || '').toLowerCase();
+    if (!rel || !byPath) continue;
+    if (rel === byPath) {
+      exactRows.push({
+        id: String(node.id || ''),
+        rel: String(node.rel || ''),
+        layer: String(node.layer || ''),
+        module: String(node.module || ''),
+        file_name: String(node.file_name || ''),
+        size_bytes: Math.max(0, Number(node.size_bytes || 0)),
+        score: 999
+      });
+    }
+  }
+  if (exactRows.length) return exactRows.slice(0, Math.max(1, Number(limit || 8)));
+  const scored = scoreNodeRows(
+    nodes,
+    target,
+    codegraphTokenize(target).slice(0, 18)
+  );
+  return scored.slice(0, Math.max(1, Number(limit || 8)));
+}
+
+function traverseImpactGraph(graph, startNodeIds, options = {}) {
+  const direction = String(options.direction || 'reverse').toLowerCase() === 'forward'
+    ? 'forward'
+    : 'reverse';
+  const maxDepth = clampNumber(options.max_depth, 1, 24, 6);
+  const nodeCap = clampNumber(options.node_cap, 20, 5000, 1200);
+  const kindNeed = String(options.kind || '').trim().toLowerCase();
+  const idx = codegraphIndexMaps(graph);
+  const startIds = Array.isArray(startNodeIds)
+    ? Array.from(new Set(startNodeIds.map((id) => String(id || '').trim()).filter(Boolean)))
+    : [];
+  const startSet = new Set(startIds);
+  const queue = [];
+  const seenDepth = {};
+  const rowsById = {};
+
+  for (const id of startIds) {
+    queue.push({ id, depth: 0 });
+    seenDepth[id] = 0;
+  }
+
+  while (queue.length > 0) {
+    const cur = queue.shift();
+    if (!cur) continue;
+    const curId = String(cur.id || '');
+    const curDepth = Math.max(0, Number(cur.depth || 0));
+    if (!curId) continue;
+    if (curDepth >= maxDepth) continue;
+    const edgeRows = direction === 'forward'
+      ? (Array.isArray(idx.out_by_id[curId]) ? idx.out_by_id[curId] : [])
+      : (Array.isArray(idx.in_by_id[curId]) ? idx.in_by_id[curId] : []);
+    for (const edge of edgeRows) {
+      if (!edge || typeof edge !== 'object') continue;
+      const edgeKind = String(edge.kind || '').toLowerCase();
+      if (kindNeed && edgeKind && edgeKind !== kindNeed) continue;
+      const nextId = direction === 'forward'
+        ? String(edge.to_id || '')
+        : String(edge.from_id || '');
+      if (!nextId || startSet.has(nextId)) continue;
+      const nextDepth = curDepth + 1;
+      if (!(nextId in seenDepth) || nextDepth < Number(seenDepth[nextId] || 9999)) {
+        seenDepth[nextId] = nextDepth;
+        if (Object.keys(rowsById).length < nodeCap && nextDepth < maxDepth) {
+          queue.push({ id: nextId, depth: nextDepth });
+        }
+      }
+      const row = rowsById[nextId] || {
+        id: nextId,
+        depth: nextDepth,
+        direct: nextDepth === 1,
+        incoming_edges: 0,
+        via_kinds: {},
+        parents: {},
+        via_symbols: {}
+      };
+      row.depth = Math.min(Number(row.depth || nextDepth), nextDepth);
+      row.direct = row.direct || nextDepth === 1;
+      row.incoming_edges += 1;
+      row.via_kinds[edgeKind || 'import'] = Number(row.via_kinds[edgeKind || 'import'] || 0) + 1;
+      const parentId = curId;
+      row.parents[parentId] = true;
+      const symbol = String(edge.symbol || '').trim();
+      if (symbol) row.via_symbols[symbol] = true;
+      rowsById[nextId] = row;
+      if (Object.keys(rowsById).length >= nodeCap) break;
+    }
+    if (Object.keys(rowsById).length >= nodeCap) break;
+  }
+
+  const rows = [];
+  for (const id of Object.keys(rowsById)) {
+    const meta = rowsById[id];
+    const node = idx.node_by_id[id];
+    if (!meta || !node) continue;
+    rows.push({
+      id,
+      rel: String(node.rel || ''),
+      layer: String(node.layer || ''),
+      module: String(node.module || ''),
+      file_name: String(node.file_name || ''),
+      size_bytes: Math.max(0, Number(node.size_bytes || 0)),
+      depth: Math.max(1, Number(meta.depth || 1)),
+      direct: meta.direct === true,
+      incoming_edges: Math.max(0, Number(meta.incoming_edges || 0)),
+      via_kinds: Object.keys(meta.via_kinds).sort(),
+      parent_count: Object.keys(meta.parents || {}).length,
+      via_symbols: Object.keys(meta.via_symbols || {}).slice(0, 24)
+    });
+  }
+  rows.sort((a, b) => {
+    if (Math.abs(Number(a.depth || 0) - Number(b.depth || 0)) > 0.0001) return Number(a.depth || 0) - Number(b.depth || 0);
+    if (Math.abs(Number(a.incoming_edges || 0) - Number(b.incoming_edges || 0)) > 0.0001) return Number(b.incoming_edges || 0) - Number(a.incoming_edges || 0);
+    return String(a.rel || '').localeCompare(String(b.rel || ''));
+  });
+  return rows;
+}
+
+function computeImpactRiskRows(rows, limit = 25) {
+  const src = Array.isArray(rows) ? rows : [];
+  const ranked = [];
+  for (const row of src) {
+    const depth = Math.max(1, Number(row && row.depth || 1));
+    const incoming = Math.max(0, Number(row && row.incoming_edges || 0));
+    const kinds = Array.isArray(row && row.via_kinds) ? row.via_kinds : [];
+    const calls = kinds.includes('call');
+    const imports = kinds.includes('import');
+    let base = 1;
+    if (calls) base += 0.65;
+    if (imports) base += 0.35;
+    if (calls && imports) base += 0.22;
+    const fanIn = Math.min(1.4, incoming * 0.18);
+    const depthPenalty = 1 / (1 + ((depth - 1) * 0.55));
+    const score = Number(((base + fanIn) * depthPenalty).toFixed(4));
+    ranked.push({
+      ...row,
+      risk_score: score
+    });
+  }
+  ranked.sort((a, b) => {
+    if (Math.abs(Number(a.risk_score || 0) - Number(b.risk_score || 0)) > 0.0001) return Number(b.risk_score || 0) - Number(a.risk_score || 0);
+    return String(a.rel || '').localeCompare(String(b.rel || ''));
+  });
+  return ranked.slice(0, Math.max(1, Number(limit || 25)));
+}
+
+function summarizeImpactRows(rows) {
+  const src = Array.isArray(rows) ? rows : [];
+  const byLayer = {};
+  const byKind = {};
+  let direct = 0;
+  for (const row of src) {
+    if (!row || typeof row !== 'object') continue;
+    if (row.direct === true) direct += 1;
+    const layer = String(row.layer || '').trim() || 'unknown';
+    byLayer[layer] = Number(byLayer[layer] || 0) + 1;
+    for (const kind of Array.isArray(row.via_kinds) ? row.via_kinds : []) {
+      const k = String(kind || '').trim() || 'import';
+      byKind[k] = Number(byKind[k] || 0) + 1;
+    }
+  }
+  return {
+    total: src.length,
+    direct,
+    transitive: Math.max(0, src.length - direct),
+    by_layer: byLayer,
+    by_kind: byKind
+  };
+}
+
+function impactCodegraph(graph, options = {}) {
+  const target = String(options.target || '').trim();
+  const maxDepth = clampNumber(options.max_depth, 1, 24, 6);
+  const limit = clampNumber(options.limit, 1, 240, 80);
+  const kindHint = String(options.kind || '').trim().toLowerCase();
+  const targetRows = resolveImpactTargetRows(graph, target, 8);
+  const targetIds = targetRows.map((row) => String(row.id || '')).filter(Boolean);
+  const summary = {
+    files_scanned: Math.max(0, Number(graph && graph.files_scanned || 0)),
+    files_truncated: graph && graph.files_truncated === true,
+    node_count: Array.isArray(graph && graph.nodes) ? graph.nodes.length : 0,
+    edge_count: Array.isArray(graph && graph.edges) ? graph.edges.length : 0,
+    import_edge_count: Math.max(0, Number(graph && graph.import_edge_count || 0)),
+    call_edge_count: Math.max(0, Number(graph && graph.call_edge_count || 0))
+  };
+
+  if (!targetIds.length) {
+    return {
+      ok: true,
+      generated_at: nowIso(),
+      target,
+      target_nodes: [],
+      summary,
+      impact: {
+        mode: 'none',
+        max_depth: maxDepth,
+        kind_filter: kindHint || '',
+        dependents: { total: 0, direct: 0, transitive: 0, by_layer: {}, by_kind: {} },
+        dependencies: { total: 0, direct: 0, transitive: 0, by_layer: {}, by_kind: {} },
+        top_dependents: [],
+        top_dependencies: [],
+        unresolved_target: true
+      }
+    };
+  }
+
+  const dependentsAll = traverseImpactGraph(graph, targetIds, {
+    direction: 'reverse',
+    max_depth: maxDepth,
+    kind: kindHint,
+    node_cap: 2600
+  });
+  const dependenciesAll = traverseImpactGraph(graph, targetIds, {
+    direction: 'forward',
+    max_depth: maxDepth,
+    kind: kindHint,
+    node_cap: 2600
+  });
+  const topDependents = computeImpactRiskRows(dependentsAll, limit);
+  const topDependencies = computeImpactRiskRows(dependenciesAll, limit);
+  return {
+    ok: true,
+    generated_at: nowIso(),
+    target,
+    target_nodes: targetRows,
+    summary,
+    impact: {
+      mode: 'blast_radius',
+      max_depth: maxDepth,
+      kind_filter: kindHint || '',
+      dependents: summarizeImpactRows(dependentsAll),
+      dependencies: summarizeImpactRows(dependenciesAll),
+      top_dependents: topDependents,
+      top_dependencies: topDependencies,
+      unresolved_target: false
+    }
+  };
+}
+
 function serveStatic(reqPath, res) {
   const rel = reqPath === '/' ? '/index.html' : reqPath;
   const normalized = path.normalize(rel).replace(/^(\.\.(\/|\\|$))+/, '');
@@ -2918,6 +4157,93 @@ function main() {
     }
     if (pathname === '/api/healthz') {
       sendJson(res, 200, { ok: true, ts: nowIso() });
+      return;
+    }
+    if (pathname === '/api/codegraph/reindex') {
+      try {
+        const graph = loadCodegraphCached(true);
+        sendJson(res, 200, {
+          ok: true,
+          generated_at: nowIso(),
+          summary: {
+            files_scanned: Number(graph.files_scanned || 0),
+            files_truncated: graph.files_truncated === true,
+            node_count: Array.isArray(graph.nodes) ? graph.nodes.length : 0,
+            edge_count: Array.isArray(graph.edges) ? graph.edges.length : 0,
+            import_edge_count: Number(graph.import_edge_count || 0),
+            call_edge_count: Number(graph.call_edge_count || 0),
+            ast_enabled: graph.ast_enabled === true,
+            ast_attempted_files: Number(graph.ast_attempted_files || 0),
+            ast_parsed_files: Number(graph.ast_parsed_files || 0),
+            ast_failed_files: Number(graph.ast_failed_files || 0)
+          },
+          top_external: Array.isArray(graph.external_top) ? graph.external_top.slice(0, 16) : []
+        });
+      } catch (err) {
+        sendJson(res, 500, {
+          ok: false,
+          error: String(err && err.message || err || 'codegraph_reindex_failed'),
+          ts: nowIso()
+        });
+      }
+      return;
+    }
+    if (pathname === '/api/codegraph/query' || pathname === '/api/codegraph') {
+      const query = String(parsed.searchParams.get('q') || '').trim();
+      const mode = String(parsed.searchParams.get('mode') || '').trim().toLowerCase();
+      const limitRaw = Number(parsed.searchParams.get('limit'));
+      const limit = Number.isFinite(limitRaw) ? limitRaw : CODEGRAPH_DEFAULT_QUERY_LIMIT;
+      const force = String(parsed.searchParams.get('reindex') || '').trim() === '1';
+      try {
+        const graph = loadCodegraphCached(force);
+        const payload = queryCodegraph(graph, {
+          query,
+          mode,
+          limit
+        });
+        sendJson(res, 200, payload);
+      } catch (err) {
+        sendJson(res, 500, {
+          ok: false,
+          error: String(err && err.message || err || 'codegraph_query_failed'),
+          ts: nowIso()
+        });
+      }
+      return;
+    }
+    if (pathname === '/api/codegraph/impact') {
+      const target = String(parsed.searchParams.get('target') || parsed.searchParams.get('q') || '').trim();
+      const kind = String(parsed.searchParams.get('kind') || '').trim().toLowerCase();
+      const maxDepthRaw = Number(parsed.searchParams.get('max_depth'));
+      const maxDepth = Number.isFinite(maxDepthRaw) ? maxDepthRaw : 6;
+      const limitRaw = Number(parsed.searchParams.get('limit'));
+      const limit = Number.isFinite(limitRaw) ? limitRaw : 80;
+      const force = String(parsed.searchParams.get('reindex') || '').trim() === '1';
+      if (!target) {
+        sendJson(res, 400, {
+          ok: false,
+          error: 'target_required',
+          hint: 'Use /api/codegraph/impact?target=systems/spine/spine.ts',
+          ts: nowIso()
+        });
+        return;
+      }
+      try {
+        const graph = loadCodegraphCached(force);
+        const payload = impactCodegraph(graph, {
+          target,
+          kind,
+          max_depth: maxDepth,
+          limit
+        });
+        sendJson(res, 200, payload);
+      } catch (err) {
+        sendJson(res, 500, {
+          ok: false,
+          error: String(err && err.message || err || 'codegraph_impact_failed'),
+          ts: nowIso()
+        });
+      }
       return;
     }
     if (pathname === '/api/file') {

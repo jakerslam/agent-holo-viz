@@ -75,6 +75,7 @@ const SHELL_INTRO_INITIAL_DELAY_MS = 110;
 const SHELL_INTRO_LAYER_DELAY_MS = 70;
 const SHELL_INTRO_LAYER_DURATION_MS = 240;
 const RESOLVE_FLASH_MS = 4200;
+const CODEGRAPH_QUERY_LIMIT = 28;
 
 const state = {
   canvas: null,
@@ -137,6 +138,18 @@ const state = {
   },
   focus: null,
   preview_tab: 'preview',
+  codegraph: {
+    query: '',
+    mode: '',
+    running: false,
+    error: '',
+    notice: '',
+    last_result: null,
+    matched_node_ids: new Set(),
+    matched_link_ids: new Set(),
+    matched_node_paths: [],
+    matched_link_paths: []
+  },
   code_preview: {
     selection_key: '',
     path: '',
@@ -211,6 +224,84 @@ function mix(a, b, t) {
 function easeOutCubic(v) {
   const t = clamp(v, 0, 1);
   return 1 - Math.pow(1 - t, 3);
+}
+
+function normalizeRelPathText(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/\/{2,}/g, '/')
+    .replace(/\/$/, '');
+}
+
+function relPathsOverlap(a, b) {
+  const x = normalizeRelPathText(a).toLowerCase();
+  const y = normalizeRelPathText(b).toLowerCase();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (x.startsWith(`${y}/`)) return true;
+  if (y.startsWith(`${x}/`)) return true;
+  return false;
+}
+
+function codegraphState() {
+  const cg = state.codegraph && typeof state.codegraph === 'object'
+    ? state.codegraph
+    : null;
+  if (cg) return cg;
+  state.codegraph = {
+    query: '',
+    mode: '',
+    running: false,
+    error: '',
+    notice: '',
+    last_result: null,
+    matched_node_ids: new Set(),
+    matched_link_ids: new Set(),
+    matched_node_paths: [],
+    matched_link_paths: []
+  };
+  return state.codegraph;
+}
+
+function codegraphHasMatches() {
+  const cg = codegraphState();
+  return Boolean(
+    (cg.matched_node_ids instanceof Set && cg.matched_node_ids.size > 0)
+    || (cg.matched_link_ids instanceof Set && cg.matched_link_ids.size > 0)
+  );
+}
+
+function isCodegraphNodeMatched(id) {
+  const cg = codegraphState();
+  if (!codegraphHasMatches()) return false;
+  const key = String(id || '').trim();
+  if (!key) return false;
+  return cg.matched_node_ids instanceof Set && cg.matched_node_ids.has(key);
+}
+
+function isCodegraphLinkMatched(id) {
+  const cg = codegraphState();
+  if (!codegraphHasMatches()) return false;
+  const key = String(id || '').trim();
+  if (!key) return false;
+  return cg.matched_link_ids instanceof Set && cg.matched_link_ids.has(key);
+}
+
+function codegraphNodeAlphaScale(nodeId) {
+  if (!codegraphHasMatches()) return 1;
+  if (isCodegraphNodeMatched(nodeId)) return 1;
+  return 0.22;
+}
+
+function codegraphLinkAlphaScale(link) {
+  if (!codegraphHasMatches()) return 1;
+  const row = link && typeof link === 'object' ? link : {};
+  const linkId = String(row.id || '');
+  if (isCodegraphLinkMatched(linkId)) return 1;
+  if (isCodegraphNodeMatched(String(row.from_id || '')) || isCodegraphNodeMatched(String(row.to_id || ''))) return 0.6;
+  return 0.12;
 }
 
 function hasNodeIssueSignal(node) {
@@ -788,6 +879,237 @@ async function fetchCodePreview(pathText) {
   const res = await fetch(`/api/file?path=${encodeURIComponent(p)}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`file_http_${res.status}`);
   return res.json();
+}
+
+async function fetchCodegraphQuery(queryText, options = {}) {
+  const q = String(queryText || '').trim();
+  const mode = String(options.mode || '').trim();
+  const limit = Math.max(1, Number(options.limit || CODEGRAPH_QUERY_LIMIT));
+  const force = options.reindex === true;
+  const params = new URLSearchParams();
+  params.set('q', q);
+  params.set('limit', String(limit));
+  if (mode) params.set('mode', mode);
+  if (force) params.set('reindex', '1');
+  const res = await fetch(`/api/codegraph/query?${params.toString()}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`codegraph_http_${res.status}`);
+  return res.json();
+}
+
+async function fetchCodegraphReindex() {
+  const res = await fetch('/api/codegraph/reindex', { cache: 'no-store' });
+  if (!res.ok) throw new Error(`codegraph_reindex_http_${res.status}`);
+  return res.json();
+}
+
+function codegraphRows(payload, key) {
+  const src = payload && payload.matches && typeof payload.matches === 'object'
+    ? payload.matches
+    : {};
+  const rows = Array.isArray(src[key]) ? src[key] : [];
+  return rows.slice(0, 160);
+}
+
+function mapCodegraphMatchesToScene(scene, payload) {
+  const mapped = {
+    node_ids: new Set(),
+    link_ids: new Set(),
+    node_paths: [],
+    link_paths: []
+  };
+  if (!scene || !scene.node_by_id || !payload || typeof payload !== 'object') return mapped;
+  const nodeRows = codegraphRows(payload, 'nodes');
+  const linkRows = codegraphRows(payload, 'links');
+  const nodePathList = nodeRows
+    .map((row) => normalizeRelPathText(row && row.rel))
+    .filter(Boolean);
+  const linkPathList = linkRows
+    .map((row) => ({
+      from_rel: normalizeRelPathText(row && row.from_rel),
+      to_rel: normalizeRelPathText(row && row.to_rel),
+      kind: String(row && row.kind || '').toLowerCase()
+    }))
+    .filter((row) => row.from_rel || row.to_rel);
+  mapped.node_paths = nodePathList.slice(0, 24);
+  mapped.link_paths = linkPathList
+    .slice(0, 24)
+    .map((row) => `${row.from_rel || '?'} -> ${row.to_rel || '?'}`);
+  const sceneNodes = Array.isArray(scene.nodes) ? scene.nodes : [];
+  for (const node of sceneNodes) {
+    const nodeId = String(node && node.id || '');
+    const nodeRel = normalizeRelPathText(node && node.rel);
+    if (!nodeId || !nodeRel) continue;
+    if (nodePathList.some((rel) => relPathsOverlap(nodeRel, rel))) {
+      mapped.node_ids.add(nodeId);
+    }
+  }
+  const sceneLinks = Array.isArray(scene.links) ? scene.links : [];
+  const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
+    ? scene.node_by_id
+    : Object.create(null);
+  for (const link of sceneLinks) {
+    if (!link) continue;
+    const linkId = String(link.id || '');
+    const fromId = String(link.from_id || '');
+    const toId = String(link.to_id || '');
+    const fromNode = nodeById[fromId];
+    const toNode = nodeById[toId];
+    const fromRel = normalizeRelPathText(fromNode && fromNode.rel);
+    const toRel = normalizeRelPathText(toNode && toNode.rel);
+    const kind = String(link.kind || '').toLowerCase();
+    let matched = false;
+    for (const row of linkPathList) {
+      const kindMatch = !row.kind || row.kind === kind;
+      const fromMatch = !row.from_rel || relPathsOverlap(fromRel, row.from_rel);
+      const toMatch = !row.to_rel || relPathsOverlap(toRel, row.to_rel);
+      if (kindMatch && fromMatch && toMatch) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched && (mapped.node_ids.has(fromId) || mapped.node_ids.has(toId))) {
+      matched = true;
+    }
+    if (matched && linkId) {
+      mapped.link_ids.add(linkId);
+      mapped.node_ids.add(fromId);
+      mapped.node_ids.add(toId);
+    }
+  }
+  return mapped;
+}
+
+function applyCodegraphMatches(scene = state.scene) {
+  const cg = codegraphState();
+  const payload = cg.last_result && typeof cg.last_result === 'object'
+    ? cg.last_result
+    : null;
+  if (!payload || !scene) {
+    cg.matched_node_ids = new Set();
+    cg.matched_link_ids = new Set();
+    cg.matched_node_paths = [];
+    cg.matched_link_paths = [];
+    return;
+  }
+  const mapped = mapCodegraphMatchesToScene(scene, payload);
+  cg.matched_node_ids = mapped.node_ids;
+  cg.matched_link_ids = mapped.link_ids;
+  cg.matched_node_paths = mapped.node_paths;
+  cg.matched_link_paths = mapped.link_paths;
+}
+
+function renderCodegraphStatus() {
+  const cg = codegraphState();
+  const el = byId('queryStatus');
+  if (!el) return;
+  if (cg.running) {
+    el.textContent = 'CodeGraph: querying...';
+    return;
+  }
+  if (cg.error) {
+    el.textContent = `CodeGraph: ${cg.error}`;
+    return;
+  }
+  if (cg.notice) {
+    el.textContent = `CodeGraph: ${cg.notice}`;
+    return;
+  }
+  if (cg.query) {
+    const nodeCount = cg.matched_node_ids instanceof Set ? cg.matched_node_ids.size : 0;
+    const linkCount = cg.matched_link_ids instanceof Set ? cg.matched_link_ids.size : 0;
+    const mode = String(cg.mode || 'search');
+    el.textContent = `CodeGraph: ${mode} | nodes ${nodeCount} | links ${linkCount}`;
+    return;
+  }
+  el.textContent = 'CodeGraph: idle';
+}
+
+async function runCodegraphQuery(options = {}) {
+  const cg = codegraphState();
+  const inputEl = byId('queryInput');
+  const rawQuery = options && options.query != null
+    ? String(options.query)
+    : String(inputEl && inputEl.value || '');
+  const query = rawQuery.trim();
+  if (!query) {
+    cg.error = 'query_required';
+    cg.notice = '';
+    cg.last_result = null;
+    cg.query = '';
+    cg.mode = '';
+    cg.matched_node_ids = new Set();
+    cg.matched_link_ids = new Set();
+    cg.matched_node_paths = [];
+    cg.matched_link_paths = [];
+    syncParticlePool(true);
+    renderCodegraphStatus();
+    renderStats();
+    return;
+  }
+  cg.running = true;
+  cg.error = '';
+  cg.notice = '';
+  renderCodegraphStatus();
+  renderStats();
+  try {
+    const payload = await fetchCodegraphQuery(query, {
+      mode: String(options.mode || '').trim(),
+      limit: CODEGRAPH_QUERY_LIMIT,
+      reindex: options.reindex === true
+    });
+    if (!payload || payload.ok !== true) {
+      throw new Error(String(payload && payload.error || 'codegraph_query_failed'));
+    }
+    cg.query = query;
+    cg.mode = String(payload.mode || 'search');
+    cg.last_result = payload;
+    cg.error = '';
+    cg.notice = '';
+    cg.running = false;
+    if (inputEl) inputEl.value = query;
+    applyCodegraphMatches(state.scene);
+    syncParticlePool(true);
+    renderCodegraphStatus();
+    renderStats();
+  } catch (err) {
+    cg.running = false;
+    cg.error = String(err && err.message || err || 'codegraph_query_failed');
+    cg.notice = '';
+    renderCodegraphStatus();
+    renderStats();
+  }
+}
+
+async function reindexCodegraph() {
+  const cg = codegraphState();
+  cg.running = true;
+  cg.error = '';
+  cg.notice = '';
+  renderCodegraphStatus();
+  renderStats();
+  try {
+    const payload = await fetchCodegraphReindex();
+    const summary = payload && payload.summary && typeof payload.summary === 'object'
+      ? payload.summary
+      : {};
+    const files = Math.max(0, Number(summary.files_scanned || 0));
+    const nodes = Math.max(0, Number(summary.node_count || 0));
+    const edges = Math.max(0, Number(summary.edge_count || 0));
+    cg.notice = `reindexed ${files} files (${nodes} nodes, ${edges} links)`;
+    cg.running = false;
+    renderCodegraphStatus();
+    if (cg.query) {
+      await runCodegraphQuery({ query: cg.query, mode: cg.mode || '', reindex: true });
+      return;
+    }
+    renderStats();
+  } catch (err) {
+    cg.running = false;
+    cg.error = String(err && err.message || err || 'codegraph_reindex_failed');
+    cg.notice = '';
+    renderCodegraphStatus();
+    renderStats();
+  }
 }
 
 function parseJsonSafe(raw) {
@@ -2439,10 +2761,26 @@ function packetRadiusForLink(link, range) {
 
 function visibleLinksForScene(scene) {
   if (!scene) return [];
-  const linksAll = Array.isArray(scene.links) ? scene.links : [];
+  let linksAll = Array.isArray(scene.links) ? scene.links : [];
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
-  if (!focusLinks) return linksAll;
-  return linksAll.filter((link) => focusLinks.has(link.id));
+  if (focusLinks) {
+    linksAll = linksAll.filter((link) => focusLinks.has(link.id));
+  }
+  if (!codegraphHasMatches()) return linksAll;
+  const cg = codegraphState();
+  const linkSet = cg.matched_link_ids instanceof Set ? cg.matched_link_ids : null;
+  const nodeSet = cg.matched_node_ids instanceof Set ? cg.matched_node_ids : null;
+  if ((!linkSet || linkSet.size <= 0) && (!nodeSet || nodeSet.size <= 0)) return linksAll;
+  return linksAll.filter((link) => {
+    const lid = String(link && link.id || '');
+    if (linkSet && linkSet.size > 0 && lid && linkSet.has(lid)) return true;
+    if (nodeSet && nodeSet.size > 0) {
+      const fromId = String(link && link.from_id || '');
+      const toId = String(link && link.to_id || '');
+      if (nodeSet.has(fromId) || nodeSet.has(toId)) return true;
+    }
+    return false;
+  });
 }
 
 function particleSignature(scene) {
@@ -2683,10 +3021,12 @@ function setPayload(payload) {
   registerResolvedFlashes(prevScene, nextScene, performance.now());
   state.scene = nextScene;
   if (state.scene) primeShellIntro(state.scene, performance.now());
+  applyCodegraphMatches(state.scene);
   clampCameraPanInPlace();
   applySelectionFocus(false);
   syncParticlePool(false);
   renderSelectionTag();
+  renderCodegraphStatus();
   renderStats();
 }
 
@@ -2746,6 +3086,8 @@ function drawLayerRing(layerNode, ts) {
   const isSelected = selectedId
     && selectedId === String(layerNode.id || '')
     && (!selectedType || selectedType === 'layer');
+  const queryMatch = isCodegraphNodeMatched(String(layerNode.id || ''));
+  const queryAlphaScale = codegraphNodeAlphaScale(String(layerNode.id || ''));
   const introScale = clamp(Number(layerNode.intro_scale == null ? 1 : layerNode.intro_scale), 0, 1);
   const baseRadius = Number(layerNode.render_radius || layerNode.radius || 0);
   if (baseRadius <= 0.5) return;
@@ -2753,8 +3095,8 @@ function drawLayerRing(layerNode, ts) {
   const jitter = Math.sin(ts * 0.00035 + layerNode.radius * 0.02) * 1.5 * introScale;
   const radius = Math.max(0.2, baseRadius + jitter);
   const alphaScale = 0.25 + (introScale * 0.75);
-  const primaryAlpha = (0.2 + (layerNode.activity * 0.22)) * alphaScale;
-  const secondaryAlpha = 0.11;
+  const primaryAlpha = (0.2 + (layerNode.activity * 0.22)) * alphaScale * queryAlphaScale;
+  const secondaryAlpha = 0.11 * queryAlphaScale;
   const resolvedAlpha = resolvedFlashAlpha('node', String(layerNode && layerNode.id || ''), ts);
   const integrityPrimary = `rgba(255,82,82,${clamp(0.28 + (primaryAlpha * 0.92), 0.2, 0.92)})`;
   const integritySecondary = `rgba(255,112,112,${clamp(0.2 + (secondaryAlpha * 1.25), 0.16, 0.84)})`;
@@ -2764,6 +3106,8 @@ function drawLayerRing(layerNode, ts) {
     ? resolvedPrimary
     : (isSelected
       ? softHighlightColor(Math.min(0.92, primaryAlpha + 0.11))
+      : queryMatch
+        ? colorFromActivityBright(layerNode.activity, Math.min(0.88, primaryAlpha + 0.3), 0.28)
       : integrityAlert
         ? integrityPrimary
       : colorFromActivity(layerNode.activity, primaryAlpha));
@@ -2777,6 +3121,8 @@ function drawLayerRing(layerNode, ts) {
     ? resolvedSecondary
     : (isSelected
       ? softHighlightColor(Math.min(0.8, secondaryAlpha + 0.22))
+      : queryMatch
+        ? colorFromActivityBright(layerNode.activity, Math.min(0.7, secondaryAlpha + 0.34), 0.26)
       : integrityAlert
         ? integritySecondary
       : colorFromActivity(layerNode.activity, secondaryAlpha));
@@ -2799,6 +3145,8 @@ function drawSpineHub(scene, ts) {
   const spineSelected = selectedId
     && selectedId === SPINE_NODE_ID
     && (!selectedType || selectedType === 'spine');
+  const queryMatch = isCodegraphNodeMatched(SPINE_NODE_ID);
+  const queryAlphaScale = codegraphNodeAlphaScale(SPINE_NODE_ID);
   const pulse = 1 + (Math.sin(ts * 0.00125) * 0.08);
   const drift = clamp(Number(scene.metrics && scene.metrics.drift_proxy || 0), 0, 1);
   const integrityAlert = scene && (
@@ -2808,10 +3156,10 @@ function drawSpineHub(scene, ts) {
   const base = 13 * pulse;
   const normalPrimary = spineSelected
     ? `rgba(${brightenChannel(110, 0.2)},${brightenChannel(203, 0.2)},${brightenChannel(255, 0.2)},0.86)`
-    : 'rgba(110, 203, 255, 0.72)';
+    : `rgba(110, 203, 255, ${0.72 * queryAlphaScale})`;
   const normalSecondary = spineSelected
     ? `rgba(${brightenChannel(110, 0.22)},${brightenChannel(203, 0.22)},${brightenChannel(255, 0.22)},0.5)`
-    : 'rgba(110, 203, 255, 0.34)';
+    : `rgba(110, 203, 255, ${0.34 * queryAlphaScale})`;
   const alertPrimary = spineSelected ? 'rgba(255,236,236,0.9)' : 'rgba(255,86,86,0.86)';
   const alertSecondary = spineSelected ? 'rgba(255,226,226,0.58)' : 'rgba(255,104,104,0.46)';
   const resolvedAlpha = resolvedFlashAlpha('node', SPINE_NODE_ID, ts);
@@ -2819,14 +3167,18 @@ function drawSpineHub(scene, ts) {
   const resolvedSecondary = `rgba(156,255,190,${clamp(0.24 + (resolvedAlpha * 0.44), 0.12, 0.88)})`;
   ctx.strokeStyle = resolvedAlpha > 0
     ? resolvedPrimary
-    : (integrityAlert ? alertPrimary : normalPrimary);
+    : (queryMatch
+      ? `rgba(222,242,255,${clamp(0.7 * queryAlphaScale, 0.2, 0.92)})`
+      : (integrityAlert ? alertPrimary : normalPrimary));
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(c.x, c.y, base, 0, Math.PI * 2);
   ctx.stroke();
   ctx.strokeStyle = resolvedAlpha > 0
     ? resolvedSecondary
-    : (integrityAlert ? alertSecondary : normalSecondary);
+    : (queryMatch
+      ? `rgba(205,236,252,${clamp(0.52 * queryAlphaScale, 0.16, 0.8)})`
+      : (integrityAlert ? alertSecondary : normalSecondary));
   ctx.beginPath();
   ctx.arc(c.x, c.y, base + 7, 0, Math.PI * 2);
   ctx.stroke();
@@ -2968,6 +3320,8 @@ function drawModuleNode(node, ts) {
   const isSelected = selectedId
     && selectedId === String(node.id || '')
     && (!selectedType || selectedType === 'module');
+  const queryMatch = isCodegraphNodeMatched(String(node.id || ''));
+  const queryAlphaScale = codegraphNodeAlphaScale(String(node.id || ''));
   const introScale = nodeIntroScale(node);
   if (introScale <= 0.02) return;
   const errorActive = Boolean(node && node.error_state_active === true);
@@ -2977,11 +3331,13 @@ function drawModuleNode(node, ts) {
   const r = node.radius * pulse;
   const spinOffset = Number(node.fractal_count || 0) > 0 ? Number(node.spin_angle || 0) * 0.42 : 0;
   ctx.save();
-  ctx.globalAlpha *= (0.2 + (introScale * 0.8));
+  ctx.globalAlpha *= (0.2 + (introScale * 0.8)) * queryAlphaScale;
   ctx.strokeStyle = resolvedAlpha > 0
     ? `rgba(122,255,166,${clamp(0.34 + (resolvedAlpha * 0.56), 0.18, 0.96)})`
     : (isSelected
       ? softHighlightColor(0.9)
+      : queryMatch
+        ? colorFromActivityBright(node.activity, 0.9, 0.3)
       : (errorActive ? 'rgba(255,96,96,0.92)' : colorFromActivity(node.activity, 0.65)));
   ctx.lineWidth = 1.2;
   ctx.beginPath();
@@ -2992,6 +3348,8 @@ function drawModuleNode(node, ts) {
     ? `rgba(132,255,176,${clamp(0.18 + (resolvedAlpha * 0.24), 0.12, 0.52)})`
     : (isSelected
       ? softHighlightColor(Math.min(0.34, 0.2 + (glow * 0.16)))
+      : queryMatch
+        ? colorFromActivityBright(node.activity, Math.min(0.4, (glow * 0.24) + 0.12), 0.26)
       : (errorActive ? 'rgba(255,88,88,0.22)' : colorFromActivity(node.activity, glow * 0.2)));
   ctx.beginPath();
   ctx.arc(node.x, node.y, r * 0.72, 0, Math.PI * 2);
@@ -3001,6 +3359,8 @@ function drawModuleNode(node, ts) {
     ? `rgba(154,255,188,${clamp(0.24 + (resolvedAlpha * 0.44), 0.14, 0.84)})`
     : (isSelected
       ? softHighlightColor(0.74)
+      : queryMatch
+        ? colorFromActivityBright(node.activity, 0.74, 0.26)
       : (errorActive ? 'rgba(255,132,132,0.74)' : colorFromActivity(node.activity, 0.36)));
   ctx.lineWidth = 1;
   for (let i = 0; i < 3; i += 1) {
@@ -3021,6 +3381,8 @@ function drawSubmoduleNode(node) {
   const isSelected = selectedId
     && selectedId === String(node.id || '')
     && (!selectedType || selectedType === 'submodule');
+  const queryMatch = isCodegraphNodeMatched(String(node.id || ''));
+  const queryAlphaScale = codegraphNodeAlphaScale(String(node.id || ''));
   const subfractalChildren = subfractalChildrenForNode(node);
   const hasSubfractals = subfractalChildren.length > 0;
   const selectedSubfractal = isSelected
@@ -3033,19 +3395,21 @@ function drawSubmoduleNode(node) {
   const introScale = nodeIntroScale(node);
   if (introScale <= 0.02) return;
   ctx.save();
-  ctx.globalAlpha *= (0.18 + (introScale * 0.82));
+  ctx.globalAlpha *= (0.18 + (introScale * 0.82)) * queryAlphaScale;
   if (state.quality_tier === 'low' && !(isSelected && hasSubfractals)) {
     const s = Math.max(1.4, node.radius * 1.45);
     ctx.fillStyle = resolvedAlpha > 0
       ? `rgba(124,255,170,${clamp(0.54 + (resolvedAlpha * 0.34), 0.24, 0.96)})`
       : (errorActive
         ? 'rgba(255,72,72,0.92)'
+        : queryMatch
+          ? colorFromActivityBright(node.activity, 0.88, 0.26)
         : colorFromActivity(node.activity, 0.82));
     ctx.fillRect(node.x - s, node.y - s, s * 2, s * 2);
     if (resolvedAlpha > 0 || isSelected || errorActive) {
       ctx.strokeStyle = resolvedAlpha > 0
         ? `rgba(168,255,198,${clamp(0.36 + (resolvedAlpha * 0.54), 0.2, 0.94)})`
-        : softHighlightColor(0.88);
+        : (queryMatch ? colorFromActivityBright(node.activity, 0.88, 0.28) : softHighlightColor(0.88));
       ctx.lineWidth = 1;
       ctx.strokeRect(node.x - s, node.y - s, s * 2, s * 2);
     }
@@ -3062,11 +3426,15 @@ function drawSubmoduleNode(node) {
     ? `rgba(132,255,176,${clamp(0.18 + (resolvedAlpha * 0.24), 0.1, 0.52)})`
     : (errorActive
       ? `rgba(255,68,68,${0.18 + (node.activity * 0.24)})`
+      : queryMatch
+        ? colorFromActivityBright(node.activity, 0.26 + (node.activity * 0.18), 0.24)
       : colorFromActivity(node.activity, 0.16 + (node.activity * 0.22)));
   ctx.strokeStyle = resolvedAlpha > 0
     ? `rgba(122,255,166,${clamp(0.36 + (resolvedAlpha * 0.56), 0.18, 0.96)})`
     : (isSelected
       ? softHighlightColor(0.9)
+      : queryMatch
+        ? colorFromActivityBright(node.activity, 0.92, 0.28)
       : (errorActive ? 'rgba(255,102,102,0.95)' : colorFromActivity(node.activity, 0.68)));
   ctx.lineWidth = (isSelected && hasSubfractals) ? 0.72 : 1;
   ctx.beginPath();
@@ -3109,6 +3477,8 @@ function drawSubmoduleNode(node) {
       ? `rgba(154,255,188,${clamp(0.24 + (resolvedAlpha * 0.44), 0.14, 0.86)})`
       : (isSelected
         ? softHighlightColor(0.7)
+        : queryMatch
+          ? colorFromActivityBright(node.activity, 0.72, 0.24)
         : (errorActive ? 'rgba(255,122,122,0.85)' : colorFromActivity(node.activity, 0.4)));
     ctx.lineWidth = 0.8;
     for (let i = 1; i <= 2; i += 1) {
@@ -3130,7 +3500,10 @@ function drawIoNode(node, ts) {
   const ctx = state.ctx;
   const spin = ts * 0.0014;
   const size = node.radius + (Math.sin(spin + node.angle * 2) * 1.2);
+  const queryAlphaScale = codegraphNodeAlphaScale(String(node && node.id || ''));
+  if (queryAlphaScale <= 0.02) return;
   ctx.save();
+  ctx.globalAlpha *= queryAlphaScale;
   ctx.translate(node.x, node.y);
   ctx.rotate(spin + node.angle);
   ctx.strokeStyle = node.type === 'io_input'
@@ -3152,23 +3525,29 @@ function drawLinks(scene) {
   const profile = state.quality_profile;
   const nowTs = performance.now();
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
+  const hasCodegraph = codegraphHasMatches();
   const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
     ? scene.node_by_id
     : Object.create(null);
   for (const link of scene.links) {
     if (focusLinks && !focusLinks.has(link.id)) continue;
+    const codegraphScale = codegraphLinkAlphaScale(link);
+    if (hasCodegraph && codegraphScale <= 0.001) continue;
+    const codegraphMatch = codegraphScale >= 0.999;
     const fromNode = nodeById[String(link.from_id || '')];
     const toNode = nodeById[String(link.to_id || '')];
     const introScale = Math.min(nodeIntroScale(fromNode), nodeIntroScale(toNode));
     if (introScale <= 0.02) continue;
     const kind = String(link.kind || '').toLowerCase();
     if (kind === 'fractal') {
-      const alpha = clamp((0.2 + (Number(link.activity || 0) * 0.35)) * (0.2 + introScale * 0.8), 0.12, 0.8);
+      const alpha = clamp((0.2 + (Number(link.activity || 0) * 0.35)) * (0.2 + introScale * 0.8) * codegraphScale, 0.06, 0.8);
       const resolvedAlpha = resolvedFlashAlpha('link', String(link && link.id || ''), nowTs);
       ctx.shadowBlur = 0;
       ctx.strokeStyle = resolvedAlpha > 0
         ? `rgba(136,255,180,${clamp(alpha + (resolvedAlpha * 0.35), 0.14, 0.96)})`
-        : `rgba(196,232,255,${alpha})`;
+        : (codegraphMatch
+          ? `rgba(230,242,252,${clamp(alpha + 0.26, 0.14, 0.96)})`
+          : `rgba(196,232,255,${alpha})`);
       ctx.lineWidth = (0.7 + (Number(link.activity || 0) * 0.95)) * (0.35 + (introScale * 0.65));
       ctx.beginPath();
       ctx.moveTo(link.p0.x, link.p0.y);
@@ -3181,14 +3560,16 @@ function drawLinks(scene) {
     const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
     const blockedActive = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
     const resolvedAlpha = resolvedFlashAlpha('link', String(link && link.id || ''), nowTs);
-    const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78));
+    const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78)) * codegraphScale;
     const baseLineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
     if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
       if (errActive || blockedActive) {
-        ctx.shadowColor = `rgba(255,78,78,${0.24 + (errW * 0.4)})`;
+        ctx.shadowColor = `rgba(255,78,78,${(0.24 + (errW * 0.4)) * codegraphScale})`;
         ctx.shadowBlur = (8 + (errW * 22)) * (0.2 + (introScale * 0.8));
       } else {
-        ctx.shadowColor = colorFromActivity(link.activity, 0.26);
+        ctx.shadowColor = codegraphMatch
+          ? `rgba(218,241,255,${clamp(0.34 * codegraphScale, 0.08, 0.64)})`
+          : colorFromActivity(link.activity, 0.26 * codegraphScale);
         ctx.shadowBlur = (8 + (link.activity * 16)) * (0.2 + (introScale * 0.8));
       }
     } else {
@@ -3197,6 +3578,9 @@ function drawLinks(scene) {
     if (resolvedAlpha > 0) {
       ctx.strokeStyle = `rgba(128,255,174,${clamp(0.2 + alpha + (resolvedAlpha * 0.42), 0.12, 0.98)})`;
       ctx.lineWidth = baseLineWidth;
+    } else if (codegraphMatch) {
+      ctx.strokeStyle = `rgba(232,246,255,${clamp(0.2 + alpha + 0.28, 0.1, 0.98)})`;
+      ctx.lineWidth = baseLineWidth * 1.1;
     } else if (errActive) {
       ctx.strokeStyle = `rgba(255,72,72,${clamp(0.14 + alpha + (errW * 0.55), 0.08, 0.96)})`;
       ctx.lineWidth = baseLineWidth;
@@ -3210,7 +3594,7 @@ function drawLinks(scene) {
     ctx.stroke();
 
     if (blockedActive) {
-      const blockedAlpha = clamp((0.24 + (blockedRatio * 0.64)) * (0.22 + (introScale * 0.78)), 0.12, 0.92);
+      const blockedAlpha = clamp((0.24 + (blockedRatio * 0.64)) * (0.22 + (introScale * 0.78)) * codegraphScale, 0.08, 0.92);
       ctx.save();
       ctx.setLineDash([4.5 + (blockedRatio * 6.5), 4.5]);
       ctx.lineDashOffset = -(nowTs * (0.013 + (blockedRatio * 0.018)));
@@ -3224,7 +3608,7 @@ function drawLinks(scene) {
 
       const mid = bezierPoint(link, 0.52);
       const markerR = 2.1 + (blockedRatio * 3.1);
-      ctx.strokeStyle = `rgba(255,108,108,${clamp(0.45 + (blockedRatio * 0.4), 0.45, 0.92)})`;
+      ctx.strokeStyle = `rgba(255,108,108,${clamp((0.45 + (blockedRatio * 0.4)) * Math.max(0.4, codegraphScale), 0.2, 0.92)})`;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.arc(mid.x, mid.y, markerR, 0, Math.PI * 2);
@@ -3263,15 +3647,15 @@ function drawParticles(dt) {
   const nowTs = performance.now();
   const burstBoost = nowTs < state.spine_burst_until ? 1.45 : 1;
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
+  const visibleLinks = visibleLinksForScene(scene);
+  const visibleLinkIds = new Set(visibleLinks.map((link) => String(link && link.id || '')).filter(Boolean));
   const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
     ? scene.node_by_id
     : Object.create(null);
 
   const linkById = {};
   for (const link of scene.links) linkById[link.id] = link;
-  const linksForSizing = focusLinks
-    ? scene.links.filter((link) => focusLinks.has(String(link && link.id || '')))
-    : scene.links;
+  const linksForSizing = visibleLinks;
   const packetRange = packetMetricRange(linksForSizing);
   const forceMinPacketSize = isModuleDepthPacketView(scene);
 
@@ -3291,6 +3675,10 @@ function drawParticles(dt) {
       continue;
     }
     if (focusLinks && !focusLinks.has(link.id)) {
+      p.trail.length = 0;
+      continue;
+    }
+    if (!visibleLinkIds.has(String(link.id || ''))) {
       p.trail.length = 0;
       continue;
     }
@@ -3334,6 +3722,7 @@ function drawParticles(dt) {
     const introScale = clamp(Number(linkIntroScaleById[link.id]), 0, 1);
     if (introScale <= 0.03) continue;
     if (focusLinks && !focusLinks.has(link.id)) continue;
+    if (!visibleLinkIds.has(String(link.id || ''))) continue;
     if (trailLength <= 0 || p.trail.length < 2) continue;
     const failProgress = clamp(Number(p.fail_progress || 0), 0, 1);
     const failActive = p.fail_active === true && failProgress > 0;
@@ -3367,6 +3756,7 @@ function drawParticles(dt) {
     const introScale = clamp(Number(linkIntroScaleById[link.id]), 0, 1);
     if (introScale <= 0.03) continue;
     if (focusLinks && !focusLinks.has(link.id)) continue;
+    if (!visibleLinkIds.has(String(link.id || ''))) continue;
     const pt = bezierPoint(link, p.t);
     const failProgress = clamp(Number(p.fail_progress || 0), 0, 1);
     const failActive = p.fail_active === true && failProgress > 0;
@@ -3746,6 +4136,14 @@ function renderStats() {
   if (previewTabBtn) previewTabBtn.classList.toggle('active', !showingCode);
   if (codeTabBtn) codeTabBtn.classList.toggle('active', showingCode);
   let rows = [];
+  const cg = codegraphState();
+  const cgResult = cg.last_result && typeof cg.last_result === 'object'
+    ? cg.last_result
+    : null;
+  const cgMatchedNodes = cg.matched_node_ids instanceof Set ? cg.matched_node_ids.size : 0;
+  const cgMatchedLinks = cg.matched_link_ids instanceof Set ? cg.matched_link_ids.size : 0;
+  const cgTopNodePaths = Array.isArray(cg.matched_node_paths) ? cg.matched_node_paths.slice(0, 2) : [];
+  const cgTopLinkPaths = Array.isArray(cg.matched_link_paths) ? cg.matched_link_paths.slice(0, 2) : [];
   const selectedIntegrityRows = integrityRowsForSelection(integrityIncident, selectedType, selectedNode);
   const selectedNodeErrorRows = nodeErrorRowsForSelection(selectedNode, selectedIntegrityRows, errorSignal);
   const sceneChange = scene && scene.change_summary && typeof scene.change_summary === 'object'
@@ -4073,6 +4471,25 @@ function renderStats() {
       ...bottleneckRows
     ];
   }
+  const cgRows = [];
+  if (cg.running) {
+    cgRows.push(['CodeGraph', 'Query running...']);
+  } else if (cg.error) {
+    cgRows.push(['CodeGraph Error', String(cg.error || 'query_failed')]);
+  } else if (cg.query) {
+    const modeLabel = String(cg.mode || 'search');
+    const explanation = String(cgResult && cgResult.matches && cgResult.matches.explanation || '').trim();
+    cgRows.push(['CodeGraph Query', `${String(cg.query)} (${modeLabel})`]);
+    cgRows.push(['CodeGraph Hits', `nodes ${fmtNum(cgMatchedNodes)} | links ${fmtNum(cgMatchedLinks)}`]);
+    if (cgTopNodePaths.length) cgRows.push(['CodeGraph Paths', cgTopNodePaths.join(' | ')]);
+    if (cgTopLinkPaths.length) cgRows.push(['CodeGraph Flows', cgTopLinkPaths.join(' | ')]);
+    if (explanation) cgRows.push(['CodeGraph Mode', explanation]);
+  }
+  if (cg.notice && !cg.running && !cg.error) {
+    cgRows.push(['CodeGraph Status', String(cg.notice)]);
+  }
+  if (cgRows.length) rows = [...cgRows, ...rows];
+
   const integrityLabel = integrityIncident.active
     ? `${String(integrityIncident.severity || 'critical').toUpperCase()} (${fmtNum(integrityIncident.violation_total)} mismatches)`
     : 'OK';
@@ -4138,10 +4555,14 @@ function renderStats() {
     ? ` | spine ${fmtNum(state.spine_event_count)} evt (${state.spine_event_top})`
     : ` | spine ${fmtNum(state.spine_event_count)} evt`;
   const linkPreviewSuffix = selectedLink ? ` | preview: ${String(selectedLink.from_id || '?')} -> ${String(selectedLink.to_id || '?')}` : '';
+  const querySuffix = cg.query
+    ? ` | query ${String(cg.mode || 'search')} n${fmtNum(cgMatchedNodes)} l${fmtNum(cgMatchedLinks)}`
+    : '';
   const integritySuffix = integrityIncident.active
     ? ` | integrity ${String(integrityIncident.severity || 'critical')} ${fmtNum(integrityIncident.violation_total)}`
     : ' | integrity ok';
-  byId('metaLine').textContent = `Updated ${new Date(payload.generated_at || Date.now()).toLocaleString()} | ${state.transport} | zoom ${fmtNum(state.camera.zoom)}x | fallback ${Math.round(state.refresh_ms / 1000)}s${pulseSuffix}${linkPreviewSuffix}${integritySuffix}`;
+  byId('metaLine').textContent = `Updated ${new Date(payload.generated_at || Date.now()).toLocaleString()} | ${state.transport} | zoom ${fmtNum(state.camera.zoom)}x | fallback ${Math.round(state.refresh_ms / 1000)}s${pulseSuffix}${linkPreviewSuffix}${querySuffix}${integritySuffix}`;
+  renderCodegraphStatus();
   renderIncidentBanner();
 }
 
@@ -5849,6 +6270,7 @@ function boot() {
   setQualityTier(state.gpu.tier);
   resizeCanvas();
   renderSelectionTag();
+  renderCodegraphStatus();
   const tabPreviewBtn = byId('tabPreview');
   const tabCodeBtn = byId('tabCode');
   if (tabPreviewBtn) {
@@ -5856,6 +6278,23 @@ function boot() {
   }
   if (tabCodeBtn) {
     tabCodeBtn.addEventListener('click', () => setPreviewTab('code'));
+  }
+
+  const queryInputEl = byId('queryInput');
+  const queryRunEl = byId('queryRun');
+  const queryReindexEl = byId('queryReindex');
+  if (queryInputEl) {
+    queryInputEl.addEventListener('keydown', (evt) => {
+      if (evt.key !== 'Enter') return;
+      evt.preventDefault();
+      runCodegraphQuery();
+    });
+  }
+  if (queryRunEl) {
+    queryRunEl.addEventListener('click', () => runCodegraphQuery());
+  }
+  if (queryReindexEl) {
+    queryReindexEl.addEventListener('click', () => reindexCodegraph());
   }
 
   byId('refresh').addEventListener('click', requestRefresh);
@@ -5877,8 +6316,10 @@ function boot() {
     clampCameraPanInPlace();
     state.scene = buildScene(state.payload);
     clampCameraPanInPlace();
+    applyCodegraphMatches(state.scene);
     applySelectionFocus(false);
     syncParticlePool(true);
+    renderCodegraphStatus();
   });
   window.addEventListener('beforeunload', () => {
     if (state.ws_retry_timer) clearTimeout(state.ws_retry_timer);
