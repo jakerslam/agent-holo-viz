@@ -30,6 +30,10 @@ const CONTINUUM_RUNS_DIR = path.join(CONTINUUM_DIR, 'runs');
 const CONTINUUM_EVENTS_DIR = path.join(CONTINUUM_DIR, 'events');
 const CONTINUUM_LATEST_PATH = path.join(CONTINUUM_DIR, 'latest.json');
 const CONTINUUM_HISTORY_PATH = path.join(CONTINUUM_DIR, 'history.jsonl');
+const AUTOTEST_DIR = path.join(REPO_ROOT, 'state', 'ops', 'autotest');
+const AUTOTEST_LATEST_PATH = path.join(AUTOTEST_DIR, 'latest.json');
+const AUTOTEST_STATUS_PATH = path.join(AUTOTEST_DIR, 'status.json');
+const AUTOTEST_EVENTS_PATH = path.join(AUTOTEST_DIR, 'events.jsonl');
 const FRACTAL_ORGANISM_DIR = path.join(FRACTAL_DIR, 'organism_cycle');
 const FRACTAL_INTROSPECTION_DIR = path.join(FRACTAL_DIR, 'introspection');
 const FRACTAL_PHEROMONE_DIR = path.join(FRACTAL_DIR, 'pheromones');
@@ -679,6 +683,7 @@ function loadContinuumSnapshot() {
     self_improvement: 0,
     creative_incubation: 0,
     security_vigilance: 0,
+    autotest_validation: 0,
     consolidation: 0
   };
   let events24h = 0;
@@ -705,6 +710,29 @@ function loadContinuumSnapshot() {
     if (tsMs != null && tsMs < cutoffMs) break;
     queueRows24h += Number(row && row.training_queue_rows || 0);
   }
+
+  const autotestLatest = safeJsonRead(AUTOTEST_LATEST_PATH, null);
+  const autotestLatestPayload = autotestLatest && typeof autotestLatest === 'object' ? autotestLatest : {};
+  const autotestStatus = safeJsonRead(AUTOTEST_STATUS_PATH, null);
+  const autotestStatusPayload = autotestStatus && typeof autotestStatus === 'object' ? autotestStatus : {};
+  const autotestRun = autotestLatestPayload.run && typeof autotestLatestPayload.run === 'object'
+    ? autotestLatestPayload.run
+    : autotestLatestPayload;
+  const autotestTs = String(autotestRun.ts || autotestLatestPayload.ts || autotestStatusPayload.last_run || '');
+  const autotestEvents = readJsonlRows(AUTOTEST_EVENTS_PATH);
+  let autotestAlerts24h = 0;
+  let autotestFailed24h = 0;
+  let autotestGuardBlocked24h = 0;
+  for (let i = autotestEvents.length - 1; i >= 0; i -= 1) {
+    const row = autotestEvents[i];
+    const tsMs = parseTsMs(row && row.ts);
+    if (tsMs != null && tsMs < cutoffMs) break;
+    if (String(row && row.type || '') !== 'autotest_alert') continue;
+    autotestAlerts24h += 1;
+    autotestFailed24h += Number(row && row.failed || 0);
+    autotestGuardBlocked24h += Number(row && row.guard_blocked || 0);
+  }
+
   const pulseAgeSec = latestTs
     ? Number(Math.max(0, (nowMs - Date.parse(latestTs)) / 1000).toFixed(2))
     : null;
@@ -742,6 +770,20 @@ function loadContinuumSnapshot() {
     red_team_cases_last: Number(securityAction.metrics && securityAction.metrics.executed_cases || 0),
     red_team_critical_last: Number(securityAction.metrics && securityAction.metrics.critical_fail_cases || 0),
     observer_mood_last: String(selfImproveAction.metrics && selfImproveAction.metrics.mood || ''),
+    autotest_available: fs.existsSync(AUTOTEST_LATEST_PATH) || fs.existsSync(AUTOTEST_STATUS_PATH),
+    autotest_last_run_ts: autotestTs || '',
+    autotest_last_scope: String(autotestRun.scope || ''),
+    autotest_selected_tests_last: Number(autotestRun.selected_tests || 0),
+    autotest_failed_last: Number(autotestRun.failed || 0),
+    autotest_guard_blocked_last: Number(autotestRun.guard_blocked || 0),
+    autotest_untested_modules_last: Number(autotestRun.untested_modules || 0),
+    autotest_modules_total: Number(autotestStatusPayload.modules_total || 0),
+    autotest_modules_changed: Number(autotestStatusPayload.modules_changed || 0),
+    autotest_tests_failed: Number(autotestStatusPayload.tests_failed || 0),
+    autotest_tests_total: Number(autotestStatusPayload.tests_total || 0),
+    autotest_alerts_24h: autotestAlerts24h,
+    autotest_failed_24h: autotestFailed24h,
+    autotest_guard_blocked_24h: autotestGuardBlocked24h,
     history_rows: historyRows.length
   };
 
@@ -2149,6 +2191,8 @@ function assignLayerActivity(layers, runs, summary, aliasToId) {
     bumpAlias('systems/autonomy', Math.max(0.4, continuumEvents * 0.02));
     bumpAlias('systems/workflow', Math.max(0.3, Number(continuum.anticipation_candidates_last || 0) * 0.07));
     bumpAlias('memory', Math.max(0.2, Number(continuum.events_24h_by_stage && continuum.events_24h_by_stage.dream_consolidation || 0) * 0.06));
+    bumpAlias('systems/ops', Math.max(0.2, Number(continuum.autotest_alerts_24h || 0) * 0.12));
+    bumpAlias('state/ops', Math.max(0.15, Number(continuum.autotest_modules_changed || 0) * 0.08));
   }
 
   let maxRaw = 0;
@@ -2491,6 +2535,13 @@ function buildHoloModel(runs, summary) {
       continuum_last_trit_label: String(continuum.last_trit_label || ''),
       continuum_last_skipped: continuum.last_skipped === true ? 1 : 0,
       continuum_pulse_age_sec: Number(continuum.pulse_age_sec || 0),
+      continuum_autotest_failed_last: Number(continuum.autotest_failed_last || 0),
+      continuum_autotest_guard_blocked_last: Number(continuum.autotest_guard_blocked_last || 0),
+      continuum_autotest_untested_modules_last: Number(continuum.autotest_untested_modules_last || 0),
+      continuum_autotest_modules_changed: Number(continuum.autotest_modules_changed || 0),
+      continuum_autotest_alerts_24h: Number(continuum.autotest_alerts_24h || 0),
+      continuum_autotest_failed_24h: Number(continuum.autotest_failed_24h || 0),
+      continuum_autotest_guard_blocked_24h: Number(continuum.autotest_guard_blocked_24h || 0),
       change_pending_push: pendingPush,
       change_just_pushed: justPushed,
       change_active_modules: Number(changeSummary.active_modules || 0),
@@ -2545,7 +2596,21 @@ function buildPayload(hours) {
     anticipation_candidates_last: Number(continuumSnapshot && continuumSnapshot.anticipation_candidates_last || 0),
     red_team_cases_last: Number(continuumSnapshot && continuumSnapshot.red_team_cases_last || 0),
     red_team_critical_last: Number(continuumSnapshot && continuumSnapshot.red_team_critical_last || 0),
-    observer_mood_last: String(continuumSnapshot && continuumSnapshot.observer_mood_last || '')
+    observer_mood_last: String(continuumSnapshot && continuumSnapshot.observer_mood_last || ''),
+    autotest_available: continuumSnapshot && continuumSnapshot.autotest_available === true,
+    autotest_last_run_ts: String(continuumSnapshot && continuumSnapshot.autotest_last_run_ts || ''),
+    autotest_last_scope: String(continuumSnapshot && continuumSnapshot.autotest_last_scope || ''),
+    autotest_selected_tests_last: Number(continuumSnapshot && continuumSnapshot.autotest_selected_tests_last || 0),
+    autotest_failed_last: Number(continuumSnapshot && continuumSnapshot.autotest_failed_last || 0),
+    autotest_guard_blocked_last: Number(continuumSnapshot && continuumSnapshot.autotest_guard_blocked_last || 0),
+    autotest_untested_modules_last: Number(continuumSnapshot && continuumSnapshot.autotest_untested_modules_last || 0),
+    autotest_modules_total: Number(continuumSnapshot && continuumSnapshot.autotest_modules_total || 0),
+    autotest_modules_changed: Number(continuumSnapshot && continuumSnapshot.autotest_modules_changed || 0),
+    autotest_tests_failed: Number(continuumSnapshot && continuumSnapshot.autotest_tests_failed || 0),
+    autotest_tests_total: Number(continuumSnapshot && continuumSnapshot.autotest_tests_total || 0),
+    autotest_alerts_24h: Number(continuumSnapshot && continuumSnapshot.autotest_alerts_24h || 0),
+    autotest_failed_24h: Number(continuumSnapshot && continuumSnapshot.autotest_failed_24h || 0),
+    autotest_guard_blocked_24h: Number(continuumSnapshot && continuumSnapshot.autotest_guard_blocked_24h || 0)
   };
   const summary = {
     ...baseSummary,
