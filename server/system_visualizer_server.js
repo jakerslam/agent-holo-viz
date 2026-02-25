@@ -646,6 +646,33 @@ function objectiveIdFromRun(evt) {
   return raw;
 }
 
+function proposalDependenciesFromRun(evt) {
+  const dep = evt && evt.proposal_dependencies && typeof evt.proposal_dependencies === 'object'
+    ? evt.proposal_dependencies
+    : null;
+  if (!dep) return null;
+  const parentObjectiveId = String(dep.parent_objective_id || '').trim();
+  const childObjectiveIds = Array.isArray(dep.child_objective_ids)
+    ? dep.child_objective_ids.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 24)
+    : [];
+  const chain = Array.isArray(dep.chain)
+    ? dep.chain.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 24)
+    : [];
+  const edges = Array.isArray(dep.edges)
+    ? dep.edges.map((row) => ({
+      from: String(row && row.from || '').trim(),
+      to: String(row && row.to || '').trim(),
+      relation: String(row && row.relation || 'depends_on').trim()
+    })).filter((row) => row.from && row.to)
+    : [];
+  return {
+    parent_objective_id: parentObjectiveId || null,
+    child_objective_ids: childObjectiveIds,
+    chain,
+    edges
+  };
+}
+
 function proposalTypeFromRun(evt) {
   const explicit = String(evt && evt.proposal_type || '').trim().toLowerCase();
   if (explicit) return explicit;
@@ -1579,6 +1606,8 @@ function buildGraph(runs, directives, strategy) {
     const evt = row && row.evt ? row.evt : {};
     const pType = proposalTypeFromRun(evt);
     const alignment = objectiveAlignmentScore(evt, directivesById);
+    const deps = proposalDependenciesFromRun(evt);
+    const depChildren = deps && Array.isArray(deps.child_objective_ids) ? deps.child_objective_ids.length : 0;
     addNode(nodeMap, {
       id: `proposal:${pid}`,
       label: pType === 'unknown' ? pid : `${pType}:${pid.slice(0, 8)}`,
@@ -1591,7 +1620,8 @@ function buildGraph(runs, directives, strategy) {
         alignment_score: Number(alignment.score || 0),
         alignment_band: String(alignment.band || 'gray'),
         objective_id: alignment.objective_id || null,
-        objective_tier: alignment.tier
+        objective_tier: alignment.tier,
+        dependency_children: depChildren
       }
     });
     addEdge(edgeMap, `strategy:${strategyId}`, `proposal:${pid}`, 'selects', 1);
@@ -1612,6 +1642,55 @@ function buildGraph(runs, directives, strategy) {
     const campaignIds = campaignTypeIndex[pType] ? Array.from(campaignTypeIndex[pType]) : [];
     for (const cid of campaignIds) {
       addEdge(edgeMap, `campaign:${cid}`, `proposal:${pid}`, 'contains_type', 1);
+    }
+
+    if (deps) {
+      const parentId = String(deps.parent_objective_id || '').trim();
+      if (parentId) {
+        objectiveSet.add(parentId);
+        addNode(nodeMap, {
+          id: `directive:${parentId}`,
+          label: parentId,
+          type: 'directive',
+          weight: 1,
+          meta: { tier: parentId.startsWith('T1_') ? 1 : null }
+        });
+        addEdge(edgeMap, `proposal:${pid}`, `directive:${parentId}`, 'decomposes_parent', 1);
+      }
+      for (const childId of deps.child_objective_ids || []) {
+        objectiveSet.add(childId);
+        addNode(nodeMap, {
+          id: `directive:${childId}`,
+          label: childId,
+          type: 'directive',
+          weight: 1,
+          meta: { tier: childId.startsWith('T1_') ? 1 : null }
+        });
+        addEdge(edgeMap, `proposal:${pid}`, `directive:${childId}`, 'decomposes_to', 1);
+        if (parentId) {
+          addEdge(edgeMap, `directive:${parentId}`, `directive:${childId}`, 'depends_on', 1);
+        }
+      }
+      for (const edge of deps.edges || []) {
+        const from = String(edge.from || '').trim();
+        const to = String(edge.to || '').trim();
+        if (!from || !to) continue;
+        addNode(nodeMap, {
+          id: `directive:${from}`,
+          label: from,
+          type: 'directive',
+          weight: 1,
+          meta: { tier: from.startsWith('T1_') ? 1 : null }
+        });
+        addNode(nodeMap, {
+          id: `directive:${to}`,
+          label: to,
+          type: 'directive',
+          weight: 1,
+          meta: { tier: to.startsWith('T1_') ? 1 : null }
+        });
+        addEdge(edgeMap, `directive:${from}`, `directive:${to}`, String(edge.relation || 'depends_on'), 1);
+      }
     }
   }
 
