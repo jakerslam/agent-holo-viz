@@ -1172,6 +1172,14 @@ function isPreviewWarningRow(key, value) {
     const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
     if (Number.isFinite(n) && n < 65) return true;
   }
+  if (k === 'fractal harmony') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n < 45) return true;
+  }
+  if (k === 'black-box rows') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n <= 0) return true;
+  }
   if (k === 'integrity' && (v.includes('warning') || v.includes('recent'))) return true;
   if (k === 'health' && v.includes('watch')) return true;
   if (k === 'flow status' && (v.includes('degraded') || v.includes('partial') || v.includes('blocked'))) return true;
@@ -1188,6 +1196,14 @@ function isPreviewGoodRow(key, value) {
   if (!k && !v) return false;
   if (k === 'constitution alignment' && (v.includes('green') || v.includes('aligned'))) return true;
   if (k === 'evolution trajectory' && v.includes('accelerating')) return true;
+  if (k === 'fractal harmony') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n >= 70) return true;
+  }
+  if (k === 'black-box rows') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n > 0) return true;
+  }
   if (k === 'integrity' && v === 'ok') return true;
   if (k === 'health' && v.includes('nominal')) return true;
   if (k === 'flow status' && v === 'clear') return true;
@@ -3658,6 +3674,9 @@ function renderStats() {
   const evolution = summary.evolution && typeof summary.evolution === 'object'
     ? summary.evolution
     : {};
+  const fractal = summary.fractal && typeof summary.fractal === 'object'
+    ? summary.fractal
+    : {};
   const scene = state.scene;
   const nodeCount = scene && Array.isArray(scene.nodes) ? scene.nodes.length : 0;
   const linkCount = scene && Array.isArray(scene.links) ? scene.links.length : 0;
@@ -3756,6 +3775,10 @@ function renderStats() {
       ['Constitution Alignment', `${String(constitution.alignment_band || 'gray').toUpperCase()} (${fmtNum(Number(constitution.alignment_score || 0) * 100)}%)`],
       ['T1/T2 Directives', `${fmtNum(constitution.tier1_total || 0)} / ${fmtNum(constitution.tier2_total || 0)}`],
       ['Evolution Commits 30d', fmtNum(evolution.commits_30d || 0)],
+      ['Fractal Harmony', `${fmtNum(Number(fractal.harmony_score || 0) * 100)}%`],
+      ['Symbiosis Plans', fmtNum(fractal.symbiosis_plans || 0)],
+      ['Predator Candidates', fmtNum(fractal.predator_candidates || 0)],
+      ['Black-Box Rows', fmtNum(fractal.black_box_rows || 0)],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows
@@ -3788,6 +3811,14 @@ function renderStats() {
       ['Evolution Trajectory', String(evolution.trajectory || 'flat')],
       ['Evolution Commits 30d', fmtNum(evolution.commits_30d || 0)],
       ['Evolution Stability', `${fmtNum(Number(evolution.stability_score || 0) * 100)}%`],
+      ['Fractal Harmony', `${fmtNum(Number(fractal.harmony_score || 0) * 100)}%`],
+      ['Symbiosis Plans', fmtNum(fractal.symbiosis_plans || 0)],
+      ['Predator Candidates', fmtNum(fractal.predator_candidates || 0)],
+      ['Restructure Candidates', fmtNum(fractal.restructure_candidates || 0)],
+      ['Epigenetic Tags', fmtNum(fractal.epigenetic_tags || 0)],
+      ['Archetypes', fmtNum(fractal.archetypes || 0)],
+      ['Pheromones', fmtNum(fractal.pheromones || 0)],
+      ['Black-Box Rows', fmtNum(fractal.black_box_rows || 0)],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
@@ -3959,6 +3990,14 @@ function renderStats() {
       ['Evolution Commits 7/30/90', `${fmtNum(evolution.commits_7d || 0)} / ${fmtNum(evolution.commits_30d || 0)} / ${fmtNum(evolution.commits_90d || 0)}`],
       ['Evolution Velocity', `${fmtNum(evolution.commit_velocity_30d || 0)} commits/day`],
       ['Evolution Stability', `${fmtNum(Number(evolution.stability_score || 0) * 100)}%`],
+      ['Fractal Harmony', `${fmtNum(Number(fractal.harmony_score || 0) * 100)}%`],
+      ['Symbiosis Plans', fmtNum(fractal.symbiosis_plans || 0)],
+      ['Predator Candidates', fmtNum(fractal.predator_candidates || 0)],
+      ['Restructure Candidates', fmtNum(fractal.restructure_candidates || 0)],
+      ['Epigenetic Tags', fmtNum(fractal.epigenetic_tags || 0)],
+      ['Archetypes', fmtNum(fractal.archetypes || 0)],
+      ['Pheromones', fmtNum(fractal.pheromones || 0)],
+      ['Black-Box Rows', fmtNum(fractal.black_box_rows || 0)],
       ['Layer Nodes', fmtNum(nodeCount)],
       ['Links', fmtNum(linkCount)],
       ...bottleneckRows

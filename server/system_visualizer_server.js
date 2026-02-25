@@ -24,6 +24,14 @@ const REPO_ROOT = process.env.OPENCLAW_WORKSPACE
   : path.resolve(__dirname, '..', '..');
 const RUNS_DIR = path.join(REPO_ROOT, 'state', 'autonomy', 'runs');
 const SPINE_RUNS_DIR = path.join(REPO_ROOT, 'state', 'spine', 'runs');
+const FRACTAL_DIR = path.join(REPO_ROOT, 'state', 'autonomy', 'fractal');
+const FRACTAL_ORGANISM_DIR = path.join(FRACTAL_DIR, 'organism_cycle');
+const FRACTAL_INTROSPECTION_DIR = path.join(FRACTAL_DIR, 'introspection');
+const FRACTAL_PHEROMONE_DIR = path.join(FRACTAL_DIR, 'pheromones');
+const FRACTAL_EPIGENETIC_PATH = path.join(FRACTAL_DIR, 'epigenetic_tags.json');
+const FRACTAL_ARCHETYPE_PATH = path.join(FRACTAL_DIR, 'archetype_pool.json');
+const GENOME_JOURNAL_PATH = path.join(REPO_ROOT, 'state', 'autonomy', 'genome', 'mutation_journal.jsonl');
+const BLACK_BOX_CHAIN_PATH = path.join(REPO_ROOT, 'state', 'security', 'black_box_ledger', 'chain.jsonl');
 const INTEGRITY_POLICY_PATH = path.join(REPO_ROOT, 'config', 'security_integrity_policy.json');
 const INTEGRITY_LOG_PATH = path.join(REPO_ROOT, 'state', 'security', 'integrity_violations.jsonl');
 const STATIC_DIR = path.join(__dirname, '..', 'client');
@@ -49,6 +57,7 @@ const ACTIVE_WRITE_WINDOW_MS = 14000;
 const JUST_PUSHED_WINDOW_MS = 2600;
 const MAX_CHANGE_FILES = 10;
 const EVOLUTION_CACHE_TTL_MS = 30000;
+const FRACTAL_CACHE_TTL_MS = 3000;
 const CODEBASE_SIZE_MAX_FILES = 2400;
 const CODEBASE_SIZE_MAX_DEPTH = 10;
 const CODE_PREVIEW_MAX_BYTES = 180 * 1024;
@@ -92,6 +101,11 @@ let CHANGE_STATE_CACHE = {
 };
 
 let EVOLUTION_CACHE = {
+  ts: 0,
+  payload: null
+};
+
+let FRACTAL_CACHE = {
   ts: 0,
   payload: null
 };
@@ -153,6 +167,27 @@ function safeJsonParse(line) {
   } catch {
     return null;
   }
+}
+
+function safeJsonRead(filePath, fallback = null) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const parsed = JSON.parse(String(fs.readFileSync(filePath, 'utf8') || ''));
+    return parsed == null ? fallback : parsed;
+  } catch {
+    return fallback;
+  }
+}
+
+function readJsonlRows(filePath) {
+  if (!fs.existsSync(filePath)) return [];
+  const rows = [];
+  const lines = String(fs.readFileSync(filePath, 'utf8') || '').split('\n');
+  for (const line of lines) {
+    const row = safeJsonParse(String(line || '').trim());
+    if (row && typeof row === 'object') rows.push(row);
+  }
+  return rows;
 }
 
 function parseTsMs(ts) {
@@ -364,6 +399,14 @@ function listJsonlFilesDesc(absDir) {
     .reverse();
 }
 
+function listJsonFilesDesc(absDir) {
+  if (!fs.existsSync(absDir)) return [];
+  return fs.readdirSync(absDir)
+    .filter((f) => /^\d{4}-\d{2}-\d{2}(?:\.\d+)?\.json$/.test(f))
+    .sort()
+    .reverse();
+}
+
 function listRunFilesDesc() {
   return listJsonlFilesDesc(RUNS_DIR);
 }
@@ -434,6 +477,116 @@ function loadRecentSpineEvents(hours = DEFAULT_HOURS, maxEvents = 600) {
     }
   }
   return events;
+}
+
+function latestDatedJson(absDir) {
+  const files = listJsonFilesDesc(absDir);
+  if (!files.length) return null;
+  const file = files[0];
+  const rel = path.relative(REPO_ROOT, path.join(absDir, file)).replace(/\\/g, '/');
+  const payload = safeJsonRead(path.join(absDir, file), null);
+  if (!payload || typeof payload !== 'object') return null;
+  return {
+    file,
+    rel,
+    payload
+  };
+}
+
+function loadFractalSnapshot() {
+  const nowMs = Date.now();
+  if (
+    FRACTAL_CACHE.payload
+    && (nowMs - Number(FRACTAL_CACHE.ts || 0)) < FRACTAL_CACHE_TTL_MS
+  ) {
+    return cloneJson(FRACTAL_CACHE.payload);
+  }
+
+  const organism = latestDatedJson(FRACTAL_ORGANISM_DIR);
+  const introspection = latestDatedJson(FRACTAL_INTROSPECTION_DIR);
+  const pheromones = latestDatedJson(FRACTAL_PHEROMONE_DIR);
+  const epigenetic = safeJsonRead(FRACTAL_EPIGENETIC_PATH, null);
+  const archetypes = safeJsonRead(FRACTAL_ARCHETYPE_PATH, null);
+  const genomeRows = readJsonlRows(GENOME_JOURNAL_PATH);
+  const genomeLast = genomeRows.length ? genomeRows[genomeRows.length - 1] : null;
+  const blackBoxRows = readJsonlRows(BLACK_BOX_CHAIN_PATH);
+  const blackBoxLast = blackBoxRows.length ? blackBoxRows[blackBoxRows.length - 1] : null;
+
+  const organismPayload = organism && organism.payload && typeof organism.payload === 'object'
+    ? organism.payload
+    : {};
+  const introspectionPayload = introspection && introspection.payload && typeof introspection.payload === 'object'
+    ? introspection.payload
+    : {};
+  const pheromonePayload = pheromones && pheromones.payload && typeof pheromones.payload === 'object'
+    ? pheromones.payload
+    : {};
+  const epigeneticTags = epigenetic && epigenetic.tags && typeof epigenetic.tags === 'object'
+    ? Object.keys(epigenetic.tags).length
+    : 0;
+  const archetypeCount = archetypes && Array.isArray(archetypes.archetypes)
+    ? archetypes.archetypes.length
+    : 0;
+  const symbiosisPlans = Array.isArray(organismPayload.symbiosis_plans)
+    ? organismPayload.symbiosis_plans.length
+    : 0;
+  const predatorCandidates = organismPayload.predator_prey && Array.isArray(organismPayload.predator_prey.candidates)
+    ? organismPayload.predator_prey.candidates.length
+    : 0;
+  const harmonyScore = Number(organismPayload.resonance && organismPayload.resonance.score);
+  const restructureCandidates = Array.isArray(introspectionPayload.restructure_candidates)
+    ? introspectionPayload.restructure_candidates.length
+    : 0;
+  const pheromoneCount = Array.isArray(pheromonePayload.packets)
+    ? pheromonePayload.packets.length
+    : 0;
+
+  const payload = {
+    generated_at: nowIso(),
+    organism: {
+      date: organism ? String(organism.file || '').slice(0, 10) : '',
+      file: organism ? organism.rel : '',
+      harmony_score: Number.isFinite(harmonyScore) ? harmonyScore : 0,
+      symbiosis_plans: symbiosisPlans,
+      predator_candidates: predatorCandidates
+    },
+    introspection: {
+      date: introspection ? String(introspection.file || '').slice(0, 10) : '',
+      file: introspection ? introspection.rel : '',
+      restructure_candidates: restructureCandidates
+    },
+    pheromones: {
+      date: pheromones ? String(pheromones.file || '').slice(0, 10) : '',
+      file: pheromones ? pheromones.rel : '',
+      packets: pheromoneCount
+    },
+    epigenetic: {
+      file: fs.existsSync(FRACTAL_EPIGENETIC_PATH) ? path.relative(REPO_ROOT, FRACTAL_EPIGENETIC_PATH).replace(/\\/g, '/') : '',
+      tags: epigeneticTags
+    },
+    archetypes: {
+      file: fs.existsSync(FRACTAL_ARCHETYPE_PATH) ? path.relative(REPO_ROOT, FRACTAL_ARCHETYPE_PATH).replace(/\\/g, '/') : '',
+      count: archetypeCount
+    },
+    genome: {
+      rows: genomeRows.length,
+      last_hash: genomeLast ? String(genomeLast.hash || '') : '',
+      last_date: genomeLast ? String(genomeLast.date || '') : '',
+      last_plan_id: genomeLast ? String(genomeLast.plan_id || '') : ''
+    },
+    black_box: {
+      rows: blackBoxRows.length,
+      last_hash: blackBoxLast ? String(blackBoxLast.hash || '') : '',
+      last_date: blackBoxLast ? String(blackBoxLast.date || '') : '',
+      last_mode: blackBoxLast ? String(blackBoxLast.mode || '') : ''
+    }
+  };
+
+  FRACTAL_CACHE = {
+    ts: nowMs,
+    payload
+  };
+  return cloneJson(payload);
 }
 
 function safeCountMap(raw) {
@@ -2106,6 +2259,9 @@ function buildHoloModel(runs, summary) {
   const evolution = summary && summary.evolution && typeof summary.evolution === 'object'
     ? summary.evolution
     : {};
+  const fractal = summary && summary.fractal && typeof summary.fractal === 'object'
+    ? summary.fractal
+    : {};
 
   return {
     generated_at: nowIso(),
@@ -2146,6 +2302,14 @@ function buildHoloModel(runs, summary) {
       evolution_commit_velocity_30d: Number(evolution.commit_velocity_30d || 0),
       evolution_stability_score: Number(evolution.stability_score || 0),
       evolution_commits_30d: Number(evolution.commits_30d || 0),
+      fractal_harmony_score: Number(fractal.harmony_score || 0),
+      fractal_symbiosis_plans: Number(fractal.symbiosis_plans || 0),
+      fractal_predator_candidates: Number(fractal.predator_candidates || 0),
+      fractal_restructure_candidates: Number(fractal.restructure_candidates || 0),
+      fractal_epigenetic_tags: Number(fractal.epigenetic_tags || 0),
+      fractal_archetypes: Number(fractal.archetypes || 0),
+      fractal_pheromones: Number(fractal.pheromones || 0),
+      black_box_rows: Number(fractal.black_box_rows || 0),
       change_pending_push: pendingPush,
       change_just_pushed: justPushed,
       change_active_modules: Number(changeSummary.active_modules || 0),
@@ -2164,6 +2328,20 @@ function buildPayload(hours) {
   const baseSummary = buildSummary(telemetry.runs, telemetry.audits, telemetry.window_hours, integrity);
   const constitution = buildConstitutionSnapshot(telemetry.runs, directives, strategy);
   const evolution = loadEvolutionSnapshot();
+  const fractalSnapshot = loadFractalSnapshot();
+  const fractal = {
+    harmony_score: Number(fractalSnapshot && fractalSnapshot.organism ? fractalSnapshot.organism.harmony_score || 0 : 0),
+    symbiosis_plans: Number(fractalSnapshot && fractalSnapshot.organism ? fractalSnapshot.organism.symbiosis_plans || 0 : 0),
+    predator_candidates: Number(fractalSnapshot && fractalSnapshot.organism ? fractalSnapshot.organism.predator_candidates || 0 : 0),
+    restructure_candidates: Number(fractalSnapshot && fractalSnapshot.introspection ? fractalSnapshot.introspection.restructure_candidates || 0 : 0),
+    epigenetic_tags: Number(fractalSnapshot && fractalSnapshot.epigenetic ? fractalSnapshot.epigenetic.tags || 0 : 0),
+    archetypes: Number(fractalSnapshot && fractalSnapshot.archetypes ? fractalSnapshot.archetypes.count || 0 : 0),
+    pheromones: Number(fractalSnapshot && fractalSnapshot.pheromones ? fractalSnapshot.pheromones.packets || 0 : 0),
+    genome_rows: Number(fractalSnapshot && fractalSnapshot.genome ? fractalSnapshot.genome.rows || 0 : 0),
+    genome_last_hash: String(fractalSnapshot && fractalSnapshot.genome ? fractalSnapshot.genome.last_hash || '' : ''),
+    black_box_rows: Number(fractalSnapshot && fractalSnapshot.black_box ? fractalSnapshot.black_box.rows || 0 : 0),
+    black_box_last_hash: String(fractalSnapshot && fractalSnapshot.black_box ? fractalSnapshot.black_box.last_hash || '' : '')
+  };
   const summary = {
     ...baseSummary,
     constitution: {
@@ -2176,7 +2354,8 @@ function buildPayload(hours) {
       tier2_total: Number(constitution.tier2_total || 0),
       top_proposals: Array.isArray(constitution.top_proposals) ? constitution.top_proposals.slice(0, 20) : []
     },
-    evolution
+    evolution,
+    fractal
   };
   const graph = buildGraph(telemetry.runs, directives, strategy);
   const holo = buildHoloModel(telemetry.runs, summary);
@@ -2188,6 +2367,8 @@ function buildPayload(hours) {
     holo,
     constitution,
     evolution,
+    fractal,
+    fractal_snapshot: fractalSnapshot,
     incidents: {
       integrity
     }
