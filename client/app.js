@@ -1182,6 +1182,18 @@ function isPreviewWarningRow(key, value) {
   return false;
 }
 
+function isPreviewGoodRow(key, value) {
+  const k = String(key || '').trim().toLowerCase();
+  const v = String(value == null ? '' : value).trim().toLowerCase();
+  if (!k && !v) return false;
+  if (k === 'constitution alignment' && (v.includes('green') || v.includes('aligned'))) return true;
+  if (k === 'evolution trajectory' && v.includes('accelerating')) return true;
+  if (k === 'integrity' && v === 'ok') return true;
+  if (k === 'health' && v.includes('nominal')) return true;
+  if (k === 'flow status' && v === 'clear') return true;
+  return false;
+}
+
 function nodeErrorRowsForSelection(node, integrityRows = [], errorSignal = 0) {
   const out = [];
   const row = node && typeof node === 'object' ? node : null;
@@ -3640,6 +3652,12 @@ function renderStats() {
   const holoMetrics = payload.holo && payload.holo.metrics && typeof payload.holo.metrics === 'object'
     ? payload.holo.metrics
     : {};
+  const constitution = summary.constitution && typeof summary.constitution === 'object'
+    ? summary.constitution
+    : {};
+  const evolution = summary.evolution && typeof summary.evolution === 'object'
+    ? summary.evolution
+    : {};
   const scene = state.scene;
   const nodeCount = scene && Array.isArray(scene.nodes) ? scene.nodes.length : 0;
   const linkCount = scene && Array.isArray(scene.links) ? scene.links.length : 0;
@@ -3735,6 +3753,9 @@ function renderStats() {
       ['Integrity', integrityIncident.active
         ? `${String(integrityIncident.severity || 'critical').toUpperCase()} (${fmtNum(integrityIncident.violation_total)} mismatches)`
         : 'OK'],
+      ['Constitution Alignment', `${String(constitution.alignment_band || 'gray').toUpperCase()} (${fmtNum(Number(constitution.alignment_score || 0) * 100)}%)`],
+      ['T1/T2 Directives', `${fmtNum(constitution.tier1_total || 0)} / ${fmtNum(constitution.tier2_total || 0)}`],
+      ['Evolution Commits 30d', fmtNum(evolution.commits_30d || 0)],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows
@@ -3762,6 +3783,11 @@ function renderStats() {
       ['Total Links', fmtNum(scene.links.length)],
       ['Blocked Links', fmtNum(blockStats.blocked_links)],
       ['Max Block Ratio', `${fmtNum(blockStats.max_blocked_ratio * 100)}%`],
+      ['Constitution Alignment', `${String(constitution.alignment_band || 'gray').toUpperCase()} (${fmtNum(Number(constitution.alignment_score || 0) * 100)}%)`],
+      ['T1/T2 Directives', `${fmtNum(constitution.tier1_total || 0)} / ${fmtNum(constitution.tier2_total || 0)}`],
+      ['Evolution Trajectory', String(evolution.trajectory || 'flat')],
+      ['Evolution Commits 30d', fmtNum(evolution.commits_30d || 0)],
+      ['Evolution Stability', `${fmtNum(Number(evolution.stability_score || 0) * 100)}%`],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
@@ -3926,6 +3952,13 @@ function renderStats() {
       ['Error Signal', `${fmtNum(errorSignal * 100)}%`],
       ['Yield', `${fmtNum(Number(holoMetrics.yield_rate || 0) * 100)}%`],
       ['Drift Proxy', `${fmtNum(Number(holoMetrics.drift_proxy || 0) * 100)}%`],
+      ['Constitution Alignment', `${String(constitution.alignment_band || 'gray').toUpperCase()} (${fmtNum(Number(constitution.alignment_score || 0) * 100)}%)`],
+      ['Constitution Sample', fmtNum(constitution.proposals_sampled || 0)],
+      ['T1/T2 Directives', `${fmtNum(constitution.tier1_total || 0)} / ${fmtNum(constitution.tier2_total || 0)}`],
+      ['Evolution Trajectory', String(evolution.trajectory || 'flat')],
+      ['Evolution Commits 7/30/90', `${fmtNum(evolution.commits_7d || 0)} / ${fmtNum(evolution.commits_30d || 0)} / ${fmtNum(evolution.commits_90d || 0)}`],
+      ['Evolution Velocity', `${fmtNum(evolution.commit_velocity_30d || 0)} commits/day`],
+      ['Evolution Stability', `${fmtNum(Number(evolution.stability_score || 0) * 100)}%`],
       ['Layer Nodes', fmtNum(nodeCount)],
       ['Links', fmtNum(linkCount)],
       ...bottleneckRows
@@ -3949,12 +3982,13 @@ function renderStats() {
   const rowsHtml = rows.map(([k, v]) => {
     const errorRow = isPreviewErrorRow(k);
     const warningRow = !errorRow && isPreviewWarningRow(k, v);
+    const goodRow = !errorRow && !warningRow && isPreviewGoodRow(k, v);
     const itemClass = errorRow
       ? 'item item-error'
-      : (warningRow ? 'item item-warning' : 'item');
+      : (warningRow ? 'item item-warning' : (goodRow ? 'item item-good' : 'item'));
     const valueClass = errorRow
       ? 'v v-error'
-      : (warningRow ? 'v v-warning' : 'v');
+      : (warningRow ? 'v v-warning' : (goodRow ? 'v v-good' : 'v'));
     return `<div class="${itemClass}"><div class="k">${escapeHtml(String(k))}</div><div class="${valueClass}">${escapeHtml(String(v))}</div></div>`;
   }).join('');
   if (showingCode) {

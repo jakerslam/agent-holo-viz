@@ -48,6 +48,7 @@ const CHANGE_STATE_CACHE_TTL_MS = 1200;
 const ACTIVE_WRITE_WINDOW_MS = 14000;
 const JUST_PUSHED_WINDOW_MS = 2600;
 const MAX_CHANGE_FILES = 10;
+const EVOLUTION_CACHE_TTL_MS = 30000;
 const CODEBASE_SIZE_MAX_FILES = 2400;
 const CODEBASE_SIZE_MAX_DEPTH = 10;
 const CODE_PREVIEW_MAX_BYTES = 180 * 1024;
@@ -86,6 +87,11 @@ let MODULE_SCAN_CACHE = {
 };
 
 let CHANGE_STATE_CACHE = {
+  ts: 0,
+  payload: null
+};
+
+let EVOLUTION_CACHE = {
   ts: 0,
   payload: null
 };
@@ -1203,6 +1209,231 @@ function topCounts(rows, limit = 10) {
     .slice(0, limit);
 }
 
+function parsePositiveInt(raw, fallback = 0) {
+  const n = Number(String(raw || '').trim());
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.round(n);
+}
+
+function gitCountSince(sinceExpr) {
+  const since = String(sinceExpr || '').trim();
+  if (!since) return 0;
+  const res = runCmd('git', ['rev-list', '--count', `--since=${since}`, 'HEAD'], 2400);
+  if (!res.ok) return 0;
+  return parsePositiveInt(res.stdout, 0);
+}
+
+function gitChurnSince(sinceExpr) {
+  const since = String(sinceExpr || '').trim();
+  if (!since) return { added: 0, deleted: 0 };
+  const res = runCmd('git', ['log', `--since=${since}`, '--numstat', '--pretty=tformat:'], 2800);
+  if (!res.ok) return { added: 0, deleted: 0 };
+  let added = 0;
+  let deleted = 0;
+  const lines = String(res.stdout || '').split('\n');
+  for (const line of lines) {
+    const row = String(line || '').trim();
+    if (!row) continue;
+    const m = row.match(/^(\d+|-)\s+(\d+|-)\s+/);
+    if (!m) continue;
+    const a = Number(m[1]);
+    const d = Number(m[2]);
+    if (Number.isFinite(a) && a > 0) added += Math.round(a);
+    if (Number.isFinite(d) && d > 0) deleted += Math.round(d);
+  }
+  return { added, deleted };
+}
+
+function gitPathVersion(relPath) {
+  const rel = normalizeRelPath(relPath);
+  if (!rel) {
+    return { path: relPath || '', commit: '', ts: '', age_days: null };
+  }
+  const res = runCmd('git', ['log', '-1', '--format=%h|%ct', '--', rel], 2200);
+  if (!res.ok) {
+    return { path: rel, commit: '', ts: '', age_days: null };
+  }
+  const [commitRaw, epochRaw] = String(res.stdout || '').trim().split('|');
+  const commit = String(commitRaw || '').trim();
+  const epoch = Number(epochRaw || 0);
+  const ts = Number.isFinite(epoch) && epoch > 0 ? new Date(epoch * 1000).toISOString() : '';
+  const ageDays = Number.isFinite(epoch) && epoch > 0
+    ? Number((((Date.now() / 1000) - epoch) / 86400).toFixed(2))
+    : null;
+  return {
+    path: rel,
+    commit,
+    ts,
+    age_days: ageDays
+  };
+}
+
+function loadEvolutionSnapshot() {
+  const nowMs = Date.now();
+  if (
+    EVOLUTION_CACHE.payload
+    && (nowMs - Number(EVOLUTION_CACHE.ts || 0)) < EVOLUTION_CACHE_TTL_MS
+  ) {
+    return cloneJson(EVOLUTION_CACHE.payload);
+  }
+  const commits7d = gitCountSince('7 days ago');
+  const commits30d = gitCountSince('30 days ago');
+  const commits90d = gitCountSince('90 days ago');
+  const churn30d = gitChurnSince('30 days ago');
+  const totalChurn30d = Number(churn30d.added || 0) + Number(churn30d.deleted || 0);
+  const velocity30d = Number((commits30d / 30).toFixed(3));
+  const churnPerCommit = commits30d > 0 ? totalChurn30d / commits30d : totalChurn30d;
+  const stabilityScore = Number(clampNumber(1 - (churnPerCommit / 1800), 0, 1, 0.5).toFixed(3));
+  const trajectory = commits30d <= 0
+    ? 'flat'
+    : (
+      commits7d >= Math.max(1, Math.round((commits30d / 30) * 7 * 1.15))
+        ? 'accelerating'
+        : (
+          commits7d <= Math.max(0, Math.round((commits30d / 30) * 7 * 0.7))
+            ? 'cooling'
+            : 'steady'
+        )
+    );
+  const components = {
+    spine: gitPathVersion('systems/spine/spine.ts'),
+    autonomy: gitPathVersion('systems/autonomy/autonomy_controller.ts'),
+    skills: gitPathVersion('skills')
+  };
+  const payload = {
+    generated_at: nowIso(),
+    commits_7d: commits7d,
+    commits_30d: commits30d,
+    commits_90d: commits90d,
+    lines_added_30d: Number(churn30d.added || 0),
+    lines_deleted_30d: Number(churn30d.deleted || 0),
+    churn_30d: totalChurn30d,
+    commit_velocity_30d: velocity30d,
+    stability_score: stabilityScore,
+    trajectory,
+    components
+  };
+  EVOLUTION_CACHE = {
+    ts: nowMs,
+    payload
+  };
+  return cloneJson(payload);
+}
+
+function directiveTier(id, directivesById) {
+  const objectiveId = String(id || '').trim();
+  if (!objectiveId) return null;
+  const byId = directivesById && typeof directivesById === 'object' ? directivesById : {};
+  const fromCatalog = byId[objectiveId] && Number.isFinite(Number(byId[objectiveId].tier))
+    ? Number(byId[objectiveId].tier)
+    : null;
+  if (fromCatalog != null) return fromCatalog;
+  if (/^T1[_:]/i.test(objectiveId)) return 1;
+  if (/^T2[_:]/i.test(objectiveId)) return 2;
+  return null;
+}
+
+function objectiveAlignmentScore(evt, directivesById) {
+  const row = evt && typeof evt === 'object' ? evt : {};
+  const result = String(row.result || '').trim().toLowerCase();
+  const binding = row.objective_binding && typeof row.objective_binding === 'object'
+    ? row.objective_binding
+    : {};
+  const pulse = row.directive_pulse && typeof row.directive_pulse === 'object'
+    ? row.directive_pulse
+    : {};
+  const objectiveId = objectiveIdFromRun(row);
+  const tier = directiveTier(objectiveId, directivesById);
+  const pulseScore = Number(pulse.objective_allocation_score || 0);
+  const bindingPass = binding.pass !== false && String(binding.objective_id || objectiveId || '').trim() !== '';
+  let score = 0.42;
+  if (bindingPass) score += 0.22;
+  else if (String(result).startsWith('stop_init_gate_objective_binding')) score -= 0.24;
+  if (tier === 1) score += 0.18;
+  else if (tier === 2) score += 0.12;
+  if (Number.isFinite(pulseScore) && pulseScore > 0) {
+    score += clampNumber((pulseScore / 100) * 0.16, 0, 0.16, 0);
+  }
+  if (row.policy_hold === true || isPolicyHoldResult(result)) score -= 0.1;
+  if (result.includes('reverted')) score -= 0.08;
+  const bounded = Number(clampNumber(score, 0, 1, 0.5).toFixed(4));
+  const band = bounded >= 0.66 ? 'green' : (bounded <= 0.4 ? 'red' : 'gray');
+  return {
+    score: bounded,
+    band,
+    objective_id: objectiveId || null,
+    tier
+  };
+}
+
+function buildConstitutionSnapshot(runs, directives, strategy) {
+  const rows = Array.isArray(runs) ? runs : [];
+  const directivesRows = Array.isArray(directives) ? directives : [];
+  const directivesById = {};
+  let tier1Count = 0;
+  let tier2Count = 0;
+  for (const d of directivesRows) {
+    const id = String(d && d.id || '').trim();
+    if (!id) continue;
+    const tier = Number(d && d.tier || 99);
+    directivesById[id] = {
+      id,
+      tier
+    };
+    if (tier === 1) tier1Count += 1;
+    else if (tier === 2) tier2Count += 1;
+  }
+  const latestByProposal = {};
+  for (const evt of rows) {
+    const pid = String(evt && evt.proposal_id || '').trim();
+    if (!pid) continue;
+    const ts = parseTsMs(evt && evt.ts) || 0;
+    if (!latestByProposal[pid] || ts > Number(latestByProposal[pid].ts || 0)) {
+      latestByProposal[pid] = { evt, ts };
+    }
+  }
+  const proposalRows = Object.entries(latestByProposal)
+    .sort((a, b) => Number(b[1].ts || 0) - Number(a[1].ts || 0))
+    .slice(0, 80)
+    .map(([proposalId, row]) => {
+      const evt = row && row.evt ? row.evt : {};
+      const alignment = objectiveAlignmentScore(evt, directivesById);
+      return {
+        proposal_id: proposalId,
+        proposal_type: proposalTypeFromRun(evt),
+        objective_id: alignment.objective_id,
+        objective_tier: alignment.tier,
+        alignment_score: alignment.score,
+        alignment_band: alignment.band,
+        result: String(evt && evt.result || ''),
+        outcome: String(evt && evt.outcome || ''),
+        ts: String(evt && evt.ts || '')
+      };
+    });
+  const bandCounts = { green: 0, gray: 0, red: 0 };
+  let scoreTotal = 0;
+  for (const row of proposalRows) {
+    const band = String(row && row.alignment_band || 'gray');
+    if (Object.prototype.hasOwnProperty.call(bandCounts, band)) bandCounts[band] += 1;
+    scoreTotal += Number(row && row.alignment_score || 0);
+  }
+  const sampleSize = proposalRows.length;
+  const avgScore = sampleSize > 0 ? Number((scoreTotal / sampleSize).toFixed(4)) : 0;
+  const overallBand = avgScore >= 0.66 ? 'green' : (avgScore <= 0.4 ? 'red' : 'gray');
+  return {
+    generated_at: nowIso(),
+    strategy_id: String(strategy && strategy.id || '').trim() || 'default_general',
+    directives_total: directivesRows.length,
+    tier1_total: tier1Count,
+    tier2_total: tier2Count,
+    proposals_sampled: sampleSize,
+    alignment_score: avgScore,
+    alignment_band: overallBand,
+    alignment_bands: bandCounts,
+    top_proposals: proposalRows.slice(0, 20)
+  };
+}
+
 function buildSummary(runs, audits, windowHours, integrityStatus = null) {
   const resultCounts = {};
   const capabilityCounts = {};
@@ -1290,16 +1521,21 @@ function buildGraph(runs, directives, strategy) {
   const objectiveSet = new Set();
   const strategyId = String(strategy && strategy.id || '').trim() || 'default_general';
   const campaignTypeIndex = buildCampaignTypeIndex(strategy && strategy.campaigns || []);
+  const directivesById = {};
 
   for (const d of directives || []) {
+    const did = String(d && d.id || '').trim();
+    if (!did) continue;
+    const dtier = Number(d && d.tier || 99);
+    directivesById[did] = { tier: dtier };
     addNode(nodeMap, {
-      id: `directive:${d.id}`,
-      label: `${d.id}`,
+      id: `directive:${did}`,
+      label: `${did}`,
       type: 'directive',
       weight: 1,
-      meta: { tier: Number(d.tier || 99), title: String(d.title || d.id) }
+      meta: { tier: dtier, title: String(d.title || did) }
     });
-    objectiveSet.add(String(d.id));
+    objectiveSet.add(did);
   }
 
   addNode(nodeMap, {
@@ -1342,6 +1578,7 @@ function buildGraph(runs, directives, strategy) {
     const row = latestByProposal[pid];
     const evt = row && row.evt ? row.evt : {};
     const pType = proposalTypeFromRun(evt);
+    const alignment = objectiveAlignmentScore(evt, directivesById);
     addNode(nodeMap, {
       id: `proposal:${pid}`,
       label: pType === 'unknown' ? pid : `${pType}:${pid.slice(0, 8)}`,
@@ -1350,7 +1587,11 @@ function buildGraph(runs, directives, strategy) {
       meta: {
         proposal_id: pid,
         proposal_type: pType,
-        risk: String(evt && evt.risk || 'unknown')
+        risk: String(evt && evt.risk || 'unknown'),
+        alignment_score: Number(alignment.score || 0),
+        alignment_band: String(alignment.band || 'gray'),
+        objective_id: alignment.objective_id || null,
+        objective_tier: alignment.tier
       }
     });
     addEdge(edgeMap, `strategy:${strategyId}`, `proposal:${pid}`, 'selects', 1);
@@ -1780,6 +2021,12 @@ function buildHoloModel(runs, summary) {
   const integrityViolationTotal = Number(summary && summary.integrity_violation_total || 0);
   const pendingPush = changeSummary.pending_push === true ? 1 : 0;
   const justPushed = changeSummary.just_pushed === true ? 1 : 0;
+  const constitution = summary && summary.constitution && typeof summary.constitution === 'object'
+    ? summary.constitution
+    : {};
+  const evolution = summary && summary.evolution && typeof summary.evolution === 'object'
+    ? summary.evolution
+    : {};
 
   return {
     generated_at: nowIso(),
@@ -1814,6 +2061,12 @@ function buildHoloModel(runs, summary) {
       integrity_alert: integrityAlert,
       integrity_violation_total: integrityViolationTotal,
       integrity_severity: String(summary && summary.integrity_severity || (integrityAlert ? 'critical' : 'ok')),
+      constitution_alignment_score: Number(constitution.alignment_score || 0),
+      constitution_alignment_band: String(constitution.alignment_band || 'gray'),
+      constitution_proposals_sampled: Number(constitution.proposals_sampled || 0),
+      evolution_commit_velocity_30d: Number(evolution.commit_velocity_30d || 0),
+      evolution_stability_score: Number(evolution.stability_score || 0),
+      evolution_commits_30d: Number(evolution.commits_30d || 0),
       change_pending_push: pendingPush,
       change_just_pushed: justPushed,
       change_active_modules: Number(changeSummary.active_modules || 0),
@@ -1829,7 +2082,23 @@ function buildPayload(hours) {
   const directives = loadDirectiveSummary();
   const strategy = loadStrategySummary();
   const integrity = loadIntegrityStatus(telemetry.window_hours);
-  const summary = buildSummary(telemetry.runs, telemetry.audits, telemetry.window_hours, integrity);
+  const baseSummary = buildSummary(telemetry.runs, telemetry.audits, telemetry.window_hours, integrity);
+  const constitution = buildConstitutionSnapshot(telemetry.runs, directives, strategy);
+  const evolution = loadEvolutionSnapshot();
+  const summary = {
+    ...baseSummary,
+    constitution: {
+      alignment_score: Number(constitution.alignment_score || 0),
+      alignment_band: String(constitution.alignment_band || 'gray'),
+      alignment_bands: constitution.alignment_bands || { green: 0, gray: 0, red: 0 },
+      proposals_sampled: Number(constitution.proposals_sampled || 0),
+      directives_total: Number(constitution.directives_total || directives.length || 0),
+      tier1_total: Number(constitution.tier1_total || 0),
+      tier2_total: Number(constitution.tier2_total || 0),
+      top_proposals: Array.isArray(constitution.top_proposals) ? constitution.top_proposals.slice(0, 20) : []
+    },
+    evolution
+  };
   const graph = buildGraph(telemetry.runs, directives, strategy);
   const holo = buildHoloModel(telemetry.runs, summary);
   return {
@@ -1838,6 +2107,8 @@ function buildPayload(hours) {
     summary,
     graph,
     holo,
+    constitution,
+    evolution,
     incidents: {
       integrity
     }
