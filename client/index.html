@@ -225,6 +225,32 @@
       color: var(--muted);
       letter-spacing: 0.1em;
     }
+    #previewTabs {
+      display: flex;
+      gap: 6px;
+      margin: 0 0 7px;
+    }
+    .previewTabBtn {
+      border: 1px solid rgba(93, 247, 255, 0.32);
+      border-radius: 8px;
+      background: rgba(8, 20, 32, 0.62);
+      color: rgba(215, 249, 255, 0.82);
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.6rem;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      padding: 5px 8px;
+      cursor: pointer;
+    }
+    .previewTabBtn:hover {
+      filter: brightness(1.08);
+    }
+    .previewTabBtn.active {
+      border-color: rgba(93, 247, 255, 0.62);
+      color: rgba(236, 250, 255, 0.96);
+      background: rgba(20, 66, 102, 0.7);
+      box-shadow: 0 0 14px rgba(93, 247, 255, 0.24);
+    }
     #statsGrid {
       display: grid;
       grid-template-columns: 1fr;
@@ -260,6 +286,22 @@
     }
     #statsGrid .item .v.v-warning {
       color: rgba(255, 175, 92, 0.98);
+    }
+    #codePane {
+      display: none;
+      min-height: 220px;
+      border: 1px dashed rgba(93, 247, 255, 0.24);
+      border-radius: 8px;
+      padding: 8px;
+      background: rgba(9, 25, 40, 0.58);
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.66rem;
+      line-height: 1.34;
+      color: rgba(225, 246, 255, 0.94);
+      white-space: pre;
+      overflow: auto;
+      tab-size: 2;
+      -moz-tab-size: 2;
     }
     #metaLine {
       margin-top: 6px;
@@ -310,8 +352,13 @@
   <section id="incidentBanner" role="status" aria-live="polite"></section>
 
   <section id="statsPanel">
+    <div id="previewTabs">
+      <button id="tabPreview" class="previewTabBtn active" type="button">Preview</button>
+      <button id="tabCode" class="previewTabBtn" type="button">Code</button>
+    </div>
     <h2 id="statsTitle">Preview Pane</h2>
     <div id="statsGrid"></div>
+    <pre id="codePane" aria-live="polite"></pre>
     <div id="metaLine">Booting hologram...</div>
   </section>
 

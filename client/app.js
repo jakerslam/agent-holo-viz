@@ -74,6 +74,7 @@ const SHELL_ORDER_SWAP_COOLDOWN_MS = 10 * 60 * 1000;
 const SHELL_INTRO_INITIAL_DELAY_MS = 110;
 const SHELL_INTRO_LAYER_DELAY_MS = 70;
 const SHELL_INTRO_LAYER_DURATION_MS = 240;
+const RESOLVE_FLASH_MS = 4200;
 
 const state = {
   canvas: null,
@@ -86,6 +87,7 @@ const state = {
   particles: [],
   particle_cursor: 0,
   selected: null,
+  selected_subfractal: null,
   selected_link: null,
   hover: null,
   refresh_ms: 6000,
@@ -117,6 +119,9 @@ const state = {
     layer_id: '',
     runtime_by_layer: Object.create(null)
   },
+  module_spin_lock: {
+    runtime_by_module: Object.create(null)
+  },
   layer_order_lock: {
     order: [],
     last_swap_ms: 0
@@ -131,6 +136,23 @@ const state = {
     layer_ids: []
   },
   focus: null,
+  preview_tab: 'preview',
+  code_preview: {
+    selection_key: '',
+    path: '',
+    loading: false,
+    is_file: false,
+    is_dir: false,
+    truncated: false,
+    error: '',
+    content: '',
+    request_id: 0
+  },
+  code_preview_cache: Object.create(null),
+  resolved_flash: {
+    nodes: Object.create(null),
+    links: Object.create(null)
+  },
   particle_signature: '',
   camera: {
     zoom: 1,
@@ -154,6 +176,7 @@ const state = {
     submodule_return_selection_for: '',
     transition: null,
     panning: false,
+    pan_started: false,
     drag_px: 0,
     last_x: 0,
     last_y: 0
@@ -188,6 +211,81 @@ function mix(a, b, t) {
 function easeOutCubic(v) {
   const t = clamp(v, 0, 1);
   return 1 - Math.pow(1 - t, 3);
+}
+
+function hasNodeIssueSignal(node) {
+  if (!node || typeof node !== 'object') return false;
+  if (node.error_state_active === true || node.integrity_alert === true) return true;
+  if (node.change_active === true) return true;
+  const change = normalizeChangeState(node.change_state);
+  return change.changed === true;
+}
+
+function hasLinkIssueSignal(link) {
+  if (!link || typeof link !== 'object') return false;
+  const errW = clamp(Number(link.error_weight || 0), 0, 1);
+  const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
+  return errW > 0.045 || link.flow_blocked === true || blockedRatio > 0.02;
+}
+
+function registerResolvedFlashes(prevScene, nextScene, nowTs = performance.now()) {
+  const prev = prevScene && typeof prevScene === 'object' ? prevScene : null;
+  const next = nextScene && typeof nextScene === 'object' ? nextScene : null;
+  if (!prev || !next) return;
+  const flash = state.resolved_flash && typeof state.resolved_flash === 'object'
+    ? state.resolved_flash
+    : (state.resolved_flash = { nodes: Object.create(null), links: Object.create(null) });
+  const nodesMap = flash.nodes && typeof flash.nodes === 'object'
+    ? flash.nodes
+    : (flash.nodes = Object.create(null));
+  const linksMap = flash.links && typeof flash.links === 'object'
+    ? flash.links
+    : (flash.links = Object.create(null));
+  const ttl = Math.max(400, Number(RESOLVE_FLASH_MS || 4200));
+  const expiresAt = Number(nowTs || 0) + ttl;
+
+  const prevNodes = prev.node_by_id && typeof prev.node_by_id === 'object' ? prev.node_by_id : Object.create(null);
+  const nextNodes = next.node_by_id && typeof next.node_by_id === 'object' ? next.node_by_id : Object.create(null);
+  for (const id of Object.keys(nextNodes)) {
+    const before = prevNodes[id];
+    const after = nextNodes[id];
+    if (!before || !after) continue;
+    if (hasNodeIssueSignal(before) && !hasNodeIssueSignal(after)) {
+      nodesMap[id] = expiresAt;
+    }
+  }
+
+  const prevLinks = prev.link_by_id && typeof prev.link_by_id === 'object' ? prev.link_by_id : Object.create(null);
+  const nextLinks = next.link_by_id && typeof next.link_by_id === 'object' ? next.link_by_id : Object.create(null);
+  for (const id of Object.keys(nextLinks)) {
+    const before = prevLinks[id];
+    const after = nextLinks[id];
+    if (!before || !after) continue;
+    if (hasLinkIssueSignal(before) && !hasLinkIssueSignal(after)) {
+      linksMap[id] = expiresAt;
+    }
+  }
+}
+
+function resolvedFlashAlpha(kind, id, nowTs = performance.now()) {
+  const bucket = state.resolved_flash && kind === 'link'
+    ? state.resolved_flash.links
+    : state.resolved_flash && kind === 'node'
+      ? state.resolved_flash.nodes
+      : null;
+  if (!bucket || typeof bucket !== 'object') return 0;
+  const key = String(id || '').trim();
+  if (!key) return 0;
+  const until = Number(bucket[key] || 0);
+  if (!Number.isFinite(until) || until <= 0) return 0;
+  const remain = until - Number(nowTs || 0);
+  if (remain <= 0) {
+    delete bucket[key];
+    return 0;
+  }
+  const t = clamp(remain / Math.max(100, Number(RESOLVE_FLASH_MS || 4200)), 0, 1);
+  const pulse = 0.72 + (0.28 * (0.5 + (0.5 * Math.sin((Number(nowTs || 0) * 0.008) + (stableHash(key) % 31)))));
+  return clamp(t * pulse, 0, 1);
 }
 
 function syncCameraTransition(ts = performance.now()) {
@@ -672,6 +770,23 @@ async function fetchPayload(hours) {
   const h = Math.max(1, Number(hours || 24));
   const res = await fetch(`/api/holo?hours=${encodeURIComponent(String(h))}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`api_http_${res.status}`);
+  return res.json();
+}
+
+async function fetchCodePreview(pathText) {
+  const p = String(pathText || '').trim();
+  if (!p) {
+    return {
+      ok: true,
+      path: '',
+      is_file: false,
+      is_dir: false,
+      truncated: false,
+      content: ''
+    };
+  }
+  const res = await fetch(`/api/file?path=${encodeURIComponent(p)}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`file_http_${res.status}`);
   return res.json();
 }
 
@@ -1202,6 +1317,157 @@ function cloneSelectionRef(selection) {
   };
 }
 
+function subfractalChildrenForNode(node) {
+  const rows = node && typeof node === 'object' && Array.isArray(node.subfractal_children)
+    ? node.subfractal_children
+    : [];
+  const out = [];
+  for (const row of rows) {
+    const child = row && typeof row === 'object' ? row : {};
+    const id = String(child.id || '').trim();
+    const name = String(child.name || '').trim();
+    if (!id || !name) continue;
+    out.push({
+      id,
+      name,
+      rel: String(child.rel || '').trim()
+    });
+  }
+  return out;
+}
+
+function setSelectedSubfractal(next) {
+  const row = next && typeof next === 'object' ? next : null;
+  if (!row) {
+    state.selected_subfractal = null;
+    return;
+  }
+  const id = String(row.id || '').trim();
+  const parentId = String(row.parent_id || '').trim();
+  if (!id || !parentId) {
+    state.selected_subfractal = null;
+    return;
+  }
+  state.selected_subfractal = {
+    id,
+    parent_id: parentId,
+    index: Math.max(0, Math.floor(Number(row.index || 0) || 0)),
+    count: Math.max(0, Math.floor(Number(row.count || 0) || 0)),
+    name: String(row.name || id),
+    path: String(row.path || '')
+  };
+}
+
+function clearSelectedSubfractal() {
+  state.selected_subfractal = null;
+}
+
+function validateSelectedSubfractal(scene) {
+  const selected = state.selected_subfractal && typeof state.selected_subfractal === 'object'
+    ? state.selected_subfractal
+    : null;
+  if (!selected || !scene || !scene.node_by_id) {
+    if (selected) state.selected_subfractal = null;
+    return null;
+  }
+  const parentId = String(selected.parent_id || '').trim();
+  const selectedId = String(state.selected && state.selected.id || '').trim();
+  const selectedType = String(state.selected && state.selected.type || '').toLowerCase();
+  if (!parentId || selectedId !== parentId || selectedType !== 'submodule') {
+    state.selected_subfractal = null;
+    return null;
+  }
+  const node = scene.node_by_id[parentId];
+  if (!node || String(node.type || '').toLowerCase() !== 'submodule') {
+    state.selected_subfractal = null;
+    return null;
+  }
+  const children = subfractalChildrenForNode(node);
+  if (!children.length) {
+    state.selected_subfractal = null;
+    return null;
+  }
+  const currentId = String(selected.id || '').trim();
+  const idx = children.findIndex((child) => String(child.id || '') === currentId);
+  if (idx < 0) {
+    state.selected_subfractal = null;
+    return null;
+  }
+  const child = children[idx];
+  const normalized = {
+    id: String(child.id || ''),
+    parent_id: parentId,
+    index: idx,
+    count: children.length,
+    name: String(child.name || child.id || ''),
+    path: String(child.rel || '')
+  };
+  state.selected_subfractal = normalized;
+  return normalized;
+}
+
+function subfractalAnchorForSelection(node, selectedSubfractal) {
+  const subNode = node && typeof node === 'object' ? node : null;
+  const selected = selectedSubfractal && typeof selectedSubfractal === 'object'
+    ? selectedSubfractal
+    : null;
+  if (!subNode || !selected) return null;
+  const children = subfractalChildrenForNode(subNode);
+  if (!children.length) return null;
+  const idx = clamp(Math.floor(Number(selected.index || 0) || 0), 0, children.length - 1);
+  const start = Number(subNode.shell_start || 0);
+  const end = Number(subNode.shell_end || (start + (Math.PI * 0.35)));
+  const a = angleAtArcFraction(start, end, (idx + 0.5) / children.length);
+  const px = Number(subNode.parent_x || subNode.x || 0);
+  const py = Number(subNode.parent_y || subNode.y || 0);
+  const inner = Math.max(0.5, Number(subNode.shell_inner || (Number(subNode.radius || 2) * 2.2)));
+  const outer = Math.max(inner + 0.5, Number(subNode.shell_outer || (Number(subNode.radius || 2) * 3.1)));
+  const r = inner + ((outer - inner) * 0.56);
+  return {
+    x: px + (Math.cos(a) * r),
+    y: py + (Math.sin(a) * r)
+  };
+}
+
+function subfractalSelectionExtent(node, selectedSubfractal) {
+  const subNode = node && typeof node === 'object' ? node : null;
+  const selected = selectedSubfractal && typeof selectedSubfractal === 'object'
+    ? selectedSubfractal
+    : null;
+  if (!subNode || !selected) return null;
+  const children = subfractalChildrenForNode(subNode);
+  if (!children.length) return null;
+  const idx = clamp(Math.floor(Number(selected.index || 0) || 0), 0, children.length - 1);
+  const inner = Math.max(0.5, Number(subNode.shell_inner || (Number(subNode.radius || 2) * 2.2)));
+  const outer = Math.max(inner + 0.5, Number(subNode.shell_outer || (Number(subNode.radius || 2) * 3.1)));
+  const start = Number(subNode.shell_start || 0);
+  const end = Number(subNode.shell_end || (start + (Math.PI * 0.35)));
+  const segStart = angleAtArcFraction(start, end, idx / children.length);
+  const segEnd = angleAtArcFraction(start, end, (idx + 1) / children.length);
+  const span = positiveAngleSpan(segStart, segEnd);
+  const arcLen = span * ((inner + outer) * 0.5);
+  const radial = outer - inner;
+  const extent = Math.max(6, arcLen, radial);
+  return {
+    extent,
+    inner,
+    outer,
+    seg_start: segStart,
+    seg_end: segEnd
+  };
+}
+
+function nodeWithAnchor(node, anchor) {
+  const src = node && typeof node === 'object' ? node : null;
+  const a = anchor && typeof anchor === 'object' ? anchor : null;
+  if (!src || !a || !Number.isFinite(Number(a.x)) || !Number.isFinite(Number(a.y))) return src;
+  return {
+    ...src,
+    x: Number(a.x),
+    y: Number(a.y)
+  };
+}
+
 function updateSceneMotion(scene, ts) {
   if (!scene || !Number.isFinite(ts)) return;
   const nodes = Array.isArray(scene.nodes) ? scene.nodes : [];
@@ -1218,6 +1484,29 @@ function updateSceneMotion(scene, ts) {
   const selectedNode = selectedId ? nodeById[selectedId] : null;
   const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
   const selectedType = selectedTypeHint || String(selectedNode && selectedNode.type || '').toLowerCase();
+  const selectedSubfractalRef = state.selected_subfractal && typeof state.selected_subfractal === 'object'
+    ? state.selected_subfractal
+    : null;
+  const selectedSubfractalParentId = String(selectedSubfractalRef && selectedSubfractalRef.parent_id || '');
+  const selectedSubfractalParentNode = selectedSubfractalParentId ? nodeById[selectedSubfractalParentId] : null;
+  const selectedSubfractalModuleId = String(selectedSubfractalParentNode && selectedSubfractalParentNode.parent_id || '');
+  const focusId = state.camera && state.camera.focus_mode
+    ? String(state.camera.focus_target_id || '')
+    : '';
+  const focusNode = focusId ? nodeById[focusId] : null;
+  const focusType = String(focusNode && focusNode.type || '').toLowerCase();
+  const selectedSubmoduleParentId = selectedType === 'submodule'
+    ? String(selectedNode && selectedNode.parent_id || '')
+    : '';
+  const focusSubmoduleParentId = focusType === 'submodule'
+    ? String(focusNode && focusNode.parent_id || '')
+    : '';
+  const moduleSpinLock = state.module_spin_lock && typeof state.module_spin_lock === 'object'
+    ? state.module_spin_lock
+    : (state.module_spin_lock = { runtime_by_module: Object.create(null) });
+  const moduleSpinRuntimeById = moduleSpinLock.runtime_by_module && typeof moduleSpinLock.runtime_by_module === 'object'
+    ? moduleSpinLock.runtime_by_module
+    : (moduleSpinLock.runtime_by_module = Object.create(null));
   let frozenLayerId = '';
   if (selectedType === 'layer') {
     frozenLayerId = String(selectedNode && selectedNode.id || '');
@@ -1225,6 +1514,9 @@ function updateSceneMotion(scene, ts) {
     frozenLayerId = String(selectedNode && selectedNode.parent_id || '');
   } else if (selectedType === 'submodule') {
     const parentModule = nodeById[String(selectedNode && selectedNode.parent_id || '')];
+    frozenLayerId = String(parentModule && parentModule.parent_id || '');
+  } else if (selectedSubfractalModuleId) {
+    const parentModule = nodeById[selectedSubfractalModuleId];
     frozenLayerId = String(parentModule && parentModule.parent_id || '');
   }
   const layerOrbitState = scene.layer_orbit_state && typeof scene.layer_orbit_state === 'object'
@@ -1310,14 +1602,28 @@ function updateSceneMotion(scene, ts) {
 
     const childIds = Array.isArray(node.child_ids) ? node.child_ids : [];
     if (!childIds.length) continue;
+    const spinSpeed = Number(node.spin_speed || 0);
+    const spinKey = String(node.id || '');
+    const storedSpin = Number(moduleSpinRuntimeById[spinKey]);
+    if (Number.isFinite(storedSpin)) {
+      node.spin_runtime = storedSpin;
+      node.spin_target = storedSpin;
+    }
     if (!Number.isFinite(node.spin_runtime)) {
-      node.spin_runtime = Number(node.spin_base || 0);
+      let seededSpin = Number(node.spin_base || 0) + (Number(ts || 0) * spinSpeed);
+      if (Math.abs(seededSpin) > 1e6) seededSpin %= (Math.PI * 2);
+      node.spin_runtime = seededSpin;
     }
     if (!Number.isFinite(node.spin_target)) {
       node.spin_target = Number(node.spin_runtime || node.spin_base || 0);
     }
-    const spinSpeed = Number(node.spin_speed || 0);
-    const freezeSpin = selectedId && selectedId === String(node.id || '');
+    const freezeSpin = Boolean(
+      (selectedType === 'module' && selectedId && selectedId === String(node.id || ''))
+      || (focusType === 'module' && focusId && focusId === String(node.id || ''))
+      || (selectedSubmoduleParentId && selectedSubmoduleParentId === String(node.id || ''))
+      || (focusSubmoduleParentId && focusSubmoduleParentId === String(node.id || ''))
+      || (selectedSubfractalModuleId && selectedSubfractalModuleId === String(node.id || ''))
+    );
     let spinAngle = Number(node.spin_runtime || node.spin_base || 0);
     if (freezeSpin) {
       node.spin_locked = true;
@@ -1325,30 +1631,27 @@ function updateSceneMotion(scene, ts) {
       node.spin_target = spinAngle;
     } else if (spinSpeed !== 0) {
       node.spin_locked = false;
-      const spinLerpGain = clamp(Number(profile.spin_lerp_gain || 0.5), 0.08, 1);
       const spinStepDt = dtMs / spinSubsteps;
       for (let step = 0; step < spinSubsteps; step += 1) {
-        node.spin_target += spinStepDt * spinSpeed;
-        if (Math.abs(node.spin_target) > 1e6) {
-          node.spin_target = node.spin_target % (Math.PI * 2);
-        }
-        const spinAlpha = clamp((spinStepDt / 16.7) * spinLerpGain, 0.018, 1);
-        node.spin_runtime += (node.spin_target - node.spin_runtime) * spinAlpha;
+        node.spin_runtime += spinStepDt * spinSpeed;
         if (Math.abs(node.spin_runtime) > 1e6) {
           node.spin_runtime = node.spin_runtime % (Math.PI * 2);
         }
       }
+      node.spin_target = Number(node.spin_runtime || 0);
       spinAngle = Number(node.spin_runtime || 0);
     }
     node.spin_angle = spinAngle;
+    moduleSpinRuntimeById[spinKey] = Number(spinAngle || 0);
     for (const childId of childIds) {
       const sub = nodeById[String(childId || '')];
       if (!sub) continue;
       const localStart = Number(sub.local_shell_start || 0);
       const localEnd = Number(sub.local_shell_end || 0);
       const shellMid = Number(sub.shell_mid || ((Number(sub.shell_inner || 0) + Number(sub.shell_outer || 0)) * 0.5));
-      const start = orbitAngle + localStart + spinAngle;
-      const end = orbitAngle + localEnd + spinAngle;
+      const moduleOrientation = Number(node.base_angle || 0);
+      const start = moduleOrientation + localStart + spinAngle;
+      const end = moduleOrientation + localEnd + spinAngle;
       const mid = (start + end) * 0.5;
       sub.parent_x = node.x;
       sub.parent_y = node.y;
@@ -1361,13 +1664,36 @@ function updateSceneMotion(scene, ts) {
     }
   }
 
+  const selectedSubfractal = validateSelectedSubfractal(scene);
+  const selectedSubmoduleId = selectedType === 'submodule' ? String(selectedNode && selectedNode.id || '') : '';
+  const selectedModuleId = selectedType === 'submodule' ? String(selectedNode && selectedNode.parent_id || '') : '';
+  const selectedSubfractalAnchor = selectedSubmoduleId && selectedSubfractal
+    ? subfractalAnchorForSelection(selectedNode, selectedSubfractal)
+    : null;
+
   for (const link of links) {
     const fromId = String(link && link.from_id || '');
     const toId = String(link && link.to_id || '');
     const from = nodeById[fromId];
     const to = nodeById[toId];
     if (!from || !to) continue;
-    setLinkGeometry(link, from, to, center);
+    let fromNode = from;
+    let toNode = to;
+    if (selectedSubmoduleId) {
+      if (selectedSubfractalAnchor) {
+        if (fromId === selectedSubmoduleId || (selectedModuleId && fromId === selectedModuleId)) {
+          fromNode = nodeWithAnchor(fromNode, selectedSubfractalAnchor);
+        }
+        if (toId === selectedSubmoduleId || (selectedModuleId && toId === selectedModuleId)) {
+          toNode = nodeWithAnchor(toNode, selectedSubfractalAnchor);
+        }
+      } else {
+        const subAnchor = { x: Number(selectedNode && selectedNode.x || 0), y: Number(selectedNode && selectedNode.y || 0) };
+        if (selectedModuleId && fromId === selectedModuleId) fromNode = nodeWithAnchor(fromNode, subAnchor);
+        if (selectedModuleId && toId === selectedModuleId) toNode = nodeWithAnchor(toNode, subAnchor);
+      }
+    }
+    setLinkGeometry(link, fromNode, toNode, center);
   }
 }
 
@@ -1677,8 +2003,9 @@ function buildScene(payload) {
     const layerId = String(layer.id || `layer:${li}`);
     const layerRel = String(layer.rel || layer.key || layerId);
     const layerKey = String(layer.key || layer.name || layerRel || '').trim().toLowerCase();
-    const layerOrbitDirection = (li % 2 === 0) ? 1 : -1;
-    const layerOrbitSpeed = layerOrbitDirection * (0.000018 + (li * 0.000001));
+    const orbitSeed = stableHash(`${layerId}|orbit`);
+    const layerOrbitDirection = (orbitSeed % 2 === 0) ? 1 : -1;
+    const layerOrbitSpeed = layerOrbitDirection * (0.000018 + ((orbitSeed % 6) * 0.000001));
     const layerIntegrityAlert = integrityAlert && (layerKey === 'systems' || layerRel.toLowerCase().includes('systems'));
     const layerNode = {
       id: layerId,
@@ -1785,6 +2112,21 @@ function buildScene(payload) {
         const sy = y + (Math.sin(mid) * shellMid);
         const subId = String(sub.id || `${modId}/s${si}`);
         const subRel = String(sub.rel || `${modRel}/${String(sub.name || subId)}`);
+        const subfolderRows = Array.isArray(sub && sub.subfolders) ? sub.subfolders : [];
+        const subfractalChildren = [];
+        for (let ci = 0; ci < subfolderRows.length; ci += 1) {
+          const child = subfolderRows[ci] && typeof subfolderRows[ci] === 'object'
+            ? subfolderRows[ci]
+            : {};
+          const childName = String(child.name || '').trim();
+          if (!childName) continue;
+          const childPath = String(child.rel || `${subRel}/${childName}`).trim();
+          subfractalChildren.push({
+            id: `${subId}/child:${ci}:${childName}`,
+            name: childName,
+            rel: childPath
+          });
+        }
         const subErrorHint = computeNodeErrorHint(subId, subRel, sub.name, moduleNode.name);
         const subIntegrityAlert = integrityAlert && hasIntegrityPathMatch(subRel, integrityFiles);
         const subErrorActive = subIntegrityAlert || hasActiveErrorState(sub, subErrorHint, errorSignal);
@@ -1807,6 +2149,8 @@ function buildScene(payload) {
           local_shell_end: localEnd,
           shell_start: start,
           shell_end: end,
+          subfractal_children: subfractalChildren,
+          subfractal_count: subfractalChildren.length,
           activity: clamp(sub.activity, 0, 1),
           error_hint: subErrorHint,
           error_state_active: subErrorActive,
@@ -2243,18 +2587,32 @@ function applySelectionFocus(rebuild = true) {
   const lid = String(state.selected_link && state.selected_link.id || '').trim();
   if (!state.scene) {
     state.focus = null;
+    clearSelectedSubfractal();
     if (rebuild) syncParticlePool(true);
     return;
   }
+  validateSelectedSubfractal(state.scene);
   if (lid) {
     const link = state.scene.link_by_id && state.scene.link_by_id[lid]
       ? state.scene.link_by_id[lid]
       : null;
     if (link) {
-      state.focus = {
-        nodes: new Set([String(link.from_id || ''), String(link.to_id || '')]),
-        links: new Set([String(link.id || '')])
-      };
+      const mapOwnerId = state.camera && state.camera.map_mode
+        ? String(state.camera.map_owner_id || '').trim()
+        : '';
+      const mapOwnerNode = mapOwnerId && state.scene.node_by_id
+        ? state.scene.node_by_id[mapOwnerId]
+        : null;
+      const mapOwnerType = String(mapOwnerNode && mapOwnerNode.type || '').toLowerCase();
+      if (mapOwnerId && (mapOwnerType === 'module' || mapOwnerType === 'submodule')) {
+        state.focus = computeSelectionFocus(state.scene, mapOwnerId);
+      }
+      if (!state.focus) {
+        state.focus = {
+          nodes: new Set([String(link.from_id || ''), String(link.to_id || '')]),
+          links: new Set([String(link.id || '')])
+        };
+      }
     } else {
       state.selected_link = null;
       state.focus = null;
@@ -2276,11 +2634,14 @@ function applySelectionFocus(rebuild = true) {
 }
 
 function setPayload(payload) {
+  const prevScene = state.scene;
   state.payload = payload;
   state.incidents = payload && payload.incidents && typeof payload.incidents === 'object'
     ? payload.incidents
     : { integrity: null };
-  state.scene = buildScene(payload);
+  const nextScene = buildScene(payload);
+  registerResolvedFlashes(prevScene, nextScene, performance.now());
+  state.scene = nextScene;
   if (state.scene) primeShellIntro(state.scene, performance.now());
   clampCameraPanInPlace();
   applySelectionFocus(false);
@@ -2354,24 +2715,31 @@ function drawLayerRing(layerNode, ts) {
   const alphaScale = 0.25 + (introScale * 0.75);
   const primaryAlpha = (0.2 + (layerNode.activity * 0.22)) * alphaScale;
   const secondaryAlpha = 0.11;
+  const resolvedAlpha = resolvedFlashAlpha('node', String(layerNode && layerNode.id || ''), ts);
   const integrityPrimary = `rgba(255,82,82,${clamp(0.28 + (primaryAlpha * 0.92), 0.2, 0.92)})`;
   const integritySecondary = `rgba(255,112,112,${clamp(0.2 + (secondaryAlpha * 1.25), 0.16, 0.84)})`;
-  const stroke = isSelected
-    ? softHighlightColor(Math.min(0.92, primaryAlpha + 0.11))
-    : integrityAlert
-      ? integrityPrimary
-    : colorFromActivity(layerNode.activity, primaryAlpha);
+  const resolvedPrimary = `rgba(122,255,166,${clamp(0.3 + (resolvedAlpha * 0.62), 0.16, 0.96)})`;
+  const resolvedSecondary = `rgba(154,255,188,${clamp(0.22 + (resolvedAlpha * 0.46), 0.12, 0.86)})`;
+  const stroke = resolvedAlpha > 0
+    ? resolvedPrimary
+    : (isSelected
+      ? softHighlightColor(Math.min(0.92, primaryAlpha + 0.11))
+      : integrityAlert
+        ? integrityPrimary
+      : colorFromActivity(layerNode.activity, primaryAlpha));
   ctx.strokeStyle = stroke;
   ctx.lineWidth = Math.max(0.8, layerNode.ring_width * 0.08 * (0.32 + (introScale * 0.68)));
   ctx.beginPath();
   ctx.arc(layerNode.x, layerNode.y, radius, 0, Math.PI * 2);
   ctx.stroke();
 
-  ctx.strokeStyle = isSelected
-    ? softHighlightColor(Math.min(0.8, secondaryAlpha + 0.22))
-    : integrityAlert
-      ? integritySecondary
-    : colorFromActivity(layerNode.activity, secondaryAlpha);
+  ctx.strokeStyle = resolvedAlpha > 0
+    ? resolvedSecondary
+    : (isSelected
+      ? softHighlightColor(Math.min(0.8, secondaryAlpha + 0.22))
+      : integrityAlert
+        ? integritySecondary
+      : colorFromActivity(layerNode.activity, secondaryAlpha));
   ctx.lineWidth = Math.max(0.7, layerNode.ring_width * 0.03 * (0.35 + (introScale * 0.65)));
   for (let i = 0; i < 24; i += 1) {
     const a0 = (i / 24) * Math.PI * 2;
@@ -2406,16 +2774,29 @@ function drawSpineHub(scene, ts) {
     : 'rgba(110, 203, 255, 0.34)';
   const alertPrimary = spineSelected ? 'rgba(255,236,236,0.9)' : 'rgba(255,86,86,0.86)';
   const alertSecondary = spineSelected ? 'rgba(255,226,226,0.58)' : 'rgba(255,104,104,0.46)';
-  ctx.strokeStyle = integrityAlert ? alertPrimary : normalPrimary;
+  const resolvedAlpha = resolvedFlashAlpha('node', SPINE_NODE_ID, ts);
+  const resolvedPrimary = `rgba(122,255,166,${clamp(0.34 + (resolvedAlpha * 0.62), 0.14, 0.98)})`;
+  const resolvedSecondary = `rgba(156,255,190,${clamp(0.24 + (resolvedAlpha * 0.44), 0.12, 0.88)})`;
+  ctx.strokeStyle = resolvedAlpha > 0
+    ? resolvedPrimary
+    : (integrityAlert ? alertPrimary : normalPrimary);
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(c.x, c.y, base, 0, Math.PI * 2);
   ctx.stroke();
-  ctx.strokeStyle = integrityAlert ? alertSecondary : normalSecondary;
+  ctx.strokeStyle = resolvedAlpha > 0
+    ? resolvedSecondary
+    : (integrityAlert ? alertSecondary : normalSecondary);
   ctx.beginPath();
   ctx.arc(c.x, c.y, base + 7, 0, Math.PI * 2);
   ctx.stroke();
-  if (integrityAlert) {
+  if (resolvedAlpha > 0) {
+    const settledPulse = 0.16 + (0.08 * (0.5 + Math.sin(ts * 0.0032)));
+    ctx.fillStyle = `rgba(130,255,176,${settledPulse + (resolvedAlpha * 0.2)})`;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, base + 3.2, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (integrityAlert) {
     const alarmPulse = 0.32 + (0.16 * (0.5 + Math.sin(ts * 0.004)));
     ctx.fillStyle = `rgba(255,76,76,${alarmPulse})`;
     ctx.beginPath();
@@ -2550,30 +2931,37 @@ function drawModuleNode(node, ts) {
   const introScale = nodeIntroScale(node);
   if (introScale <= 0.02) return;
   const errorActive = Boolean(node && node.error_state_active === true);
+  const resolvedAlpha = resolvedFlashAlpha('node', String(node && node.id || ''), ts);
   const glow = 0.17 + (node.activity * 0.35);
   const pulse = 0.88 + (Math.sin(ts * 0.001 + node.x * 0.01) * 0.1);
   const r = node.radius * pulse;
   const spinOffset = Number(node.fractal_count || 0) > 0 ? Number(node.spin_angle || 0) * 0.42 : 0;
   ctx.save();
   ctx.globalAlpha *= (0.2 + (introScale * 0.8));
-  ctx.strokeStyle = isSelected
-    ? softHighlightColor(0.9)
-    : (errorActive ? 'rgba(255,96,96,0.92)' : colorFromActivity(node.activity, 0.65));
+  ctx.strokeStyle = resolvedAlpha > 0
+    ? `rgba(122,255,166,${clamp(0.34 + (resolvedAlpha * 0.56), 0.18, 0.96)})`
+    : (isSelected
+      ? softHighlightColor(0.9)
+      : (errorActive ? 'rgba(255,96,96,0.92)' : colorFromActivity(node.activity, 0.65)));
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
   ctx.stroke();
 
-  ctx.fillStyle = isSelected
-    ? softHighlightColor(Math.min(0.34, 0.2 + (glow * 0.16)))
-    : (errorActive ? 'rgba(255,88,88,0.22)' : colorFromActivity(node.activity, glow * 0.2));
+  ctx.fillStyle = resolvedAlpha > 0
+    ? `rgba(132,255,176,${clamp(0.18 + (resolvedAlpha * 0.24), 0.12, 0.52)})`
+    : (isSelected
+      ? softHighlightColor(Math.min(0.34, 0.2 + (glow * 0.16)))
+      : (errorActive ? 'rgba(255,88,88,0.22)' : colorFromActivity(node.activity, glow * 0.2)));
   ctx.beginPath();
   ctx.arc(node.x, node.y, r * 0.72, 0, Math.PI * 2);
   ctx.fill();
 
-  ctx.strokeStyle = isSelected
-    ? softHighlightColor(0.74)
-    : (errorActive ? 'rgba(255,132,132,0.74)' : colorFromActivity(node.activity, 0.36));
+  ctx.strokeStyle = resolvedAlpha > 0
+    ? `rgba(154,255,188,${clamp(0.24 + (resolvedAlpha * 0.44), 0.14, 0.84)})`
+    : (isSelected
+      ? softHighlightColor(0.74)
+      : (errorActive ? 'rgba(255,132,132,0.74)' : colorFromActivity(node.activity, 0.36)));
   ctx.lineWidth = 1;
   for (let i = 0; i < 3; i += 1) {
     const start = ((i / 3) * Math.PI * 2) + (ts * 0.00016) + (stableHash(node.id) % 10) * 0.07 + spinOffset;
@@ -2593,19 +2981,31 @@ function drawSubmoduleNode(node) {
   const isSelected = selectedId
     && selectedId === String(node.id || '')
     && (!selectedType || selectedType === 'submodule');
+  const subfractalChildren = subfractalChildrenForNode(node);
+  const hasSubfractals = subfractalChildren.length > 0;
+  const selectedSubfractal = isSelected
+    && state.selected_subfractal
+    && String(state.selected_subfractal.parent_id || '') === String(node.id || '')
+    ? state.selected_subfractal
+    : null;
   const errorActive = Boolean(node && node.error_state_active === true);
+  const resolvedAlpha = resolvedFlashAlpha('node', String(node && node.id || ''));
   const introScale = nodeIntroScale(node);
   if (introScale <= 0.02) return;
   ctx.save();
   ctx.globalAlpha *= (0.18 + (introScale * 0.82));
-  if (state.quality_tier === 'low') {
+  if (state.quality_tier === 'low' && !(isSelected && hasSubfractals)) {
     const s = Math.max(1.4, node.radius * 1.45);
-    ctx.fillStyle = errorActive
-      ? 'rgba(255,72,72,0.92)'
-      : colorFromActivity(node.activity, 0.82);
+    ctx.fillStyle = resolvedAlpha > 0
+      ? `rgba(124,255,170,${clamp(0.54 + (resolvedAlpha * 0.34), 0.24, 0.96)})`
+      : (errorActive
+        ? 'rgba(255,72,72,0.92)'
+        : colorFromActivity(node.activity, 0.82));
     ctx.fillRect(node.x - s, node.y - s, s * 2, s * 2);
-    if (isSelected || errorActive) {
-      ctx.strokeStyle = softHighlightColor(0.88);
+    if (resolvedAlpha > 0 || isSelected || errorActive) {
+      ctx.strokeStyle = resolvedAlpha > 0
+        ? `rgba(168,255,198,${clamp(0.36 + (resolvedAlpha * 0.54), 0.2, 0.94)})`
+        : softHighlightColor(0.88);
       ctx.lineWidth = 1;
       ctx.strokeRect(node.x - s, node.y - s, s * 2, s * 2);
     }
@@ -2618,13 +3018,17 @@ function drawSubmoduleNode(node) {
   const outer = Math.max(inner + 1, Number(node.shell_outer || (node.radius * 3.1)));
   const start = Number(node.shell_start || 0);
   const end = Number(node.shell_end || (Math.PI * 0.4));
-  ctx.fillStyle = errorActive
-    ? `rgba(255,68,68,${0.18 + (node.activity * 0.24)})`
-    : colorFromActivity(node.activity, 0.16 + (node.activity * 0.22));
-  ctx.strokeStyle = isSelected
-    ? softHighlightColor(0.9)
-    : (errorActive ? 'rgba(255,102,102,0.95)' : colorFromActivity(node.activity, 0.68));
-  ctx.lineWidth = 1;
+  ctx.fillStyle = resolvedAlpha > 0
+    ? `rgba(132,255,176,${clamp(0.18 + (resolvedAlpha * 0.24), 0.1, 0.52)})`
+    : (errorActive
+      ? `rgba(255,68,68,${0.18 + (node.activity * 0.24)})`
+      : colorFromActivity(node.activity, 0.16 + (node.activity * 0.22)));
+  ctx.strokeStyle = resolvedAlpha > 0
+    ? `rgba(122,255,166,${clamp(0.36 + (resolvedAlpha * 0.56), 0.18, 0.96)})`
+    : (isSelected
+      ? softHighlightColor(0.9)
+      : (errorActive ? 'rgba(255,102,102,0.95)' : colorFromActivity(node.activity, 0.68)));
+  ctx.lineWidth = (isSelected && hasSubfractals) ? 0.72 : 1;
   ctx.beginPath();
   ctx.arc(px, py, outer, start, end);
   ctx.arc(px, py, inner, end, start, true);
@@ -2632,11 +3036,40 @@ function drawSubmoduleNode(node) {
   ctx.fill();
   ctx.stroke();
 
+  if (isSelected && hasSubfractals) {
+    const count = subfractalChildren.length;
+    const selectedIdxRaw = selectedSubfractal
+      ? Number(selectedSubfractal.index || 0)
+      : -1;
+    const selectedIdx = clamp(Math.floor(selectedIdxRaw), 0, Math.max(0, count - 1));
+    if (selectedSubfractal && selectedIdx >= 0 && selectedIdx < count) {
+      const segStart = angleAtArcFraction(start, end, selectedIdx / count);
+      const segEnd = angleAtArcFraction(start, end, (selectedIdx + 1) / count);
+      ctx.fillStyle = softHighlightColor(0.15);
+      ctx.beginPath();
+      ctx.arc(px, py, outer, segStart, segEnd);
+      ctx.arc(px, py, inner, segEnd, segStart, true);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.strokeStyle = softHighlightColor(0.48);
+    ctx.lineWidth = 0.32;
+    for (let i = 1; i < count; i += 1) {
+      const a = angleAtArcFraction(start, end, i / count);
+      ctx.beginPath();
+      ctx.moveTo(px + (Math.cos(a) * inner), py + (Math.sin(a) * inner));
+      ctx.lineTo(px + (Math.cos(a) * outer), py + (Math.sin(a) * outer));
+      ctx.stroke();
+    }
+  }
+
   if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
     const step = (end - start) / 3;
-    ctx.strokeStyle = isSelected
-      ? softHighlightColor(0.7)
-      : (errorActive ? 'rgba(255,122,122,0.85)' : colorFromActivity(node.activity, 0.4));
+    ctx.strokeStyle = resolvedAlpha > 0
+      ? `rgba(154,255,188,${clamp(0.24 + (resolvedAlpha * 0.44), 0.14, 0.86)})`
+      : (isSelected
+        ? softHighlightColor(0.7)
+        : (errorActive ? 'rgba(255,122,122,0.85)' : colorFromActivity(node.activity, 0.4)));
     ctx.lineWidth = 0.8;
     for (let i = 1; i <= 2; i += 1) {
       const a = start + (step * i);
@@ -2691,8 +3124,11 @@ function drawLinks(scene) {
     const kind = String(link.kind || '').toLowerCase();
     if (kind === 'fractal') {
       const alpha = clamp((0.2 + (Number(link.activity || 0) * 0.35)) * (0.2 + introScale * 0.8), 0.12, 0.8);
+      const resolvedAlpha = resolvedFlashAlpha('link', String(link && link.id || ''), nowTs);
       ctx.shadowBlur = 0;
-      ctx.strokeStyle = `rgba(196,232,255,${alpha})`;
+      ctx.strokeStyle = resolvedAlpha > 0
+        ? `rgba(136,255,180,${clamp(alpha + (resolvedAlpha * 0.35), 0.14, 0.96)})`
+        : `rgba(196,232,255,${alpha})`;
       ctx.lineWidth = (0.7 + (Number(link.activity || 0) * 0.95)) * (0.35 + (introScale * 0.65));
       ctx.beginPath();
       ctx.moveTo(link.p0.x, link.p0.y);
@@ -2704,6 +3140,7 @@ function drawLinks(scene) {
     const errActive = errW > 0.045;
     const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
     const blockedActive = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
+    const resolvedAlpha = resolvedFlashAlpha('link', String(link && link.id || ''), nowTs);
     const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78));
     const baseLineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
     if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
@@ -2717,7 +3154,10 @@ function drawLinks(scene) {
     } else {
       ctx.shadowBlur = 0;
     }
-    if (errActive) {
+    if (resolvedAlpha > 0) {
+      ctx.strokeStyle = `rgba(128,255,174,${clamp(0.2 + alpha + (resolvedAlpha * 0.42), 0.12, 0.98)})`;
+      ctx.lineWidth = baseLineWidth;
+    } else if (errActive) {
       ctx.strokeStyle = `rgba(255,72,72,${clamp(0.14 + alpha + (errW * 0.55), 0.08, 0.96)})`;
       ctx.lineWidth = baseLineWidth;
     } else {
@@ -2758,6 +3198,23 @@ function drawLinks(scene) {
   ctx.shadowBlur = 0;
 }
 
+function isModuleDepthPacketView(scene) {
+  if (!scene || !scene.node_by_id) return false;
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selectedRef && selectedRef.id || '').trim();
+  const selectedNode = selectedId ? scene.node_by_id[selectedId] : null;
+  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
+  if (selectedType === 'module' || selectedType === 'submodule') return true;
+  const focusId = state.camera && state.camera.focus_mode
+    ? String(state.camera.focus_target_id || '').trim()
+    : '';
+  if (!focusId) return false;
+  const focusNode = scene.node_by_id[focusId];
+  const focusType = String((focusNode && focusNode.type) || '').toLowerCase();
+  return focusType === 'module' || focusType === 'submodule';
+}
+
 function drawParticles(dt) {
   const scene = state.scene;
   if (!scene || !state.particles.length) return;
@@ -2776,6 +3233,7 @@ function drawParticles(dt) {
     ? scene.links.filter((link) => focusLinks.has(String(link && link.id || '')))
     : scene.links;
   const packetRange = packetMetricRange(linksForSizing);
+  const forceMinPacketSize = isModuleDepthPacketView(scene);
 
   const linkIntroScaleById = Object.create(null);
   for (const link of scene.links) {
@@ -2796,7 +3254,9 @@ function drawParticles(dt) {
       p.trail.length = 0;
       continue;
     }
-    p.radius = packetRadiusForLink(link, packetRange);
+    p.radius = forceMinPacketSize
+      ? PACKET_RADIUS_FLOOR
+      : packetRadiusForLink(link, packetRange);
     const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
     const blockedFlow = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
     const moveGain = blockedFlow ? (0.14 + ((1 - blockedRatio) * 0.22)) : 1;
@@ -3060,6 +3520,119 @@ function renderIncidentBanner() {
   badge.classList.add('show', severityClass);
 }
 
+function codeSelectionTarget(scene) {
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedSubfractalRef = state.selected_subfractal && typeof state.selected_subfractal === 'object'
+    ? state.selected_subfractal
+    : null;
+  const selectedLinkRef = state.selected_link && typeof state.selected_link === 'object' ? state.selected_link : null;
+  const selectedId = String(selectedRef && selectedRef.id || '').trim();
+  const selectedType = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedPath = String(selectedRef && selectedRef.path || '').trim();
+  const selectedSubfractalId = String(selectedSubfractalRef && selectedSubfractalRef.id || '').trim();
+  const selectedSubfractalPath = String(selectedSubfractalRef && selectedSubfractalRef.path || '').trim();
+  const selectedLinkId = String(selectedLinkRef && selectedLinkRef.id || '').trim();
+  const selectedLinkPath = String(selectedLinkRef && selectedLinkRef.path || '').trim();
+  let rawPath = '';
+  let key = '';
+
+  if (selectedSubfractalId) {
+    rawPath = selectedSubfractalPath;
+    key = `subfractal:${selectedSubfractalId}`;
+  } else if (selectedId) {
+    rawPath = selectedPath;
+    key = `node:${selectedType || 'unknown'}:${selectedId}`;
+  } else if (selectedLinkId) {
+    rawPath = selectedLinkPath;
+    key = `link:${selectedLinkId}`;
+  } else {
+    rawPath = WORKSPACE_ROOT_PATH;
+    key = 'root:system';
+  }
+
+  const normalizedPath = rawPath.includes(' -> ') ? '' : rawPath;
+  const pathKey = normalizedPath || '__none__';
+  return {
+    selection_key: `${key}|${pathKey}`,
+    path: normalizedPath
+  };
+}
+
+function applyCodePreviewPayload(target, payload) {
+  const view = state.code_preview;
+  const src = payload && typeof payload === 'object' ? payload : {};
+  const isFile = src.ok === true && src.is_file === true;
+  const isDir = src.ok === true && src.is_dir === true;
+  view.selection_key = String(target.selection_key || '');
+  view.path = String(target.path || '');
+  view.loading = false;
+  view.error = src.ok === true ? '' : String(src.error || 'code_load_failed');
+  view.is_file = isFile;
+  view.is_dir = isDir;
+  view.truncated = isFile && src.truncated === true;
+  view.content = isFile ? String(src.content || '') : '';
+}
+
+function ensureCodePreview(scene) {
+  if (state.preview_tab !== 'code') return;
+  const view = state.code_preview;
+  const target = codeSelectionTarget(scene);
+  if (String(view.selection_key || '') === String(target.selection_key || '')) return;
+
+  const cache = state.code_preview_cache && typeof state.code_preview_cache === 'object'
+    ? state.code_preview_cache
+    : (state.code_preview_cache = Object.create(null));
+  view.selection_key = String(target.selection_key || '');
+  view.path = String(target.path || '');
+  view.is_file = false;
+  view.is_dir = false;
+  view.truncated = false;
+  view.error = '';
+  view.content = '';
+
+  if (!target.path) {
+    view.loading = false;
+    return;
+  }
+
+  const cacheKey = String(target.path || '');
+  if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) {
+    applyCodePreviewPayload(target, cache[cacheKey]);
+    return;
+  }
+
+  view.loading = true;
+  const requestId = Number(view.request_id || 0) + 1;
+  view.request_id = requestId;
+  fetchCodePreview(target.path)
+    .then((payload) => {
+      if (Number(state.code_preview.request_id || 0) !== requestId) return;
+      cache[cacheKey] = payload;
+      applyCodePreviewPayload(target, payload);
+      renderStats();
+    })
+    .catch((err) => {
+      if (Number(state.code_preview.request_id || 0) !== requestId) return;
+      state.code_preview.loading = false;
+      state.code_preview.error = String(err && err.message || err || 'code_load_failed');
+      state.code_preview.is_file = false;
+      state.code_preview.is_dir = false;
+      state.code_preview.truncated = false;
+      state.code_preview.content = '';
+      renderStats();
+    });
+}
+
+function setPreviewTab(tab) {
+  const next = tab === 'code' ? 'code' : 'preview';
+  if (state.preview_tab === next) return;
+  state.preview_tab = next;
+  if (next === 'code') {
+    state.code_preview.selection_key = '';
+  }
+  renderStats();
+}
+
 function renderStats() {
   const payload = state.payload || {};
   const integrityIncident = normalizeIntegrityIncident(payload);
@@ -3083,7 +3656,15 @@ function renderStats() {
   const selectedLink = selectedLinkId && scene && scene.link_by_id
     ? scene.link_by_id[selectedLinkId]
     : null;
+  const selectedSubfractal = scene ? validateSelectedSubfractal(scene) : null;
   const titleEl = byId('statsTitle');
+  const statsGridEl = byId('statsGrid');
+  const codePaneEl = byId('codePane');
+  const previewTabBtn = byId('tabPreview');
+  const codeTabBtn = byId('tabCode');
+  const showingCode = state.preview_tab === 'code';
+  if (previewTabBtn) previewTabBtn.classList.toggle('active', !showingCode);
+  if (codeTabBtn) codeTabBtn.classList.toggle('active', showingCode);
   let rows = [];
   const selectedIntegrityRows = integrityRowsForSelection(integrityIncident, selectedType, selectedNode);
   const selectedNodeErrorRows = nodeErrorRowsForSelection(selectedNode, selectedIntegrityRows, errorSignal);
@@ -3285,6 +3866,11 @@ function renderStats() {
     if (!processRows.length) rows.push(['Process/none', '0']);
   } else if (selectedType === 'submodule' && scene && Array.isArray(scene.nodes) && Array.isArray(scene.links)) {
     const submoduleId = String(selectedNode.id || '');
+    const subfractalActive = selectedSubfractal
+      && String(selectedSubfractal.parent_id || '') === submoduleId
+      ? selectedSubfractal
+      : null;
+    const subfractalCount = subfractalChildrenForNode(selectedNode).length;
     const moduleId = String(selectedNode.parent_id || '');
     const moduleNode = moduleId && scene.node_by_id ? scene.node_by_id[moduleId] : null;
     const layerId = String(moduleNode && moduleNode.parent_id || '');
@@ -3308,9 +3894,12 @@ function renderStats() {
     const blockStats = blockedFlowStats(relevantLinks);
     if (titleEl) titleEl.textContent = 'Preview Pane';
     rows = [
-      ['Mode', 'Fractal Process Overview'],
+      ['Mode', subfractalActive ? 'Subfractal Process Overview' : 'Fractal Process Overview'],
       ['Fractal', String(selectedNode.name || submoduleId)],
       ['Fractal Path', String(selectedNode.rel || submoduleId)],
+      ['Subfractals', fmtNum(subfractalCount)],
+      ['Selected Subfractal', subfractalActive ? String(subfractalActive.name || subfractalActive.id || 'n/a') : 'none'],
+      ['Selected Path', subfractalActive ? String(subfractalActive.path || 'n/a') : 'n/a'],
       ['Module', String((moduleNode && moduleNode.name) || moduleId || 'n/a')],
       ['Shell', String((layerNode && layerNode.name) || layerId || 'n/a')],
       ['Direct Links', fmtNum(relevantLinks.length)],
@@ -3357,7 +3946,7 @@ function renderStats() {
   } else if (integrityIncident.last_reseal_ts) {
     rows.push(['Last Reseal', new Date(integrityIncident.last_reseal_ts).toLocaleString()]);
   }
-  byId('statsGrid').innerHTML = rows.map(([k, v]) => {
+  const rowsHtml = rows.map(([k, v]) => {
     const errorRow = isPreviewErrorRow(k);
     const warningRow = !errorRow && isPreviewWarningRow(k, v);
     const itemClass = errorRow
@@ -3368,6 +3957,40 @@ function renderStats() {
       : (warningRow ? 'v v-warning' : 'v');
     return `<div class="${itemClass}"><div class="k">${escapeHtml(String(k))}</div><div class="${valueClass}">${escapeHtml(String(v))}</div></div>`;
   }).join('');
+  if (showingCode) {
+    ensureCodePreview(scene);
+    if (statsGridEl) statsGridEl.style.display = 'none';
+    if (codePaneEl) {
+      codePaneEl.style.display = 'block';
+      const view = state.code_preview && typeof state.code_preview === 'object'
+        ? state.code_preview
+        : {};
+      let codeBody = '';
+      if (view.loading === true) {
+        codeBody = '// Loading code...';
+      } else if (String(view.error || '').trim()) {
+        codeBody = `// ${String(view.error || 'code_load_failed')}`;
+      } else if (view.is_file === true) {
+        codeBody = String(view.content || '');
+        if (view.truncated === true) {
+          codeBody += '\n\n// [truncated preview]';
+        }
+      } else {
+        codeBody = '';
+      }
+      codePaneEl.textContent = codeBody;
+    }
+    if (titleEl) titleEl.textContent = 'Code';
+  } else {
+    if (statsGridEl) {
+      statsGridEl.style.display = 'grid';
+      statsGridEl.innerHTML = rowsHtml;
+    }
+    if (codePaneEl) {
+      codePaneEl.style.display = 'none';
+      codePaneEl.textContent = '';
+    }
+  }
   const pulseSuffix = state.spine_event_top
     ? ` | spine ${fmtNum(state.spine_event_count)} evt (${state.spine_event_top})`
     : ` | spine ${fmtNum(state.spine_event_count)} evt`;
@@ -3381,6 +4004,18 @@ function renderStats() {
 
 function renderSelectionTag() {
   const selectedTag = byId('selectedTag');
+  const selectedSubfractal = state.selected_subfractal && typeof state.selected_subfractal === 'object'
+    ? state.selected_subfractal
+    : null;
+  if (selectedSubfractal) {
+    const name = escapeHtml(String(selectedSubfractal.name || 'Subfractal'));
+    const pth = escapeHtml(String(selectedSubfractal.path || ''));
+    selectedTag.innerHTML = pth
+      ? `<div class="selName">${name}</div><div class="selPath">${pth}</div>`
+      : `<div class="selName">${name}</div>`;
+    selectedTag.classList.add('show');
+    return;
+  }
   if (state.selected) {
     const name = escapeHtml(String(state.selected.name || 'Unknown'));
     const pth = escapeHtml(String(state.selected.path || ''));
@@ -3403,17 +4038,268 @@ function renderSelectionTag() {
   selectedTag.classList.add('show');
 }
 
+function nodeMatchesActiveFocusScope(scene, node) {
+  if (!scene || !scene.node_by_id || !node) return false;
+  const cam = state.camera && typeof state.camera === 'object' ? state.camera : null;
+  if (!cam || !cam.focus_mode) return true;
+  const focusId = String(cam.focus_target_id || '').trim();
+  if (!focusId) return true;
+  const focusNode = scene.node_by_id[focusId];
+  if (!focusNode) return true;
+  const focusType = String(focusNode.type || '').toLowerCase();
+  const nodeType = String(node.type || '').toLowerCase();
+  const nodeId = String(node.id || '');
+  if (nodeType === 'spine') return true;
+  if (focusType === 'layer') {
+    if (nodeType === 'layer') return nodeId === focusId;
+    if (nodeType === 'module') return String(node.parent_id || '') === focusId;
+    if (nodeType === 'submodule') {
+      const parentModule = scene.node_by_id[String(node.parent_id || '')];
+      return String(parentModule && parentModule.parent_id || '') === focusId;
+    }
+    return false;
+  }
+  if (focusType === 'module') {
+    const focusLayerId = String(focusNode.parent_id || '');
+    if (nodeType === 'module') return String(node.parent_id || '') === focusLayerId;
+    if (nodeType === 'submodule') return String(node.parent_id || '') === focusId;
+    if (nodeType === 'layer') {
+      const focusParent = scene.node_by_id[String(focusNode.parent_id || '')];
+      return Boolean(focusParent && String(focusParent.id || '') === nodeId);
+    }
+    return false;
+  }
+  if (focusType === 'submodule') {
+    const focusParentId = String(focusNode.parent_id || '');
+    const focusParent = focusParentId ? scene.node_by_id[focusParentId] : null;
+    const focusLayerId = String(focusParent && focusParent.parent_id || '');
+    if (nodeType === 'submodule') return String(node.parent_id || '') === focusParentId;
+    if (nodeType === 'module') return nodeId === focusParentId;
+    if (nodeType === 'layer') return nodeId === focusLayerId;
+    return false;
+  }
+  return true;
+}
+
+function normalizeAngleRad(v) {
+  const tau = Math.PI * 2;
+  let n = Number(v || 0);
+  if (!Number.isFinite(n)) n = 0;
+  n = n % tau;
+  if (n < 0) n += tau;
+  return n;
+}
+
+function positiveAngleSpan(start, end) {
+  const s = normalizeAngleRad(start);
+  const e = normalizeAngleRad(end);
+  let span = e - s;
+  if (span <= 0) span += Math.PI * 2;
+  return Math.max(0.001, span);
+}
+
+function angleAtArcFraction(start, end, t) {
+  const s = normalizeAngleRad(start);
+  const span = positiveAngleSpan(start, end);
+  return normalizeAngleRad(s + (span * clamp(t, 0, 1)));
+}
+
+function angleInArc(theta, start, end, margin = 0) {
+  const m = Math.max(0, Number(margin || 0));
+  const t = normalizeAngleRad(theta);
+  const s = normalizeAngleRad(start - m);
+  const e = normalizeAngleRad(end + m);
+  if (s <= e) return t >= s && t <= e;
+  return t >= s || t <= e;
+}
+
+function hitTestSelectedSubfractal(scene, worldX, worldY) {
+  if (!scene || !scene.node_by_id) return null;
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selectedRef && selectedRef.id || '').trim();
+  const selectedType = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const focusId = state.camera && state.camera.focus_mode
+    ? String(state.camera.focus_target_id || '').trim()
+    : '';
+  const focusNode = focusId && scene.node_by_id ? scene.node_by_id[focusId] : null;
+  const focusType = String(focusNode && focusNode.type || '').toLowerCase();
+  let candidateId = (selectedType === 'submodule' && selectedId)
+    ? selectedId
+    : ((focusType === 'submodule' && focusId) ? focusId : '');
+  if (!candidateId && Array.isArray(scene.nodes)) {
+    const preferred = hitTestSubmoduleShell(scene, worldX, worldY);
+    const preferredId = String(preferred && preferred.id || '').trim();
+    const pickScore = (node) => {
+      if (!node) return Infinity;
+      const cx = Number(node.parent_x || node.x || 0);
+      const cy = Number(node.parent_y || node.y || 0);
+      const dx = Number(worldX || 0) - cx;
+      const dy = Number(worldY || 0) - cy;
+      const distance = Math.hypot(dx, dy);
+      const inner = Math.max(0.5, Number(node.shell_inner || (Number(node.radius || 2) * 2.2)));
+      const outer = Math.max(inner + 0.5, Number(node.shell_outer || (Number(node.radius || 2) * 3.1)));
+      const zoom = Math.max(0.25, Number(state.camera && state.camera.zoom || 1));
+      const radialPad = Math.max(3.8, 9.2 / zoom);
+      if (distance < (inner - radialPad) || distance > (outer + radialPad)) return Infinity;
+      const theta = Math.atan2(dy, dx);
+      const start = Number(node.shell_start || 0);
+      const end = Number(node.shell_end || (start + (Math.PI * 0.35)));
+      if (!angleInArc(theta, start, end, 0.22)) return Infinity;
+      const midRadius = (inner + outer) * 0.5;
+      const radialError = Math.abs(distance - midRadius);
+      const spanMid = normalizeAngleRad((start + end) * 0.5);
+      let angularError = Math.abs(normalizeAngleRad(theta) - spanMid);
+      if (angularError > Math.PI) angularError = (Math.PI * 2) - angularError;
+      return radialError + (angularError * Math.max(6, midRadius * 0.22));
+    };
+    let bestId = '';
+    let bestScore = Infinity;
+    for (const node of scene.nodes) {
+      if (!node || String(node.type || '').toLowerCase() !== 'submodule') continue;
+      if (!nodeMatchesActiveFocusScope(scene, node)) continue;
+      if (!subfractalChildrenForNode(node).length) continue;
+      const nodeId = String(node.id || '').trim();
+      if (!nodeId) continue;
+      const score = pickScore(node);
+      if (!Number.isFinite(score)) continue;
+      const preferredBias = preferredId && nodeId === preferredId ? -2 : 0;
+      const totalScore = score + preferredBias;
+      if (totalScore < bestScore) {
+        bestScore = totalScore;
+        bestId = nodeId;
+      }
+    }
+    if (bestId) candidateId = bestId;
+  }
+  if (!candidateId) return null;
+  const node = scene.node_by_id[candidateId];
+  if (!node || String(node.type || '').toLowerCase() !== 'submodule') return null;
+  const children = subfractalChildrenForNode(node);
+  if (!children.length) return null;
+
+  const cx = Number(node.parent_x || node.x || 0);
+  const cy = Number(node.parent_y || node.y || 0);
+  const dx = Number(worldX || 0) - cx;
+  const dy = Number(worldY || 0) - cy;
+  const distance = Math.hypot(dx, dy);
+  const inner = Math.max(0.5, Number(node.shell_inner || (Number(node.radius || 2) * 2.2)));
+  const outer = Math.max(inner + 0.5, Number(node.shell_outer || (Number(node.radius || 2) * 3.1)));
+  const zoom = Math.max(0.25, Number(state.camera && state.camera.zoom || 1));
+  const radialPad = Math.max(3.8, 9.2 / zoom);
+  if (distance < (inner - radialPad) || distance > (outer + radialPad)) return null;
+
+  const theta = Math.atan2(dy, dx);
+  const start = Number(node.shell_start || 0);
+  const end = Number(node.shell_end || (start + (Math.PI * 0.35)));
+  if (!angleInArc(theta, start, end, 0.22)) return null;
+
+  const sNorm = normalizeAngleRad(start);
+  const tNorm = normalizeAngleRad(theta);
+  const span = positiveAngleSpan(start, end);
+  let rel = tNorm - sNorm;
+  if (rel < 0) rel += Math.PI * 2;
+  const frac = clamp(rel / span, 0, 0.999999);
+  const index = clamp(Math.floor(frac * children.length), 0, children.length - 1);
+  const child = children[index];
+  if (!child) return null;
+  const subId = String(child.id || `${candidateId}/child:${index}`);
+  const subName = String(child.name || `sub-${index + 1}`);
+  const subPath = String(child.rel || `${String(node.rel || candidateId)}/${subName}`);
+  return {
+    id: candidateId,
+    kind: 'subfractal',
+    subfractal_id: subId,
+    subfractal_index: index,
+    subfractal_name: subName,
+    subfractal_path: subPath,
+    name: `${String(node.name || selectedId)} / ${subName}`,
+    path: subPath
+  };
+}
+
+function hitTestSubmoduleShell(scene, worldX, worldY) {
+  if (!scene || !scene.node_by_id || !Array.isArray(scene.nodes)) return null;
+  let bestNode = null;
+  let bestScore = Infinity;
+  const zoom = Math.max(0.2, Number(state.camera && state.camera.zoom || 1));
+  const radialPad = Math.max(1.2, 2.8 / zoom);
+  const angularPad = 0.05;
+  for (const node of scene.nodes) {
+    if (!node || String(node.type || '').toLowerCase() !== 'submodule') continue;
+    if (!nodeMatchesActiveFocusScope(scene, node)) continue;
+    const cx = Number(node.parent_x || node.x || 0);
+    const cy = Number(node.parent_y || node.y || 0);
+    const dx = worldX - cx;
+    const dy = worldY - cy;
+    const distance = Math.hypot(dx, dy);
+    const inner = Math.max(0.5, Number(node.shell_inner || (Number(node.radius || 2) * 2.2)));
+    const outer = Math.max(inner + 0.5, Number(node.shell_outer || (Number(node.radius || 2) * 3.1)));
+    if (distance < (inner - radialPad) || distance > (outer + radialPad)) continue;
+    const theta = Math.atan2(dy, dx);
+    const start = Number(node.shell_start || 0);
+    const end = Number(node.shell_end || (start + (Math.PI * 0.35)));
+    if (!angleInArc(theta, start, end, angularPad)) continue;
+    const midRadius = (inner + outer) * 0.5;
+    const radialError = Math.abs(distance - midRadius);
+    const spanMid = normalizeAngleRad((start + end) * 0.5);
+    const t = normalizeAngleRad(theta);
+    let angularError = Math.abs(t - spanMid);
+    if (angularError > Math.PI) angularError = (Math.PI * 2) - angularError;
+    const score = radialError + (angularError * Math.max(6, midRadius * 0.26));
+    if (score < bestScore) {
+      bestScore = score;
+      bestNode = node;
+    }
+  }
+  if (!bestNode) return null;
+  const nodeId = String(bestNode.id || '').trim();
+  const target = scene.hit_target_by_id && scene.hit_target_by_id[nodeId]
+    ? scene.hit_target_by_id[nodeId]
+    : null;
+  if (target) {
+    return {
+      id: String(target.id || nodeId),
+      name: String(target.name || bestNode.name || nodeId),
+      path: String(target.path || bestNode.rel || ''),
+      kind: 'submodule_shell'
+    };
+  }
+  return {
+    id: nodeId,
+    name: String(bestNode.name || nodeId),
+    path: String(bestNode.rel || ''),
+    kind: 'submodule_shell'
+  };
+}
+
 function hitTest(x, y) {
   const scene = state.scene;
   if (!scene) return null;
   const world = screenToWorld(x, y);
+  const subfractalHit = hitTestSelectedSubfractal(scene, world.x, world.y);
+  if (subfractalHit) return subfractalHit;
+  const submoduleShellHit = hitTestSubmoduleShell(scene, world.x, world.y);
+  if (submoduleShellHit) return submoduleShellHit;
   const center = scene.center && typeof scene.center === 'object'
     ? scene.center
     : { x: state.width * 0.52, y: state.height * 0.5 };
   let circleFound = null;
   let circleBest = Infinity;
+  let scopedCircleFound = null;
+  let scopedCircleBest = Infinity;
   let zoneFound = null;
   let zoneBest = Infinity;
+  const cam = state.camera && typeof state.camera === 'object' ? state.camera : null;
+  const scopeActive = Boolean(
+    cam && cam.focus_mode && scene.node_by_id
+    && (() => {
+      const fid = String(cam.focus_target_id || '').trim();
+      if (!fid) return false;
+      const fnode = scene.node_by_id[fid];
+      const ftype = String((fnode && fnode.type) || '').toLowerCase();
+      return ftype === 'layer' || ftype === 'module' || ftype === 'submodule';
+    })()
+  );
   for (const t of scene.hit_targets || []) {
     if (t.kind === 'ring' || t.kind === 'shell_fill') {
       const dx = world.x - Number(t.cx || 0);
@@ -3439,8 +4325,15 @@ function hitTest(x, y) {
       circleBest = d;
       circleFound = t;
     }
+    const node = scene.node_by_id ? scene.node_by_id[String(t.id || '')] : null;
+    if (node && nodeMatchesActiveFocusScope(scene, node) && d <= Number(t.r || 0) && d < scopedCircleBest) {
+      scopedCircleBest = d;
+      scopedCircleFound = t;
+    }
   }
-  const found = circleFound || zoneFound;
+  const found = scopeActive
+    ? (scopedCircleFound || zoneFound)
+    : (scopedCircleFound || circleFound || zoneFound);
   if (found) return found;
   const shellBoundary = Math.max(0, Number(scene.outer_shell_boundary || 0));
   if (shellBoundary > 0 && scene.system_target) {
@@ -3512,11 +4405,24 @@ function linksInteractiveForSelection() {
   const scene = state.scene;
   if (!scene || !scene.node_by_id) return false;
   const sid = String(state.selected && state.selected.id || '').trim();
-  if (!sid) return false;
-  const node = scene.node_by_id[sid];
-  if (!node) return false;
-  const type = String(node.type || '').toLowerCase();
-  return type === 'module' || type === 'submodule';
+  if (sid) {
+    const node = scene.node_by_id[sid];
+    const type = String(node && node.type || '').toLowerCase();
+    if (type === 'module' || type === 'submodule') return true;
+  }
+  const focusId = String(state.camera && state.camera.focus_target_id || '').trim();
+  if (focusId) {
+    const focusNode = scene.node_by_id[focusId];
+    const focusType = String(focusNode && focusNode.type || '').toLowerCase();
+    if (focusType === 'module' || focusType === 'submodule') return true;
+  }
+  const mapOwnerId = String(state.camera && state.camera.map_owner_id || '').trim();
+  if (mapOwnerId) {
+    const mapOwnerNode = scene.node_by_id[mapOwnerId];
+    const ownerType = String(mapOwnerNode && mapOwnerNode.type || '').toLowerCase();
+    if (ownerType === 'module' || ownerType === 'submodule') return true;
+  }
+  return false;
 }
 
 function isModuleDepthSelection(scene) {
@@ -3581,6 +4487,44 @@ function layerIdForNode(scene, node) {
   return '';
 }
 
+function selectionInteractionContext(scene) {
+  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  const selectedId = String(selectedRef && selectedRef.id || '').trim();
+  const selectedNode = selectedId && scene && scene.node_by_id ? scene.node_by_id[selectedId] : null;
+  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
+  const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
+  const focusMode = Boolean(state.camera && state.camera.focus_mode);
+  const focusId = focusMode ? String(state.camera.focus_target_id || '').trim() : '';
+  const focusNode = focusId && scene && scene.node_by_id ? scene.node_by_id[focusId] : null;
+  const focusType = focusMode ? String((focusNode && focusNode.type) || '').toLowerCase() : '';
+  let interactionNode = selectedNode;
+  let interactionType = selectedType;
+  if (focusNode && focusType) {
+    const selectedMatchesFocus = Boolean(
+      selectedNode
+      && selectedType
+      && String(selectedNode.id || '') === focusId
+      && selectedType === focusType
+    );
+    if (!selectedMatchesFocus) {
+      interactionNode = focusNode;
+      interactionType = focusType;
+    }
+  }
+  return {
+    selectedRef,
+    selectedId,
+    selectedNode,
+    selectedType,
+    focusMode,
+    focusId,
+    focusNode,
+    focusType,
+    interactionNode,
+    interactionType
+  };
+}
+
 function isLayerFocusZoomed(scene, layerId) {
   if (!scene || !scene.node_by_id) return false;
   const id = String(layerId || '').trim();
@@ -3593,13 +4537,13 @@ function isLayerFocusZoomed(scene, layerId) {
 
 function normalizeHitForCurrentLevel(scene, hit) {
   if (!scene || !hit) return hit;
+  const hitKind = String(hit.kind || '').toLowerCase();
+  if (hitKind === 'subfractal') return hit;
   const node = interactionNodeFromHit(scene, hit);
   if (!node) return hit;
-  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
-  const sid = String(selectedRef && selectedRef.id || '').trim();
-  const selectedNode = sid && scene.node_by_id ? scene.node_by_id[sid] : null;
-  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
-  const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
+  const interaction = selectionInteractionContext(scene);
+  const selectedNode = interaction.interactionNode;
+  const selectedType = interaction.interactionType;
   const nodeType = String(node.type || '').toLowerCase();
 
   const mapToLayer = () => {
@@ -3618,7 +4562,8 @@ function normalizeHitForCurrentLevel(scene, hit) {
 
   // Preferred module selector level inside selected shell.
   if (selectedType === 'layer') {
-    const selectedLayerId = String(selectedNode.id || '');
+    const selectedLayerId = String(selectedNode && selectedNode.id || '');
+    if (!selectedLayerId) return hit;
     const shellZoomed = isLayerFocusZoomed(scene, selectedLayerId);
     if (!shellZoomed) {
       if (nodeType === 'module') {
@@ -3659,12 +4604,34 @@ function isHitAllowedForCurrentLevel(scene, hit) {
   const targetNode = interactionNodeFromHit(scene, hit);
   const targetType = String((targetNode && targetNode.type) || '').toLowerCase();
   const hitKind = String(hit.kind || '').toLowerCase();
+  if (hitKind === 'subfractal') {
+    const sid = String(state.selected && state.selected.id || '').trim();
+    const stype = String(state.selected && state.selected.type || '').toLowerCase();
+    const focusId = String(state.camera && state.camera.focus_mode ? state.camera.focus_target_id || '' : '').trim();
+    const focusNode = focusId && scene.node_by_id ? scene.node_by_id[focusId] : null;
+    const focusType = String(focusNode && focusNode.type || '').toLowerCase();
+    const targetId = String(hit.id || '').trim();
+    if ((stype === 'submodule' && !!sid && sid === targetId)
+      || (focusType === 'submodule' && !!focusId && focusId === targetId)) {
+      return true;
+    }
+    const interaction = selectionInteractionContext(scene);
+    const interactionNode = interaction.interactionNode;
+    const interactionType = interaction.interactionType;
+    if (!interactionNode || !targetNode) return false;
+    if (interactionType === 'module') {
+      return String(targetNode.parent_id || '') === String(interactionNode.id || '');
+    }
+    if (interactionType === 'layer' && isLayerFocusZoomed(scene, String(interactionNode.id || ''))) {
+      const parentModule = scene.node_by_id ? scene.node_by_id[String(targetNode.parent_id || '')] : null;
+      return String(parentModule && parentModule.parent_id || '') === String(interactionNode.id || '');
+    }
+    return false;
+  }
   const isShellHit = hitKind === 'ring' || hitKind === 'shell_fill';
-  const selectedRef = state.selected && typeof state.selected === 'object' ? state.selected : null;
-  const sid = String(selectedRef && selectedRef.id || '').trim();
-  const selectedNode = sid && scene.node_by_id ? scene.node_by_id[sid] : null;
-  const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
-  const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
+  const interaction = selectionInteractionContext(scene);
+  const selectedNode = interaction.interactionNode;
+  const selectedType = interaction.interactionType;
   if (targetType === 'system') return true;
 
   // Root level: only shell (layer ring) interaction.
@@ -3685,7 +4652,8 @@ function isHitAllowedForCurrentLevel(scene, hit) {
   }
 
   if (selectedType === 'layer') {
-    const selectedLayerId = String(selectedNode.id || '');
+    const selectedLayerId = String(selectedNode && selectedNode.id || '');
+    if (!selectedLayerId) return isShellHit && targetType === 'layer';
     const shellZoomed = isLayerFocusZoomed(scene, selectedLayerId);
     if (targetType === 'spine') return true;
     if (isShellHit && targetType === 'layer') return true;
@@ -3703,16 +4671,16 @@ function isHitAllowedForCurrentLevel(scene, hit) {
   }
 
   if (selectedType === 'module') {
-    const selectedLayerId = String(selectedNode.parent_id || '');
+    const selectedLayerId = String(selectedNode && selectedNode.parent_id || '');
     if (targetType === 'spine') return true;
     if (isShellHit && targetType === 'layer') return true;
     if (targetType === 'module') return String(targetNode.parent_id || '') === selectedLayerId;
-    if (targetType === 'submodule') return String(targetNode.parent_id || '') === String(selectedNode.id || '');
+    if (targetType === 'submodule') return String(targetNode.parent_id || '') === String(selectedNode && selectedNode.id || '');
     return false;
   }
 
   if (selectedType === 'submodule') {
-    const parentModuleId = String(selectedNode.parent_id || '');
+    const parentModuleId = String(selectedNode && selectedNode.parent_id || '');
     const parentModule = parentModuleId && scene.node_by_id ? scene.node_by_id[parentModuleId] : null;
     const layerId = String(parentModule && parentModule.parent_id || '');
     if (targetType === 'spine') return true;
@@ -3741,23 +4709,80 @@ function onCanvasClick(evt) {
   const selectedNode = selectedId && scene && scene.node_by_id ? scene.node_by_id[selectedId] : null;
   const selectedTypeHint = String(selectedRef && selectedRef.type || '').toLowerCase();
   const selectedType = selectedTypeHint || String((selectedNode && selectedNode.type) || '').toLowerCase();
-  const rawHit = hitTest(x, y);
-  const normalizedHit = rawHit ? normalizeHitForCurrentLevel(scene, rawHit) : null;
-  const hit = normalizedHit && isHitAllowedForCurrentLevel(scene, normalizedHit) ? normalizedHit : null;
-  const linkHit = linksInteractiveForSelection() ? hitTestLink(x, y, 12) : null;
-  const preferLine = linkHit ? (state.camera.map_mode || shouldPreferLinkSelection(scene, hit, linkHit)) : false;
   const activeFocusId = String(state.camera.focus_target_id || '');
   const activeFocusNode = activeFocusId && scene && scene.node_by_id
     ? scene.node_by_id[activeFocusId]
     : null;
   const activeFocusType = String((activeFocusNode && activeFocusNode.type) || '').toLowerCase();
+  const interactionType = activeFocusType || selectedType;
+  const interactionNode = activeFocusNode || selectedNode;
+  const rawHit = hitTest(x, y);
+  const normalizedHit = rawHit ? normalizeHitForCurrentLevel(scene, rawHit) : null;
+  let hit = normalizedHit && isHitAllowedForCurrentLevel(scene, normalizedHit) ? normalizedHit : null;
+  const rawNode = rawHit ? interactionNodeFromHit(scene, rawHit) : null;
+  const rawNodeType = String(rawNode && rawNode.type || '').toLowerCase();
+  if (!hit && rawNode) {
+    if (interactionType === 'layer' && interactionNode) {
+      const selectedLayerId = String(interactionNode.id || '');
+      const layerZoomed = isLayerFocusZoomed(scene, selectedLayerId);
+      if (layerZoomed) {
+        if (rawNodeType === 'module' && String(rawNode.parent_id || '') === selectedLayerId) {
+          hit = hitTargetFromNode(scene, String(rawNode.id || ''), 'circle') || null;
+        } else if (rawNodeType === 'submodule') {
+          const parentModule = scene && scene.node_by_id
+            ? scene.node_by_id[String(rawNode.parent_id || '')]
+            : null;
+          if (parentModule && String(parentModule.parent_id || '') === selectedLayerId) {
+            hit = hitTargetFromNode(scene, String(rawNode.id || ''), 'circle') || null;
+          }
+        }
+      }
+    } else if (interactionType === 'module') {
+      const selectedModuleId = String(interactionNode && interactionNode.id || '');
+      if (rawNodeType === 'submodule' && String(rawNode.parent_id || '') === selectedModuleId) {
+        hit = hitTargetFromNode(scene, String(rawNode.id || ''), 'circle') || null;
+      }
+    }
+  }
+  const linkHit = linksInteractiveForSelection() ? hitTestLink(x, y, 12) : null;
+  const preferLine = linkHit ? (state.camera.map_mode || shouldPreferLinkSelection(scene, hit, linkHit)) : false;
+  const rawHitKind = String(rawHit && rawHit.kind || '').toLowerCase();
+  const rawLayerId = rawNode
+    ? String(layerIdForNode(scene, rawNode) || '')
+    : ((rawHitKind === 'ring' || rawHitKind === 'shell_fill') ? String(rawHit && rawHit.id || '') : '');
+  const rawLayerNode = rawLayerId && scene && scene.node_by_id ? scene.node_by_id[rawLayerId] : null;
+  const clickedOutsideFocusedShell = Boolean(
+    state.camera.focus_mode
+    && !preferLine
+    && activeFocusType === 'layer'
+    && rawLayerId
+    && rawLayerId !== activeFocusId
+    && String(rawLayerNode && rawLayerNode.type || '').toLowerCase() === 'layer'
+  );
+  if (clickedOutsideFocusedShell) {
+    const systemTarget = scene && scene.system_target
+      ? scene.system_target
+      : hitTargetFromNode(scene, SYSTEM_ROOT_ID, 'system');
+    const sid = String(systemTarget && systemTarget.id || SYSTEM_ROOT_ID);
+    const snode = scene && scene.node_by_id ? scene.node_by_id[sid] : null;
+    state.selected = {
+      id: sid,
+      name: String((systemTarget && systemTarget.name) || (snode && snode.name) || 'System Root'),
+      path: String((systemTarget && systemTarget.path) || (snode && snode.rel) || WORKSPACE_ROOT_PATH),
+      kind: String((systemTarget && systemTarget.kind) || 'system'),
+      type: 'system'
+    };
+    state.selected_link = null;
+    clearModuleDepthReturns();
+    clearMapMode();
+    zoomToSystemRoot();
+    applySelectionFocus(true);
+    renderSelectionTag();
+    renderStats();
+    return;
+  }
   if (rawHit && !hit && !linkHit) {
     if (state.camera.focus_mode && activeFocusType === 'layer') {
-      const rawNode = interactionNodeFromHit(scene, rawHit);
-      const rawHitKind = String(rawHit.kind || '').toLowerCase();
-      const rawLayerId = rawNode
-        ? String(layerIdForNode(scene, rawNode) || '')
-        : ((rawHitKind === 'ring' || rawHitKind === 'shell_fill') ? String(rawHit.id || '') : '');
       if (rawLayerId && rawLayerId !== activeFocusId) {
         restoreCameraFocus();
         const layerTarget = hitTargetFromNode(scene, rawLayerId, 'ring');
@@ -3778,15 +4803,33 @@ function onCanvasClick(evt) {
     }
     return;
   }
-  if (!hit && !linkHit && (selectedType === 'module' || selectedType === 'submodule')) {
+  const moduleDepthType = (selectedType === 'module' || selectedType === 'submodule')
+    ? selectedType
+    : ((activeFocusType === 'module' || activeFocusType === 'submodule') ? activeFocusType : '');
+  const moduleDepthNode = moduleDepthType
+    ? ((moduleDepthType === selectedType && selectedNode) ? selectedNode : activeFocusNode)
+    : null;
+  const moduleDepthId = String(moduleDepthNode && moduleDepthNode.id || '');
+  const selectedSubfractal = validateSelectedSubfractal(scene);
+  if (!state.camera.map_mode && !hit && !linkHit && selectedSubfractal && selectedType === 'submodule') {
+    const submoduleSelectedId = String(selectedId || '');
+    clearSelectedSubfractal();
+    state.selected_link = null;
+    if (submoduleSelectedId) zoomIntoSubmodule(submoduleSelectedId, null);
+    applySelectionFocus(true);
+    renderSelectionTag();
+    renderStats();
+    return;
+  }
+  if (!hit && !linkHit && moduleDepthType && moduleDepthNode) {
     const cam = state.camera;
     const submoduleReturnSelection = cloneSelectionRef(cam.submodule_return_selection);
     const hasSubmoduleReturn = (
-      selectedType === 'submodule'
+      moduleDepthType === 'submodule'
       && cam.focus_mode
-      && String(cam.focus_target_id || '') === selectedId
+      && String(cam.focus_target_id || '') === moduleDepthId
       && submoduleReturnSelection
-      && String(cam.submodule_return_selection_for || '') === selectedId
+      && String(cam.submodule_return_selection_for || '') === moduleDepthId
     );
     if (hasSubmoduleReturn) {
       restoreCameraFocus();
@@ -3800,11 +4843,11 @@ function onCanvasClick(evt) {
     }
     const moduleReturnSelection = cloneSelectionRef(cam.module_return_selection);
     const hasModuleReturn = (
-      selectedType === 'module'
+      moduleDepthType === 'module'
       && cam.focus_mode
-      && String(cam.focus_target_id || '') === selectedId
+      && String(cam.focus_target_id || '') === moduleDepthId
       && moduleReturnSelection
-      && String(cam.module_return_selection_for || '') === selectedId
+      && String(cam.module_return_selection_for || '') === moduleDepthId
     );
     if (hasModuleReturn) {
       restoreCameraFocus();
@@ -3817,10 +4860,10 @@ function onCanvasClick(evt) {
       return;
     }
     let parentLayerId = '';
-    if (selectedType === 'module') {
-      parentLayerId = String(selectedNode && selectedNode.parent_id || '');
+    if (moduleDepthType === 'module') {
+      parentLayerId = String(moduleDepthNode && moduleDepthNode.parent_id || '');
     } else {
-      const parentModuleId = String(selectedNode && selectedNode.parent_id || '');
+      const parentModuleId = String(moduleDepthNode && moduleDepthNode.parent_id || '');
       const parentModule = parentModuleId && scene && scene.node_by_id
         ? scene.node_by_id[parentModuleId]
         : null;
@@ -3865,6 +4908,52 @@ function onCanvasClick(evt) {
     && activeFocusId !== hitId
   );
   const linePreviewClick = Boolean(preferLine && linkHit);
+  const hitKind = String(hit && hit.kind || '').toLowerCase();
+  const subfractalClick = Boolean(hit && !preferLine && hitKind === 'subfractal');
+  if (subfractalClick && hitNode && hitType === 'submodule') {
+    const parentId = String(hitNode.id || '').trim();
+    const parentPath = String(hitNode.rel || '').trim();
+    const selectedParent = state.selected
+      && String(state.selected.id || '') === parentId
+      && String(state.selected.type || '').toLowerCase() === 'submodule';
+    if (!selectedParent) {
+      state.selected = {
+        id: parentId,
+        name: String(hitNode.name || parentId),
+        path: parentPath,
+        kind: 'circle',
+        type: 'submodule'
+      };
+    }
+    const childRows = subfractalChildrenForNode(hitNode);
+    const childId = String(hit && hit.subfractal_id || '').trim();
+    const childIndexRaw = Math.floor(Number(hit && hit.subfractal_index || 0) || 0);
+    const childIndex = clamp(childIndexRaw, 0, Math.max(0, childRows.length - 1));
+    const child = childRows.find((row) => String(row.id || '') === childId) || childRows[childIndex] || null;
+    const nextId = String((child && child.id) || childId || '').trim();
+    const sameSubfractal = state.selected_subfractal
+      && String(state.selected_subfractal.parent_id || '') === parentId
+      && String(state.selected_subfractal.id || '') === nextId;
+    if (sameSubfractal || !nextId) {
+      clearSelectedSubfractal();
+      zoomIntoSubmodule(parentId, null);
+    } else {
+      setSelectedSubfractal({
+        id: nextId,
+        parent_id: parentId,
+        index: childIndex,
+        count: childRows.length,
+        name: String((child && child.name) || hit.subfractal_name || nextId),
+        path: String((child && child.rel) || hit.subfractal_path || parentPath)
+      });
+      zoomIntoSubfractal(parentId, state.selected_subfractal);
+    }
+    state.selected_link = null;
+    applySelectionFocus(true);
+    renderSelectionTag();
+    renderStats();
+    return;
+  }
   if (state.camera.map_mode && !linePreviewClick) {
     const restored = exitMapModeToCenteredSelection();
     if (restored) {
@@ -3896,6 +4985,12 @@ function onCanvasClick(evt) {
       || (activeFocusType === 'module'
         && hitType === 'submodule'
         && String(hitNode && hitNode.parent_id || '') === activeFocusId)
+      || (activeFocusType === 'module'
+        && hitType === 'module'
+        && String(hitNode && hitNode.parent_id || '') === String(activeFocusNode && activeFocusNode.parent_id || ''))
+      || (activeFocusType === 'submodule'
+        && hitType === 'submodule'
+        && String(hitNode && hitNode.parent_id || '') === String(activeFocusNode && activeFocusNode.parent_id || ''))
     )
   );
   if (state.camera.focus_mode
@@ -3907,6 +5002,7 @@ function onCanvasClick(evt) {
   const suppressAutoLayerZoom = clickedDifferentLayerWhileFocusedLayer;
 
   if (hit && !preferLine) {
+    clearSelectedSubfractal();
     const node = scene && scene.node_by_id
       ? scene.node_by_id[String(hit.id || '')]
       : null;
@@ -3919,12 +5015,12 @@ function onCanvasClick(evt) {
     if (node && String(node.type || '') === 'submodule') {
       const parentId = String(node.parent_id || '').trim();
       const parentNode = scene && scene.node_by_id ? scene.node_by_id[parentId] : null;
-      const selectedSubmoduleParentId = selectedNode ? String(selectedNode.parent_id || '') : '';
-      const selectedLayerId = selectedNode ? String(selectedNode.id || '') : '';
-      const layerZoomed = selectedType === 'layer' && isLayerFocusZoomed(scene, selectedLayerId);
+      const selectedSubmoduleParentId = interactionNode ? String(interactionNode.parent_id || '') : '';
+      const selectedLayerId = interactionNode ? String(interactionNode.id || '') : '';
+      const layerZoomed = interactionType === 'layer' && isLayerFocusZoomed(scene, selectedLayerId);
       const allowDirectSubmodule = (
-        (selectedType === 'module' && selectedId === parentId)
-        || (selectedType === 'submodule' && selectedSubmoduleParentId === parentId)
+        (interactionType === 'module' && String(interactionNode && interactionNode.id || '') === parentId)
+        || (interactionType === 'submodule' && selectedSubmoduleParentId === parentId)
         || (layerZoomed
           && parentNode
           && String(parentNode.parent_id || '') === selectedLayerId)
@@ -4013,6 +5109,7 @@ function onCanvasClick(evt) {
     state.selected_link = null;
   } else {
     if (linkHit) {
+      clearSelectedSubfractal();
       const sameLink = state.selected_link && String(state.selected_link.id) === String(linkHit.id);
       state.selected_link = sameLink ? null : {
         id: linkHit.id,
@@ -4024,12 +5121,27 @@ function onCanvasClick(evt) {
       };
       const mapOwnerId = (selectedType === 'module' || selectedType === 'submodule')
         ? selectedId
-        : '';
+        : ((activeFocusType === 'module' || activeFocusType === 'submodule')
+          ? activeFocusId
+          : '');
+      if (mapOwnerId && (!state.selected || String(state.selected.id || '') !== mapOwnerId)) {
+        const ownerNode = scene && scene.node_by_id ? scene.node_by_id[mapOwnerId] : null;
+        if (ownerNode) {
+          state.selected = {
+            id: mapOwnerId,
+            name: String(ownerNode.name || mapOwnerId),
+            path: String(ownerNode.rel || ''),
+            kind: 'circle',
+            type: String(ownerNode.type || '').toLowerCase()
+          };
+        }
+      }
       if (state.selected_link && mapOwnerId) {
         enterMapModeForSelection(mapOwnerId);
       }
     } else {
       state.selected = null;
+      clearSelectedSubfractal();
       state.selected_link = null;
       clearModuleDepthReturns();
       clearMapMode();
@@ -4057,6 +5169,17 @@ function updateHoverAtCanvasPoint(x, y) {
   const linkHit = linksInteractiveForSelection() ? hitTestLink(x, y, 10) : null;
   const preferLine = shouldPreferLinkSelection(scene, hit, linkHit);
   if (hit && !preferLine) {
+    if (String(hit.kind || '').toLowerCase() === 'subfractal') {
+      state.hover = {
+        id: String(hit.subfractal_id || `${hit.id || ''}:sub`),
+        name: String(hit.subfractal_name || hit.name || 'Subfractal'),
+        path: String(hit.subfractal_path || hit.path || ''),
+        kind: 'subfractal',
+        sx: Number(x || 0),
+        sy: Number(y || 0)
+      };
+      return;
+    }
     const node = scene.node_by_id ? scene.node_by_id[String(hit.id || '')] : null;
     state.hover = {
       id: String((node && node.id) || hit.id || ''),
@@ -4419,6 +5542,27 @@ function submoduleVisualExtent(node) {
   return Math.max(3.5, nodeDiameter, radialThickness, arcLength);
 }
 
+function zoomIntoSubfractal(nodeId, selectedSubfractal) {
+  const id = String(nodeId || '').trim();
+  if (!id || !state.scene || !state.scene.node_by_id) return false;
+  const node = state.scene.node_by_id[id];
+  if (!node || String(node.type || '') !== 'submodule') return false;
+  const extentInfo = subfractalSelectionExtent(node, selectedSubfractal);
+  const anchor = subfractalAnchorForSelection(node, selectedSubfractal);
+  if (!extentInfo || !anchor) return false;
+  const cam = state.camera;
+  const targetDiameter = Math.max(34, state.height * 0.10);
+  const desiredZoom = targetDiameter / Math.max(1, Number(extentInfo.extent || 1));
+  const zoomTarget = clamp(Math.max(1.2, desiredZoom), cam.min_zoom, cam.max_zoom);
+  const panX = (state.width * 0.5) - (Number(anchor.x || 0) * zoomTarget);
+  const panY = (state.height * 0.5) - (Number(anchor.y || 0) * zoomTarget);
+  startCameraTransition(zoomTarget, panX, panY, 155, { allow_out_of_bounds: true });
+  cam.focus_mode = true;
+  cam.focus_target_id = id;
+  clearMapMode();
+  return true;
+}
+
 function zoomIntoSubmodule(nodeId, originSelection = null) {
   const id = String(nodeId || '').trim();
   if (!id || !state.scene || !state.scene.node_by_id) return false;
@@ -4441,12 +5585,15 @@ function zoomIntoSubmodule(nodeId, originSelection = null) {
     cam.submodule_return_selection_for = '';
   }
   const fractalExtent = submoduleVisualExtent(node);
-  const targetDiameter = Math.max(14, state.height * 0.05);
+  const hasSubfractals = subfractalChildrenForNode(node).length > 0;
+  const targetDiameter = hasSubfractals
+    ? Math.max(34, state.height * 0.10)
+    : Math.max(56, state.height * 0.2);
   const desiredZoom = targetDiameter / Math.max(1, fractalExtent);
-  const zoomTarget = clamp(desiredZoom, cam.min_zoom, cam.max_zoom);
+  const zoomTarget = clamp(Math.max(1.08, desiredZoom), cam.min_zoom, cam.max_zoom);
   const panX = (state.width * 0.5) - (Number(node.x || 0) * zoomTarget);
   const panY = (state.height * 0.5) - (Number(node.y || 0) * zoomTarget);
-  startCameraTransition(zoomTarget, panX, panY, 140, { allow_out_of_bounds: true });
+  startCameraTransition(zoomTarget, panX, panY, 160, { allow_out_of_bounds: true });
   cam.focus_mode = true;
   cam.focus_target_id = id;
   clearMapMode();
@@ -4499,15 +5646,14 @@ function onCanvasWheel(evt) {
 function onCanvasMouseDown(evt) {
   const enablePan = evt.button === 0 || evt.button === 1 || evt.button === 2 || evt.shiftKey === true;
   if (!enablePan) return;
-  stopCameraTransition();
-  if (state.camera.focus_mode) restoreCameraFocus({ instant: true });
   evt.preventDefault();
   const cam = state.camera;
   cam.panning = true;
+  cam.pan_started = false;
   cam.drag_px = 0;
   cam.last_x = evt.clientX;
   cam.last_y = evt.clientY;
-  state.canvas.style.cursor = 'grabbing';
+  state.canvas.style.cursor = 'grab';
 }
 
 function onCanvasMouseMove(evt) {
@@ -4517,10 +5663,17 @@ function onCanvasMouseMove(evt) {
     const dy = evt.clientY - cam.last_y;
     cam.last_x = evt.clientX;
     cam.last_y = evt.clientY;
+    cam.drag_px += Math.abs(dx) + Math.abs(dy);
+    if (!cam.pan_started && cam.drag_px > 5) {
+      cam.pan_started = true;
+      stopCameraTransition();
+      if (cam.focus_mode) restoreCameraFocus({ instant: true });
+      state.canvas.style.cursor = 'grabbing';
+    }
+    if (!cam.pan_started) return;
     cam.pan_x += dx;
     cam.pan_y += dy;
     clampCameraPanInPlace();
-    cam.drag_px += Math.abs(dx) + Math.abs(dy);
     state.hover = null;
     return;
   }
@@ -4538,6 +5691,7 @@ function onCanvasMouseLeave() {
 function onCanvasMouseUp() {
   const cam = state.camera;
   cam.panning = false;
+  cam.pan_started = false;
   state.canvas.style.cursor = 'grab';
   setTimeout(() => {
     cam.drag_px = 0;
@@ -4552,6 +5706,14 @@ function boot() {
   setQualityTier(state.gpu.tier);
   resizeCanvas();
   renderSelectionTag();
+  const tabPreviewBtn = byId('tabPreview');
+  const tabCodeBtn = byId('tabCode');
+  if (tabPreviewBtn) {
+    tabPreviewBtn.addEventListener('click', () => setPreviewTab('preview'));
+  }
+  if (tabCodeBtn) {
+    tabCodeBtn.addEventListener('click', () => setPreviewTab('code'));
+  }
 
   byId('refresh').addEventListener('click', requestRefresh);
   byId('hours').addEventListener('change', () => {

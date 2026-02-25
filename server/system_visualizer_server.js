@@ -40,6 +40,7 @@ const WS_PING_MS = 15000;
 const MODULE_SCAN_CACHE_TTL_MS = 7000;
 const MAX_LAYER_MODULES = 24;
 const MAX_MODULE_SUBMODULES = 20;
+const MAX_SUBMODULE_SUBFOLDERS = 14;
 const MAX_INTEGRITY_FILES = 12;
 const MAX_INTEGRITY_EVENTS = 8;
 const GIT_CMD_TIMEOUT_MS = 1800;
@@ -49,6 +50,7 @@ const JUST_PUSHED_WINDOW_MS = 2600;
 const MAX_CHANGE_FILES = 10;
 const CODEBASE_SIZE_MAX_FILES = 2400;
 const CODEBASE_SIZE_MAX_DEPTH = 10;
+const CODE_PREVIEW_MAX_BYTES = 180 * 1024;
 const CODEBASE_SIZE_EXTS = new Set([
   '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
   '.json', '.md', '.yaml', '.yml',
@@ -780,6 +782,21 @@ function shouldIncludeSubEntry(ent) {
   return ext === '.js' || ext === '.ts' || ext === '.json' || ext === '.md';
 }
 
+function listRenderableChildDirs(absDir, limit = MAX_SUBMODULE_SUBFOLDERS) {
+  const entries = safeReadDirWithTypes(absDir)
+    .filter((ent) => ent && ent.isDirectory && ent.isDirectory())
+    .filter((ent) => isRenderableEntryName(ent && ent.name))
+    .sort(direntSort);
+  const names = [];
+  for (const ent of entries) {
+    if (names.length >= Math.max(1, Number(limit || MAX_SUBMODULE_SUBFOLDERS))) break;
+    const name = String(ent && ent.name || '').trim();
+    if (!name) continue;
+    names.push(name);
+  }
+  return names;
+}
+
 function tokenize(text) {
   const raw = String(text || '').toLowerCase();
   return raw
@@ -919,11 +936,19 @@ function scanLayerModelRaw() {
             type: sub.isDirectory() ? 'dir' : 'file',
             activity: 0,
             codebase_size_bytes: 0,
-            codebase_file_count: 0
+            codebase_file_count: 0,
+            subfolders: []
           };
+          const subAbs = path.join(modAbs, subName);
+          if (sub.isDirectory()) {
+            const childDirNames = listRenderableChildDirs(subAbs, MAX_SUBMODULE_SUBFOLDERS);
+            subNode.subfolders = childDirNames.map((childName) => ({
+              name: childName,
+              rel: `${modRel}/${subName}/${childName}`
+            }));
+          }
           if (sub.isFile()) {
             try {
-              const subAbs = path.join(modAbs, subName);
               const stat = fs.statSync(subAbs);
               if (stat && stat.isFile() && shouldIncludeCodebaseFile(subName)) {
                 subNode.codebase_size_bytes = Math.max(0, Number(stat.size || 0));
@@ -2007,6 +2032,113 @@ function sendText(res, code, text) {
   res.end(body);
 }
 
+function resolveWorkspacePath(rawPath) {
+  const input = String(rawPath || '').trim();
+  if (!input) return null;
+  const abs = path.isAbsolute(input)
+    ? path.resolve(input)
+    : path.resolve(REPO_ROOT, input);
+  const rootPrefix = REPO_ROOT.endsWith(path.sep) ? REPO_ROOT : `${REPO_ROOT}${path.sep}`;
+  if (abs !== REPO_ROOT && !abs.startsWith(rootPrefix)) return null;
+  return abs;
+}
+
+function likelyTextBuffer(buf) {
+  if (!Buffer.isBuffer(buf)) return false;
+  if (buf.length === 0) return true;
+  const sampleLen = Math.min(buf.length, 4096);
+  let controlCount = 0;
+  for (let i = 0; i < sampleLen; i += 1) {
+    const b = buf[i];
+    if (b === 0) return false;
+    if (b < 7 || (b > 13 && b < 32)) controlCount += 1;
+  }
+  return (controlCount / sampleLen) < 0.25;
+}
+
+function readCodePreview(rawPath) {
+  const abs = resolveWorkspacePath(rawPath);
+  if (!abs) {
+    return {
+      ok: false,
+      error: 'path_outside_workspace'
+    };
+  }
+  let stat = null;
+  try {
+    stat = fs.statSync(abs);
+  } catch {
+    return {
+      ok: false,
+      error: 'not_found',
+      path: abs
+    };
+  }
+  const rel = normalizeRelPath(path.relative(REPO_ROOT, abs));
+  if (stat.isDirectory()) {
+    return {
+      ok: true,
+      path: abs,
+      rel,
+      is_file: false,
+      is_dir: true,
+      size_bytes: 0,
+      truncated: false,
+      content: ''
+    };
+  }
+  if (!stat.isFile()) {
+    return {
+      ok: true,
+      path: abs,
+      rel,
+      is_file: false,
+      is_dir: false,
+      size_bytes: 0,
+      truncated: false,
+      content: ''
+    };
+  }
+
+  const sizeBytes = Math.max(0, Number(stat.size || 0));
+  const readBytes = Math.max(0, Math.min(sizeBytes, CODE_PREVIEW_MAX_BYTES));
+  let fileBuffer = Buffer.alloc(0);
+  if (readBytes > 0) {
+    const fd = fs.openSync(abs, 'r');
+    try {
+      fileBuffer = Buffer.alloc(readBytes);
+      const bytesRead = fs.readSync(fd, fileBuffer, 0, readBytes, 0);
+      if (bytesRead < readBytes) fileBuffer = fileBuffer.slice(0, bytesRead);
+    } finally {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+  if (!likelyTextBuffer(fileBuffer)) {
+    return {
+      ok: true,
+      path: abs,
+      rel,
+      is_file: true,
+      is_dir: false,
+      size_bytes: sizeBytes,
+      truncated: sizeBytes > readBytes,
+      binary: true,
+      content: ''
+    };
+  }
+  return {
+    ok: true,
+    path: abs,
+    rel,
+    is_file: true,
+    is_dir: false,
+    size_bytes: sizeBytes,
+    truncated: sizeBytes > readBytes,
+    binary: false,
+    content: String(fileBuffer.toString('utf8') || '')
+  };
+}
+
 function serveStatic(reqPath, res) {
   const rel = reqPath === '/' ? '/index.html' : reqPath;
   const normalized = path.normalize(rel).replace(/^(\.\.(\/|\\|$))+/, '');
@@ -2078,6 +2210,18 @@ function main() {
     }
     if (pathname === '/api/healthz') {
       sendJson(res, 200, { ok: true, ts: nowIso() });
+      return;
+    }
+    if (pathname === '/api/file') {
+      const rawPath = String(parsed.searchParams.get('path') || '');
+      const payload = readCodePreview(rawPath);
+      if (!payload.ok) {
+        const err = String(payload.error || 'bad_request');
+        const code = err === 'not_found' ? 404 : (err === 'path_outside_workspace' ? 403 : 400);
+        sendJson(res, code, payload);
+        return;
+      }
+      sendJson(res, 200, payload);
       return;
     }
     if (!serveStatic(pathname, res)) {
