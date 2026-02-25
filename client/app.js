@@ -1160,6 +1160,12 @@ function isPreviewWarningRow(key, value) {
   const v = String(value == null ? '' : value).trim().toLowerCase();
   if (!k && !v) return false;
   if (isPreviewErrorRow(key)) return false;
+  if (k === 'continuum pulse' && (v.includes('unavailable') || v.includes('skipped') || v.includes('stale'))) return true;
+  if (k === 'continuum trit' && (v.includes('pain') || v.includes('unknown') || v.includes('(0)') || v.includes('(-1)'))) return true;
+  if (k === 'continuum red-team critical') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n > 0) return true;
+  }
   if (k === 'blocked links') {
     const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
     if (Number.isFinite(n) && n > 0) return true;
@@ -1194,6 +1200,12 @@ function isPreviewGoodRow(key, value) {
   const k = String(key || '').trim().toLowerCase();
   const v = String(value == null ? '' : value).trim().toLowerCase();
   if (!k && !v) return false;
+  if (k === 'continuum pulse' && v.startsWith('active')) return true;
+  if (k === 'continuum trit' && (v.includes('ok (1)') || v.includes('true (1)'))) return true;
+  if (k === 'continuum red-team critical') {
+    const n = Number(String(value == null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    if (Number.isFinite(n) && n === 0) return true;
+  }
   if (k === 'constitution alignment' && (v.includes('green') || v.includes('aligned'))) return true;
   if (k === 'evolution trajectory' && v.includes('accelerating')) return true;
   if (k === 'fractal harmony') {
@@ -3677,6 +3689,37 @@ function renderStats() {
   const fractal = summary.fractal && typeof summary.fractal === 'object'
     ? summary.fractal
     : {};
+  const continuum = summary.continuum && typeof summary.continuum === 'object'
+    ? summary.continuum
+    : {};
+  const continuumAvailable = continuum.available === true;
+  const continuumPulseAgeSec = Number(continuum.pulse_age_sec || 0);
+  const continuumPulseStatus = !continuumAvailable
+    ? 'Unavailable'
+    : (continuum.last_skipped === true
+      ? 'Skipped'
+      : (continuumPulseAgeSec > 3600
+        ? `Stale (${fmtNum(continuumPulseAgeSec)}s)`
+        : 'Active'));
+  const continuumTritLabelRaw = String(continuum.last_trit_label || '');
+  const continuumTritLabel = continuumTritLabelRaw || 'unknown';
+  const continuumTritValue = Number(continuum.last_trit || 0);
+  const continuumEventsByStage = continuum.events_24h_by_stage && typeof continuum.events_24h_by_stage === 'object'
+    ? continuum.events_24h_by_stage
+    : {};
+  const continuumStageRows = Object.entries(continuumEventsByStage)
+    .map(([stage, count]) => [String(stage || ''), Number(count || 0)])
+    .filter(([stage, count]) => stage && Number.isFinite(count) && count > 0)
+    .sort((a, b) => {
+      if (Math.abs(Number(a[1] || 0) - Number(b[1] || 0)) > 0.0001) return Number(b[1] || 0) - Number(a[1] || 0);
+      return String(a[0] || '').localeCompare(String(b[0] || ''));
+    });
+  const continuumTopStage = continuumStageRows.length
+    ? `${String(continuumStageRows[0][0])}:${fmtNum(continuumStageRows[0][1])}`
+    : 'n/a';
+  const continuumSkipReasons = Array.isArray(continuum.last_skip_reasons)
+    ? continuum.last_skip_reasons.filter(Boolean).slice(0, 3).join(', ')
+    : '';
   const scene = state.scene;
   const nodeCount = scene && Array.isArray(scene.nodes) ? scene.nodes.length : 0;
   const linkCount = scene && Array.isArray(scene.links) ? scene.links.length : 0;
@@ -3779,6 +3822,15 @@ function renderStats() {
       ['Symbiosis Plans', fmtNum(fractal.symbiosis_plans || 0)],
       ['Predator Candidates', fmtNum(fractal.predator_candidates || 0)],
       ['Black-Box Rows', fmtNum(fractal.black_box_rows || 0)],
+      ['Continuum Pulse', continuumPulseStatus],
+      ['Continuum Trit', `${continuumTritLabel} (${fmtNum(continuumTritValue)})`],
+      ['Continuum Events 24h', fmtNum(continuum.events_24h_total || 0)],
+      ['Continuum Top Stage', continuumTopStage],
+      ['Continuum Queue Rows', fmtNum(continuum.training_queue_rows_24h || 0)],
+      ['Continuum Anticipation', fmtNum(continuum.anticipation_candidates_last || 0)],
+      ['Continuum Red-Team Critical', fmtNum(continuum.red_team_critical_last || 0)],
+      ['Continuum Observer Mood', String(continuum.observer_mood_last || 'n/a')],
+      ['Continuum Skip Reasons', continuumSkipReasons || 'n/a'],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows
@@ -3819,6 +3871,15 @@ function renderStats() {
       ['Archetypes', fmtNum(fractal.archetypes || 0)],
       ['Pheromones', fmtNum(fractal.pheromones || 0)],
       ['Black-Box Rows', fmtNum(fractal.black_box_rows || 0)],
+      ['Continuum Pulse', continuumPulseStatus],
+      ['Continuum Trit', `${continuumTritLabel} (${fmtNum(continuumTritValue)})`],
+      ['Continuum Events 24h', fmtNum(continuum.events_24h_total || 0)],
+      ['Continuum Top Stage', continuumTopStage],
+      ['Continuum Queue Rows', fmtNum(continuum.training_queue_rows_24h || 0)],
+      ['Continuum Anticipation', fmtNum(continuum.anticipation_candidates_last || 0)],
+      ['Continuum Red-Team Critical', fmtNum(continuum.red_team_critical_last || 0)],
+      ['Continuum Observer Mood', String(continuum.observer_mood_last || 'n/a')],
+      ['Continuum Skip Reasons', continuumSkipReasons || 'n/a'],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
       ...selectedIntegrityRows,
@@ -3998,6 +4059,15 @@ function renderStats() {
       ['Archetypes', fmtNum(fractal.archetypes || 0)],
       ['Pheromones', fmtNum(fractal.pheromones || 0)],
       ['Black-Box Rows', fmtNum(fractal.black_box_rows || 0)],
+      ['Continuum Pulse', continuumPulseStatus],
+      ['Continuum Trit', `${continuumTritLabel} (${fmtNum(continuumTritValue)})`],
+      ['Continuum Events 24h', fmtNum(continuum.events_24h_total || 0)],
+      ['Continuum Top Stage', continuumTopStage],
+      ['Continuum Queue Rows', fmtNum(continuum.training_queue_rows_24h || 0)],
+      ['Continuum Anticipation', fmtNum(continuum.anticipation_candidates_last || 0)],
+      ['Continuum Red-Team Critical', fmtNum(continuum.red_team_critical_last || 0)],
+      ['Continuum Observer Mood', String(continuum.observer_mood_last || 'n/a')],
+      ['Continuum Skip Reasons', continuumSkipReasons || 'n/a'],
       ['Layer Nodes', fmtNum(nodeCount)],
       ['Links', fmtNum(linkCount)],
       ...bottleneckRows

@@ -25,6 +25,11 @@ const REPO_ROOT = process.env.OPENCLAW_WORKSPACE
 const RUNS_DIR = path.join(REPO_ROOT, 'state', 'autonomy', 'runs');
 const SPINE_RUNS_DIR = path.join(REPO_ROOT, 'state', 'spine', 'runs');
 const FRACTAL_DIR = path.join(REPO_ROOT, 'state', 'autonomy', 'fractal');
+const CONTINUUM_DIR = path.join(REPO_ROOT, 'state', 'autonomy', 'continuum');
+const CONTINUUM_RUNS_DIR = path.join(CONTINUUM_DIR, 'runs');
+const CONTINUUM_EVENTS_DIR = path.join(CONTINUUM_DIR, 'events');
+const CONTINUUM_LATEST_PATH = path.join(CONTINUUM_DIR, 'latest.json');
+const CONTINUUM_HISTORY_PATH = path.join(CONTINUUM_DIR, 'history.jsonl');
 const FRACTAL_ORGANISM_DIR = path.join(FRACTAL_DIR, 'organism_cycle');
 const FRACTAL_INTROSPECTION_DIR = path.join(FRACTAL_DIR, 'introspection');
 const FRACTAL_PHEROMONE_DIR = path.join(FRACTAL_DIR, 'pheromones');
@@ -58,6 +63,7 @@ const JUST_PUSHED_WINDOW_MS = 2600;
 const MAX_CHANGE_FILES = 10;
 const EVOLUTION_CACHE_TTL_MS = 30000;
 const FRACTAL_CACHE_TTL_MS = 3000;
+const CONTINUUM_CACHE_TTL_MS = 3000;
 const CODEBASE_SIZE_MAX_FILES = 2400;
 const CODEBASE_SIZE_MAX_DEPTH = 10;
 const CODE_PREVIEW_MAX_BYTES = 180 * 1024;
@@ -106,6 +112,11 @@ let EVOLUTION_CACHE = {
 };
 
 let FRACTAL_CACHE = {
+  ts: 0,
+  payload: null
+};
+
+let CONTINUUM_CACHE = {
   ts: 0,
   payload: null
 };
@@ -583,6 +594,125 @@ function loadFractalSnapshot() {
   };
 
   FRACTAL_CACHE = {
+    ts: nowMs,
+    payload
+  };
+  return cloneJson(payload);
+}
+
+function listJsonlFilesDesc(absDir) {
+  if (!fs.existsSync(absDir)) return [];
+  const ents = fs.readdirSync(absDir, { withFileTypes: true });
+  const rows = [];
+  for (const ent of ents) {
+    if (!ent || !ent.isFile()) continue;
+    const name = String(ent.name || '');
+    if (!name.endsWith('.jsonl')) continue;
+    rows.push(name);
+  }
+  rows.sort((a, b) => b.localeCompare(a));
+  return rows;
+}
+
+function loadContinuumSnapshot() {
+  const nowMs = Date.now();
+  if (
+    CONTINUUM_CACHE.payload
+    && (nowMs - Number(CONTINUUM_CACHE.ts || 0)) < CONTINUUM_CACHE_TTL_MS
+  ) {
+    return cloneJson(CONTINUUM_CACHE.payload);
+  }
+
+  const latest = safeJsonRead(CONTINUUM_LATEST_PATH, null);
+  const latestPayload = latest && typeof latest === 'object' ? latest : {};
+  const latestTs = String(latestPayload.ts || '');
+  const latestDate = String(latestPayload.date || '');
+  const latestTrit = latestPayload.trit && typeof latestPayload.trit === 'object'
+    ? latestPayload.trit
+    : {};
+  const actions = Array.isArray(latestPayload.actions) ? latestPayload.actions : [];
+  const actionById = {};
+  for (const row of actions) {
+    const id = String(row && row.id || '').trim();
+    if (!id) continue;
+    actionById[id] = row;
+  }
+
+  const cutoffMs = nowMs - (24 * 60 * 60 * 1000);
+  const eventFiles = listJsonlFilesDesc(CONTINUUM_EVENTS_DIR).slice(0, 3);
+  const byStage = {
+    dream_consolidation: 0,
+    anticipation: 0,
+    self_improvement: 0,
+    creative_incubation: 0,
+    security_vigilance: 0,
+    consolidation: 0
+  };
+  let events24h = 0;
+  for (const file of eventFiles) {
+    const rows = readJsonlRows(path.join(CONTINUUM_EVENTS_DIR, file));
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const row = rows[i];
+      const tsMs = parseTsMs(row && row.ts);
+      if (tsMs != null && tsMs < cutoffMs) break;
+      const stage = String(row && row.stage || '').trim();
+      if (!stage) continue;
+      if (Object.prototype.hasOwnProperty.call(byStage, stage)) {
+        byStage[stage] = Number(byStage[stage] || 0) + 1;
+      }
+      events24h += 1;
+    }
+  }
+
+  const historyRows = readJsonlRows(CONTINUUM_HISTORY_PATH);
+  let queueRows24h = 0;
+  for (let i = historyRows.length - 1; i >= 0; i -= 1) {
+    const row = historyRows[i];
+    const tsMs = parseTsMs(row && row.ts);
+    if (tsMs != null && tsMs < cutoffMs) break;
+    queueRows24h += Number(row && row.training_queue_rows || 0);
+  }
+  const pulseAgeSec = latestTs
+    ? Number(Math.max(0, (nowMs - Date.parse(latestTs)) / 1000).toFixed(2))
+    : null;
+
+  const anticipationAction = actionById.anticipation && typeof actionById.anticipation === 'object'
+    ? actionById.anticipation
+    : {};
+  const securityAction = actionById.security_vigilance && typeof actionById.security_vigilance === 'object'
+    ? actionById.security_vigilance
+    : {};
+  const selfImproveAction = actionById.self_improvement && typeof actionById.self_improvement === 'object'
+    ? actionById.self_improvement
+    : {};
+  const lastSkipReasons = Array.isArray(latestPayload.skip_reasons) ? latestPayload.skip_reasons.slice(0, 6) : [];
+
+  const payload = {
+    generated_at: nowIso(),
+    available: !!latest && typeof latest === 'object',
+    file: fs.existsSync(CONTINUUM_LATEST_PATH) ? path.relative(REPO_ROOT, CONTINUUM_LATEST_PATH).replace(/\\/g, '/') : '',
+    state_dir: fs.existsSync(CONTINUUM_DIR) ? path.relative(REPO_ROOT, CONTINUUM_DIR).replace(/\\/g, '/') : '',
+    last_pulse_ts: latestTs || '',
+    last_date: latestDate || '',
+    pulse_age_sec: Number.isFinite(Number(pulseAgeSec)) ? pulseAgeSec : null,
+    last_profile: String(latestPayload.profile || ''),
+    last_trit: Number(latestTrit.value || 0),
+    last_trit_label: String(latestTrit.label || ''),
+    last_skipped: latestPayload.skipped === true,
+    last_skip_reasons: lastSkipReasons,
+    tasks_executed_last: Number(latestPayload.tasks_executed || 0),
+    events_24h_total: events24h,
+    events_24h_by_stage: byStage,
+    training_queue_rows_24h: queueRows24h,
+    anticipation_drafts_last: Number(anticipationAction.metrics && anticipationAction.metrics.drafts || 0),
+    anticipation_candidates_last: Number(anticipationAction.metrics && anticipationAction.metrics.candidates || 0),
+    red_team_cases_last: Number(securityAction.metrics && securityAction.metrics.executed_cases || 0),
+    red_team_critical_last: Number(securityAction.metrics && securityAction.metrics.critical_fail_cases || 0),
+    observer_mood_last: String(selfImproveAction.metrics && selfImproveAction.metrics.mood || ''),
+    history_rows: historyRows.length
+  };
+
+  CONTINUUM_CACHE = {
     ts: nowMs,
     payload
   };
@@ -1978,6 +2108,15 @@ function assignLayerActivity(layers, runs, summary, aliasToId) {
   bumpAlias('systems', Math.max(0.5, Number(summary && summary.run_events || 0) * 0.012));
   bumpAlias('state', Math.max(0.2, Number(summary && summary.policy_holds || 0) * 0.04));
   bumpAlias('adaptive', Math.max(0.2, Number(summary && summary.executed || 0) * 0.025));
+  const continuum = summary && summary.continuum && typeof summary.continuum === 'object'
+    ? summary.continuum
+    : {};
+  const continuumEvents = Number(continuum.events_24h_total || 0);
+  if (continuumEvents > 0) {
+    bumpAlias('systems/autonomy', Math.max(0.4, continuumEvents * 0.02));
+    bumpAlias('systems/workflow', Math.max(0.3, Number(continuum.anticipation_candidates_last || 0) * 0.07));
+    bumpAlias('memory', Math.max(0.2, Number(continuum.events_24h_by_stage && continuum.events_24h_by_stage.dream_consolidation || 0) * 0.06));
+  }
 
   let maxRaw = 0;
   for (const value of Object.values(raw)) {
@@ -2262,6 +2401,9 @@ function buildHoloModel(runs, summary) {
   const fractal = summary && summary.fractal && typeof summary.fractal === 'object'
     ? summary.fractal
     : {};
+  const continuum = summary && summary.continuum && typeof summary.continuum === 'object'
+    ? summary.continuum
+    : {};
 
   return {
     generated_at: nowIso(),
@@ -2310,6 +2452,12 @@ function buildHoloModel(runs, summary) {
       fractal_archetypes: Number(fractal.archetypes || 0),
       fractal_pheromones: Number(fractal.pheromones || 0),
       black_box_rows: Number(fractal.black_box_rows || 0),
+      continuum_events_24h: Number(continuum.events_24h_total || 0),
+      continuum_training_queue_rows_24h: Number(continuum.training_queue_rows_24h || 0),
+      continuum_last_trit: Number(continuum.last_trit || 0),
+      continuum_last_trit_label: String(continuum.last_trit_label || ''),
+      continuum_last_skipped: continuum.last_skipped === true ? 1 : 0,
+      continuum_pulse_age_sec: Number(continuum.pulse_age_sec || 0),
       change_pending_push: pendingPush,
       change_just_pushed: justPushed,
       change_active_modules: Number(changeSummary.active_modules || 0),
@@ -2329,6 +2477,7 @@ function buildPayload(hours) {
   const constitution = buildConstitutionSnapshot(telemetry.runs, directives, strategy);
   const evolution = loadEvolutionSnapshot();
   const fractalSnapshot = loadFractalSnapshot();
+  const continuumSnapshot = loadContinuumSnapshot();
   const fractal = {
     harmony_score: Number(fractalSnapshot && fractalSnapshot.organism ? fractalSnapshot.organism.harmony_score || 0 : 0),
     symbiosis_plans: Number(fractalSnapshot && fractalSnapshot.organism ? fractalSnapshot.organism.symbiosis_plans || 0 : 0),
@@ -2341,6 +2490,29 @@ function buildPayload(hours) {
     genome_last_hash: String(fractalSnapshot && fractalSnapshot.genome ? fractalSnapshot.genome.last_hash || '' : ''),
     black_box_rows: Number(fractalSnapshot && fractalSnapshot.black_box ? fractalSnapshot.black_box.rows || 0 : 0),
     black_box_last_hash: String(fractalSnapshot && fractalSnapshot.black_box ? fractalSnapshot.black_box.last_hash || '' : '')
+  };
+  const continuum = {
+    available: continuumSnapshot && continuumSnapshot.available === true,
+    last_pulse_ts: String(continuumSnapshot && continuumSnapshot.last_pulse_ts || ''),
+    pulse_age_sec: Number(continuumSnapshot && continuumSnapshot.pulse_age_sec || 0),
+    last_profile: String(continuumSnapshot && continuumSnapshot.last_profile || ''),
+    last_trit: Number(continuumSnapshot && continuumSnapshot.last_trit || 0),
+    last_trit_label: String(continuumSnapshot && continuumSnapshot.last_trit_label || ''),
+    last_skipped: continuumSnapshot && continuumSnapshot.last_skipped === true,
+    last_skip_reasons: Array.isArray(continuumSnapshot && continuumSnapshot.last_skip_reasons)
+      ? continuumSnapshot.last_skip_reasons.slice(0, 6)
+      : [],
+    tasks_executed_last: Number(continuumSnapshot && continuumSnapshot.tasks_executed_last || 0),
+    events_24h_total: Number(continuumSnapshot && continuumSnapshot.events_24h_total || 0),
+    events_24h_by_stage: continuumSnapshot && continuumSnapshot.events_24h_by_stage && typeof continuumSnapshot.events_24h_by_stage === 'object'
+      ? continuumSnapshot.events_24h_by_stage
+      : {},
+    training_queue_rows_24h: Number(continuumSnapshot && continuumSnapshot.training_queue_rows_24h || 0),
+    anticipation_drafts_last: Number(continuumSnapshot && continuumSnapshot.anticipation_drafts_last || 0),
+    anticipation_candidates_last: Number(continuumSnapshot && continuumSnapshot.anticipation_candidates_last || 0),
+    red_team_cases_last: Number(continuumSnapshot && continuumSnapshot.red_team_cases_last || 0),
+    red_team_critical_last: Number(continuumSnapshot && continuumSnapshot.red_team_critical_last || 0),
+    observer_mood_last: String(continuumSnapshot && continuumSnapshot.observer_mood_last || '')
   };
   const summary = {
     ...baseSummary,
@@ -2355,7 +2527,8 @@ function buildPayload(hours) {
       top_proposals: Array.isArray(constitution.top_proposals) ? constitution.top_proposals.slice(0, 20) : []
     },
     evolution,
-    fractal
+    fractal,
+    continuum
   };
   const graph = buildGraph(telemetry.runs, directives, strategy);
   const holo = buildHoloModel(telemetry.runs, summary);
@@ -2368,7 +2541,9 @@ function buildPayload(hours) {
     constitution,
     evolution,
     fractal,
+    continuum,
     fractal_snapshot: fractalSnapshot,
+    continuum_snapshot: continuumSnapshot,
     incidents: {
       integrity
     }
@@ -2489,6 +2664,8 @@ function createWsHub(server, defaultHours) {
   };
   watchTarget(RUNS_DIR);
   watchTarget(SPINE_RUNS_DIR);
+  watchTarget(CONTINUUM_RUNS_DIR);
+  watchTarget(CONTINUUM_EVENTS_DIR);
 
   wss.on('connection', (ws, req) => {
     let subHours = defaultHours;
