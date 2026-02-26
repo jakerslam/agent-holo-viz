@@ -23,8 +23,10 @@ Open:
 
 ## Wiring
 
-- API snapshot: `GET /api/holo?hours=24`
-- Live stream: `ws://127.0.0.1:8787/ws/holo`
+- API snapshot: `GET /api/holo?hours=24&live_mode=1&live_minutes=6`
+- Live stream: `ws://127.0.0.1:8787/ws/holo?hours=24&live_mode=1&live_minutes=6`
+
+`live_mode=1` enables strict runtime liveness (tight recent-window checks); `live_mode=0` uses broader history-window behavior.
 
 ## Workspace compatibility
 

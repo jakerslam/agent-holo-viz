@@ -111,6 +111,17 @@ const state = {
   ws_retry_timer: null,
   ws_backoff_ms: 900,
   transport: 'poll',
+  live_mode: true,
+  live_minutes: 6,
+  runtime: {
+    status: 'unknown',
+    online: false,
+    stale: false,
+    offline: true,
+    signal_age_sec: null,
+    live_window_minutes: 6,
+    activity_scale: 1
+  },
   spine_event_count: 0,
   spine_event_top: '',
   spine_burst_until: 0,
@@ -858,9 +869,15 @@ function setZoomAt(screenX, screenY, nextZoom) {
   clampCameraPanInPlace();
 }
 
-async function fetchPayload(hours) {
+async function fetchPayload(hours, options = {}) {
   const h = Math.max(1, Number(hours || 24));
-  const res = await fetch(`/api/holo?hours=${encodeURIComponent(String(h))}`, { cache: 'no-store' });
+  const liveMode = options && options.live_mode === false ? 0 : 1;
+  const liveMinutes = Math.max(1, Number(options && options.live_minutes || 6));
+  const q = new URLSearchParams();
+  q.set('hours', String(h));
+  q.set('live_mode', String(liveMode));
+  q.set('live_minutes', String(liveMinutes));
+  const res = await fetch(`/api/holo?${q.toString()}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`api_http_${res.status}`);
   return res.json();
 }
@@ -1125,9 +1142,68 @@ function currentHours() {
   return Math.max(1, Number(byId('hours').value || 24));
 }
 
-function wsEndpoint(hours) {
+function currentLiveMode() {
+  const el = byId('liveMode');
+  if (!el) return state.live_mode !== false;
+  return el.checked !== false;
+}
+
+function currentLiveMinutes() {
+  const el = byId('liveMinutes');
+  return Math.max(1, Number(el && el.value || state.live_minutes || 6));
+}
+
+function currentLiveConfig() {
+  return {
+    live_mode: currentLiveMode(),
+    live_minutes: currentLiveMinutes()
+  };
+}
+
+function syncLiveControlState() {
+  const liveMinutesEl = byId('liveMinutes');
+  if (!liveMinutesEl) return;
+  liveMinutesEl.disabled = !currentLiveMode();
+}
+
+function wsEndpoint(hours, options = {}) {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/ws/holo?hours=${encodeURIComponent(String(Math.max(1, Number(hours || 24))))}`;
+  const h = Math.max(1, Number(hours || 24));
+  const liveMode = options && options.live_mode === false ? 0 : 1;
+  const liveMinutes = Math.max(1, Number(options && options.live_minutes || state.live_minutes || 6));
+  const q = new URLSearchParams();
+  q.set('hours', String(h));
+  q.set('live_mode', String(liveMode));
+  q.set('live_minutes', String(liveMinutes));
+  return `${proto}//${window.location.host}/ws/holo?${q.toString()}`;
+}
+
+function runtimeSnapshotFromPayload(payload) {
+  const summary = payload && payload.summary && typeof payload.summary === 'object'
+    ? payload.summary
+    : {};
+  const runtime = summary.runtime && typeof summary.runtime === 'object'
+    ? summary.runtime
+    : (payload && payload.runtime && typeof payload.runtime === 'object' ? payload.runtime : {});
+  const status = String(runtime.status || '').trim().toLowerCase() || 'unknown';
+  const online = runtime.online === true || status === 'online';
+  const stale = runtime.stale === true || status === 'stale';
+  const offline = runtime.offline === true || (!online && !stale);
+  const signalAge = runtime.signal_age_sec == null ? null : Number(runtime.signal_age_sec);
+  const liveWindowMinutes = Math.max(1, Number(runtime.live_window_minutes || payload && payload.live_minutes || state.live_minutes || 6));
+  const activityScale = clamp(Number(runtime.activity_scale == null ? (offline ? 0.2 : (stale ? 0.58 : 1)) : runtime.activity_scale), 0.12, 1.2);
+  return {
+    status,
+    online,
+    stale,
+    offline,
+    signal_age_sec: Number.isFinite(signalAge) ? signalAge : null,
+    live_window_minutes: liveWindowMinutes,
+    reason: String(runtime.reason || ''),
+    source: String(runtime.source || ''),
+    latest_signal_ts: String(runtime.latest_signal_ts || ''),
+    activity_scale: activityScale
+  };
 }
 
 function sendWs(msg) {
@@ -1156,9 +1232,19 @@ function applySnapshotMessage(msg) {
   const holo = msg.holo && typeof msg.holo === 'object' ? msg.holo : null;
   const incidents = msg.incidents && typeof msg.incidents === 'object' ? msg.incidents : {};
   if (summary && holo) {
+    state.live_mode = msg.live_mode !== false;
+    state.live_minutes = Math.max(1, Number(msg.live_minutes || state.live_minutes || 6));
+    state.runtime = runtimeSnapshotFromPayload({
+      summary,
+      runtime: msg.runtime || null,
+      live_minutes: state.live_minutes
+    });
     setPayload({
       ok: true,
       generated_at: msg.generated_at || new Date().toISOString(),
+      live_mode: state.live_mode,
+      live_minutes: state.live_minutes,
+      runtime: state.runtime,
       summary,
       holo,
       incidents
@@ -1186,8 +1272,9 @@ function connectWebSocket() {
     state.ws = null;
   }
   let socket = null;
+  const liveCfg = currentLiveConfig();
   try {
-    socket = new WebSocket(wsEndpoint(currentHours()));
+    socket = new WebSocket(wsEndpoint(currentHours(), liveCfg));
   } catch {
     state.ws_connected = false;
     state.transport = 'poll';
@@ -1199,7 +1286,10 @@ function connectWebSocket() {
     state.ws_connected = true;
     state.transport = 'ws';
     state.ws_backoff_ms = 900;
-    sendWs({ type: 'subscribe', hours: currentHours() });
+    const cfg = currentLiveConfig();
+    state.live_mode = cfg.live_mode;
+    state.live_minutes = cfg.live_minutes;
+    sendWs({ type: 'subscribe', hours: currentHours(), live_mode: cfg.live_mode, live_minutes: cfg.live_minutes });
   });
   socket.addEventListener('message', (evt) => {
     const msg = parseJsonSafe(evt.data);
@@ -1466,9 +1556,11 @@ function integrityRowsForSelection(incident, selectedType, selectedNode) {
   return out;
 }
 
-function isPreviewErrorRow(key) {
+function isPreviewErrorRow(key, value) {
   const k = String(key || '').trim();
+  const v = String(value == null ? '' : value).trim().toLowerCase();
   if (!k) return false;
+  if (k.toLowerCase() === 'runtime' && v.includes('offline')) return true;
   if (k === 'Errors') return true;
   if (k === 'Error Source') return true;
   if (k === 'Error Reason') return true;
@@ -1482,7 +1574,9 @@ function isPreviewWarningRow(key, value) {
   const k = String(key || '').trim().toLowerCase();
   const v = String(value == null ? '' : value).trim().toLowerCase();
   if (!k && !v) return false;
-  if (isPreviewErrorRow(key)) return false;
+  if (isPreviewErrorRow(key, value)) return false;
+  if (k === 'runtime' && (v.includes('offline') || v.includes('no signal'))) return true;
+  if (k === 'runtime' && v.includes('stale')) return true;
   if (k === 'continuum pulse' && (v.includes('unavailable') || v.includes('skipped') || v.includes('stale'))) return true;
   if (k === 'continuum trit' && (v.includes('pain') || v.includes('unknown') || v.includes('(0)') || v.includes('(-1)'))) return true;
   if (k === 'continuum red-team critical') {
@@ -1523,6 +1617,7 @@ function isPreviewGoodRow(key, value) {
   const k = String(key || '').trim().toLowerCase();
   const v = String(value == null ? '' : value).trim().toLowerCase();
   if (!k && !v) return false;
+  if (k === 'runtime' && v.includes('online')) return true;
   if (k === 'continuum pulse' && v.startsWith('active')) return true;
   if (k === 'continuum trit' && (v.includes('ok (1)') || v.includes('true (1)'))) return true;
   if (k === 'continuum red-team critical') {
@@ -2118,6 +2213,7 @@ function buildScene(payload) {
   const holo = payload && payload.holo && typeof payload.holo === 'object' ? payload.holo : null;
   if (!holo) return null;
   const summary = payload && payload.summary && typeof payload.summary === 'object' ? payload.summary : {};
+  const runtimeStatus = runtimeSnapshotFromPayload(payload);
   const workflowBirth = holo.workflow_birth && typeof holo.workflow_birth === 'object'
     ? holo.workflow_birth
     : (summary.workflow_birth && typeof summary.workflow_birth === 'object' ? summary.workflow_birth : {});
@@ -2802,6 +2898,7 @@ function buildScene(payload) {
     },
     outer_shell_boundary: Math.max(outerShellBoundary, 0),
     summary,
+    runtime_status: runtimeStatus,
     error_signal: errorSignal,
     metrics: holo.metrics && typeof holo.metrics === 'object' ? holo.metrics : {},
     change_summary: changeSummary,
@@ -3139,6 +3236,14 @@ function applySelectionFocus(rebuild = true) {
 function setPayload(payload) {
   const prevScene = state.scene;
   state.payload = payload;
+  state.live_mode = payload && payload.live_mode !== false;
+  state.live_minutes = Math.max(1, Number(payload && payload.live_minutes || state.live_minutes || 6));
+  state.runtime = runtimeSnapshotFromPayload(payload);
+  const liveModeEl = byId('liveMode');
+  const liveMinutesEl = byId('liveMinutes');
+  if (liveModeEl) liveModeEl.checked = state.live_mode !== false;
+  if (liveMinutesEl) liveMinutesEl.value = String(state.live_minutes);
+  syncLiveControlState();
   state.incidents = payload && payload.incidents && typeof payload.incidents === 'object'
     ? payload.incidents
     : { integrity: null };
@@ -3157,6 +3262,7 @@ function setPayload(payload) {
 
 function drawBackground(ts) {
   const ctx = state.ctx;
+  const runtime = runtimeStatusForScene(state.scene);
   ctx.clearRect(0, 0, state.width, state.height);
 
   const pulse = 0.5 + (0.5 * Math.sin(ts * 0.00025));
@@ -3199,6 +3305,34 @@ function drawBackground(ts) {
     pulseGrad.addColorStop(0, `rgba(255,82,82,${clamp(alpha * 1.6, 0.06, 0.24)})`);
     pulseGrad.addColorStop(1, 'rgba(255,82,82,0)');
     ctx.fillStyle = pulseGrad;
+    ctx.fillRect(0, 0, state.width, state.height);
+  } else if (runtime.offline) {
+    const offlineGlow = ctx.createRadialGradient(
+      state.width * 0.52,
+      state.height * 0.5,
+      state.height * 0.08,
+      state.width * 0.52,
+      state.height * 0.5,
+      state.height * 0.72
+    );
+    const alpha = 0.045 + (0.02 * (0.5 + Math.sin(ts * 0.0017)));
+    offlineGlow.addColorStop(0, `rgba(255,94,94,${clamp(alpha * 1.5, 0.03, 0.14)})`);
+    offlineGlow.addColorStop(1, 'rgba(255,94,94,0)');
+    ctx.fillStyle = offlineGlow;
+    ctx.fillRect(0, 0, state.width, state.height);
+  } else if (runtime.stale) {
+    const staleGlow = ctx.createRadialGradient(
+      state.width * 0.52,
+      state.height * 0.5,
+      state.height * 0.08,
+      state.width * 0.52,
+      state.height * 0.5,
+      state.height * 0.72
+    );
+    const alpha = 0.032 + (0.015 * (0.5 + Math.sin(ts * 0.0019)));
+    staleGlow.addColorStop(0, `rgba(255,172,118,${clamp(alpha * 1.4, 0.02, 0.1)})`);
+    staleGlow.addColorStop(1, 'rgba(255,172,118,0)');
+    ctx.fillStyle = staleGlow;
     ctx.fillRect(0, 0, state.width, state.height);
   }
 }
@@ -3261,9 +3395,40 @@ function drawLayerRing(layerNode, ts) {
   }
 }
 
+function runtimeStatusForScene(scene) {
+  const sceneRuntime = scene && scene.runtime_status && typeof scene.runtime_status === 'object'
+    ? scene.runtime_status
+    : {};
+  const base = state.runtime && typeof state.runtime === 'object' ? state.runtime : {};
+  const merged = {
+    ...base,
+    ...sceneRuntime
+  };
+  const status = String(merged.status || '').trim().toLowerCase() || 'unknown';
+  const online = merged.online === true || status === 'online';
+  const stale = merged.stale === true || status === 'stale';
+  const offline = merged.offline === true || (!online && !stale);
+  return {
+    ...merged,
+    status,
+    online,
+    stale,
+    offline,
+    activity_scale: clamp(Number(merged.activity_scale == null ? (offline ? 0.2 : (stale ? 0.58 : 1)) : merged.activity_scale), 0.12, 1.2)
+  };
+}
+
+function runtimeLinkAlphaScale(scene) {
+  const runtime = runtimeStatusForScene(scene);
+  if (runtime.offline) return 0.22;
+  if (runtime.stale) return 0.62;
+  return 1;
+}
+
 function drawSpineHub(scene, ts) {
   const ctx = state.ctx;
   const c = scene.center;
+  const runtime = runtimeStatusForScene(scene);
   const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
   const selectedId = String(selected && selected.id || '');
   const selectedType = String(selected && selected.type || '').toLowerCase();
@@ -3274,6 +3439,8 @@ function drawSpineHub(scene, ts) {
   const queryAlphaScale = codegraphNodeAlphaScale(SPINE_NODE_ID);
   const pulse = 1 + (Math.sin(ts * 0.00125) * 0.08);
   const drift = clamp(Number(scene.metrics && scene.metrics.drift_proxy || 0), 0, 1);
+  const runtimeOffline = runtime.offline === true;
+  const runtimeStale = !runtimeOffline && runtime.stale === true;
   const integrityAlert = scene && (
     scene.integrity_alert === true
     || Number(scene.metrics && scene.metrics.integrity_alert || 0) > 0
@@ -3287,6 +3454,10 @@ function drawSpineHub(scene, ts) {
     : `rgba(110, 203, 255, ${0.34 * queryAlphaScale})`;
   const alertPrimary = spineSelected ? 'rgba(255,236,236,0.9)' : 'rgba(255,86,86,0.86)';
   const alertSecondary = spineSelected ? 'rgba(255,226,226,0.58)' : 'rgba(255,104,104,0.46)';
+  const stalePrimary = spineSelected ? 'rgba(255,236,226,0.86)' : 'rgba(255,166,96,0.78)';
+  const staleSecondary = spineSelected ? 'rgba(255,230,216,0.56)' : 'rgba(255,186,112,0.42)';
+  const offlinePrimary = spineSelected ? 'rgba(255,230,230,0.84)' : 'rgba(255,92,92,0.66)';
+  const offlineSecondary = spineSelected ? 'rgba(255,222,222,0.52)' : 'rgba(255,112,112,0.36)';
   const resolvedAlpha = resolvedFlashAlpha('node', SPINE_NODE_ID, ts);
   const resolvedPrimary = `rgba(122,255,166,${clamp(0.34 + (resolvedAlpha * 0.62), 0.14, 0.98)})`;
   const resolvedSecondary = `rgba(156,255,190,${clamp(0.24 + (resolvedAlpha * 0.44), 0.12, 0.88)})`;
@@ -3294,7 +3465,7 @@ function drawSpineHub(scene, ts) {
     ? resolvedPrimary
     : (queryMatch
       ? `rgba(222,242,255,${clamp(0.7 * queryAlphaScale, 0.2, 0.92)})`
-      : (integrityAlert ? alertPrimary : normalPrimary));
+      : (integrityAlert ? alertPrimary : (runtimeOffline ? offlinePrimary : (runtimeStale ? stalePrimary : normalPrimary))));
   ctx.lineWidth = 1.2;
   ctx.beginPath();
   ctx.arc(c.x, c.y, base, 0, Math.PI * 2);
@@ -3303,7 +3474,7 @@ function drawSpineHub(scene, ts) {
     ? resolvedSecondary
     : (queryMatch
       ? `rgba(205,236,252,${clamp(0.52 * queryAlphaScale, 0.16, 0.8)})`
-      : (integrityAlert ? alertSecondary : normalSecondary));
+      : (integrityAlert ? alertSecondary : (runtimeOffline ? offlineSecondary : (runtimeStale ? staleSecondary : normalSecondary))));
   ctx.beginPath();
   ctx.arc(c.x, c.y, base + 7, 0, Math.PI * 2);
   ctx.stroke();
@@ -3318,6 +3489,18 @@ function drawSpineHub(scene, ts) {
     ctx.fillStyle = `rgba(255,76,76,${alarmPulse})`;
     ctx.beginPath();
     ctx.arc(c.x, c.y, base + 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (runtimeOffline) {
+    const idlePulse = 0.2 + (0.08 * (0.5 + Math.sin(ts * 0.0024)));
+    ctx.fillStyle = `rgba(255,92,92,${idlePulse})`;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, base + 3.1, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (runtimeStale) {
+    const stalePulse = 0.18 + (0.08 * (0.5 + Math.sin(ts * 0.0029)));
+    ctx.fillStyle = `rgba(255,170,110,${stalePulse})`;
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, base + 3.1, 0, Math.PI * 2);
     ctx.fill();
   }
   drawNodeChangeIndicator({
@@ -3649,6 +3832,7 @@ function drawLinks(scene) {
   const ctx = state.ctx;
   const profile = state.quality_profile;
   const nowTs = performance.now();
+  const runtimeScale = runtimeLinkAlphaScale(scene);
   const focusLinks = state.focus && state.focus.links instanceof Set ? state.focus.links : null;
   const hasCodegraph = codegraphHasMatches();
   const nodeById = scene.node_by_id && typeof scene.node_by_id === 'object'
@@ -3667,7 +3851,7 @@ function drawLinks(scene) {
     const doctorState = String(link.doctor_state || '').trim().toLowerCase();
     const doctorLink = kind === 'doctor' || Boolean(doctorState);
     if (kind === 'fractal') {
-      const alpha = clamp((0.2 + (Number(link.activity || 0) * 0.35)) * (0.2 + introScale * 0.8) * codegraphScale, 0.06, 0.8);
+      const alpha = clamp((0.2 + (Number(link.activity || 0) * 0.35)) * (0.2 + introScale * 0.8) * codegraphScale * runtimeScale, 0.06, 0.8);
       const resolvedAlpha = resolvedFlashAlpha('link', String(link && link.id || ''), nowTs);
       ctx.shadowBlur = 0;
       ctx.strokeStyle = resolvedAlpha > 0
@@ -3687,7 +3871,7 @@ function drawLinks(scene) {
     const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
     const blockedActive = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
     const resolvedAlpha = resolvedFlashAlpha('link', String(link && link.id || ''), nowTs);
-    const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78)) * codegraphScale;
+    const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78)) * codegraphScale * runtimeScale;
     const baseLineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
     if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
       if (doctorLink && doctorState === 'healing') {
@@ -3781,6 +3965,13 @@ function isModuleDepthPacketView(scene) {
 function drawParticles(dt) {
   const scene = state.scene;
   if (!scene || !state.particles.length) return;
+  const runtime = runtimeStatusForScene(scene);
+  if (runtime.offline) {
+    for (const p of state.particles) {
+      if (p && Array.isArray(p.trail)) p.trail.length = 0;
+    }
+    return;
+  }
   const ctx = state.ctx;
   const trailLength = state.quality_profile.trail_length;
   const nowTs = performance.now();
@@ -4437,6 +4628,15 @@ function renderStats() {
   const continuum = summary.continuum && typeof summary.continuum === 'object'
     ? summary.continuum
     : {};
+  const runtime = runtimeSnapshotFromPayload(payload);
+  state.runtime = runtime;
+  const runtimeStatusLabel = runtime.online
+    ? 'ONLINE'
+    : (runtime.stale ? 'STALE' : 'OFFLINE');
+  const runtimeDetail = runtime.signal_age_sec == null
+    ? `${runtimeStatusLabel} (no signal)`
+    : `${runtimeStatusLabel} (${fmtNum(runtime.signal_age_sec)}s age)`;
+  const runtimeWindowLabel = `${fmtNum(runtime.live_window_minutes)}m`;
   const workflowBirth = workflowBirthSnapshot(state.scene, summary);
   const doctor = doctorHealthSnapshot(state.scene, summary);
   const workflowBirthStageCounts = workflowBirth.stage_counts && typeof workflowBirth.stage_counts === 'object'
@@ -4583,6 +4783,8 @@ function renderStats() {
       ['Mode', 'Core Integrity Overview'],
       ['Core', String((selectedNode && selectedNode.name) || 'Spine Core')],
       ['Core Path', String((selectedNode && selectedNode.rel) || SPINE_NODE_PATH)],
+      ['Runtime', runtimeDetail],
+      ['Live Window', runtimeWindowLabel],
       ['Integrity', integrityIncident.active
         ? `${String(integrityIncident.severity || 'critical').toUpperCase()} (${fmtNum(integrityIncident.violation_total)} mismatches)`
         : 'OK'],
@@ -4635,6 +4837,8 @@ function renderStats() {
     rows = [
       ['Mode', 'System Process Overview'],
       ['Scope', 'All shells + children'],
+      ['Runtime', runtimeDetail],
+      ['Live Window', runtimeWindowLabel],
       ['Total Links', fmtNum(scene.links.length)],
       ['Blocked Links', fmtNum(blockStats.blocked_links)],
       ['Max Block Ratio', `${fmtNum(blockStats.max_blocked_ratio * 100)}%`],
@@ -4824,6 +5028,8 @@ function renderStats() {
     rows = [
       ['Mode', 'System Overview'],
       ['GPU Tier', gpuLabel],
+      ['Runtime', runtimeDetail],
+      ['Live Window', runtimeWindowLabel],
       ['FPS', fmtNum(state.fps_smoothed)],
       ['Motion Smoothness', `${fmtNum(clamp(state.motion_smoothness_ema, 0, 1) * 100)}%`],
       ['Run Events', fmtNum(summary.run_events)],
@@ -4906,7 +5112,7 @@ function renderStats() {
     rows.push(['Last Reseal', new Date(integrityIncident.last_reseal_ts).toLocaleString()]);
   }
   const rowsHtml = rows.map(([k, v]) => {
-    const errorRow = isPreviewErrorRow(k);
+    const errorRow = isPreviewErrorRow(k, v);
     const warningRow = !errorRow && isPreviewWarningRow(k, v);
     const goodRow = !errorRow && !warningRow && isPreviewGoodRow(k, v);
     const itemClass = errorRow
@@ -4961,10 +5167,11 @@ function renderStats() {
   const querySuffix = cg.query
     ? ` | query ${String(cg.mode || 'search')} n${fmtNum(cgMatchedNodes)} l${fmtNum(cgMatchedLinks)}`
     : '';
+  const runtimeSuffix = ` | runtime ${runtimeStatusLabel.toLowerCase()} ${runtime.signal_age_sec == null ? 'n/a' : `${fmtNum(runtime.signal_age_sec)}s`} | live ${runtimeWindowLabel}${state.live_mode ? '' : ' (off)'}`;
   const integritySuffix = integrityIncident.active
     ? ` | integrity ${String(integrityIncident.severity || 'critical')} ${fmtNum(integrityIncident.violation_total)}`
     : ' | integrity ok';
-  byId('metaLine').textContent = `Updated ${new Date(payload.generated_at || Date.now()).toLocaleString()} | ${state.transport} | zoom ${fmtNum(state.camera.zoom)}x | fallback ${Math.round(state.refresh_ms / 1000)}s${pulseSuffix}${linkPreviewSuffix}${querySuffix}${integritySuffix}`;
+  byId('metaLine').textContent = `Updated ${new Date(payload.generated_at || Date.now()).toLocaleString()} | ${state.transport} | zoom ${fmtNum(state.camera.zoom)}x | fallback ${Math.round(state.refresh_ms / 1000)}s${pulseSuffix}${linkPreviewSuffix}${querySuffix}${runtimeSuffix}${integritySuffix}`;
   renderCodegraphStatus();
   renderIncidentBanner();
 }
@@ -6204,8 +6411,11 @@ function animate(ts) {
 async function refreshNow(force = false) {
   if (!force && state.ws_connected) return;
   const hours = currentHours();
+  const liveCfg = currentLiveConfig();
+  state.live_mode = liveCfg.live_mode;
+  state.live_minutes = liveCfg.live_minutes;
   try {
-    const payload = await fetchPayload(hours);
+    const payload = await fetchPayload(hours, liveCfg);
     setPayload(payload);
   } catch (err) {
     byId('metaLine').textContent = `Load failed: ${String(err && err.message || err || 'unknown')}`;
@@ -6674,6 +6884,11 @@ function boot() {
   resizeCanvas();
   renderSelectionTag();
   renderCodegraphStatus();
+  const liveModeEl = byId('liveMode');
+  const liveMinutesEl = byId('liveMinutes');
+  if (liveModeEl) liveModeEl.checked = state.live_mode !== false;
+  if (liveMinutesEl) liveMinutesEl.value = String(state.live_minutes || 6);
+  syncLiveControlState();
   const tabPreviewBtn = byId('tabPreview');
   const tabCodeBtn = byId('tabCode');
   const statsGridEl = byId('statsGrid');
@@ -6707,7 +6922,29 @@ function boot() {
   byId('refresh').addEventListener('click', requestRefresh);
   byId('hours').addEventListener('change', () => {
     const hours = currentHours();
-    if (!sendWs({ type: 'subscribe', hours })) {
+    const liveCfg = currentLiveConfig();
+    state.live_mode = liveCfg.live_mode;
+    state.live_minutes = liveCfg.live_minutes;
+    if (!sendWs({ type: 'subscribe', hours, live_mode: liveCfg.live_mode, live_minutes: liveCfg.live_minutes })) {
+      refreshNow(true);
+    }
+  });
+  byId('liveMode').addEventListener('change', () => {
+    syncLiveControlState();
+    const hours = currentHours();
+    const liveCfg = currentLiveConfig();
+    state.live_mode = liveCfg.live_mode;
+    state.live_minutes = liveCfg.live_minutes;
+    if (!sendWs({ type: 'subscribe', hours, live_mode: liveCfg.live_mode, live_minutes: liveCfg.live_minutes })) {
+      refreshNow(true);
+    }
+  });
+  byId('liveMinutes').addEventListener('change', () => {
+    const hours = currentHours();
+    const liveCfg = currentLiveConfig();
+    state.live_mode = liveCfg.live_mode;
+    state.live_minutes = liveCfg.live_minutes;
+    if (!sendWs({ type: 'subscribe', hours, live_mode: liveCfg.live_mode, live_minutes: liveCfg.live_minutes })) {
       refreshNow(true);
     }
   });

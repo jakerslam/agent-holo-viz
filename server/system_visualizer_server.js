@@ -3,7 +3,7 @@
  * Read-only system visualizer server.
  *
  * Serves:
- * - GET /api/graph?hours=24
+ * - GET /api/graph?hours=24&live_mode=1&live_minutes=6
  * - static UI from agent-holo-viz/client/
  * - WebSocket stream on /ws/holo
  */
@@ -53,6 +53,7 @@ const STATIC_DIR = path.join(__dirname, '..', 'client');
 const DEFAULT_HOST = '127.0.0.1';
 const DEFAULT_PORT = 8787;
 const DEFAULT_HOURS = 24;
+const DEFAULT_LIVE_MINUTES = 6;
 const MAX_EVENTS = 6000;
 const MAX_PROPOSALS = 80;
 const WS_PATH = '/ws/holo';
@@ -83,6 +84,8 @@ const CODEGRAPH_MAX_FILES = 3200;
 const CODEGRAPH_MAX_DEPTH = 14;
 const CODEGRAPH_MAX_FILE_BYTES = 96 * 1024;
 const CODEGRAPH_DEFAULT_QUERY_LIMIT = 24;
+const LIVE_MINUTES_MIN = 1;
+const LIVE_MINUTES_MAX = 24 * 60;
 const CODEBASE_SIZE_EXTS = new Set([
   '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
   '.json', '.md', '.yaml', '.yml',
@@ -211,7 +214,12 @@ function nowIso() {
 }
 
 function parseArgs(argv) {
-  const out = { host: DEFAULT_HOST, port: DEFAULT_PORT, hours: DEFAULT_HOURS };
+  const out = {
+    host: DEFAULT_HOST,
+    port: DEFAULT_PORT,
+    hours: DEFAULT_HOURS,
+    live_minutes: DEFAULT_LIVE_MINUTES
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const tok = String(argv[i] || '');
     if (tok === '--host' && argv[i + 1]) {
@@ -231,6 +239,12 @@ function parseArgs(argv) {
       i += 1;
       continue;
     }
+    if (tok === '--live-minutes' && argv[i + 1]) {
+      const v = Number(argv[i + 1]);
+      if (Number.isFinite(v) && v > 0) out.live_minutes = Math.round(v);
+      i += 1;
+      continue;
+    }
   }
   return out;
 }
@@ -241,6 +255,19 @@ function clampNumber(v, lo, hi, fallback = lo) {
   if (n < lo) return lo;
   if (n > hi) return hi;
   return n;
+}
+
+function clampLiveMinutes(v, fallback = DEFAULT_LIVE_MINUTES) {
+  return clampNumber(v, LIVE_MINUTES_MIN, LIVE_MINUTES_MAX, fallback);
+}
+
+function parseBoolish(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  const text = String(value == null ? '' : value).trim().toLowerCase();
+  if (!text) return fallback;
+  if (text === '1' || text === 'true' || text === 'yes' || text === 'on') return true;
+  if (text === '0' || text === 'false' || text === 'no' || text === 'off') return false;
+  return fallback;
 }
 
 function safeJsonParse(line) {
@@ -568,7 +595,7 @@ function loadRecentTelemetry(hours = DEFAULT_HOURS, maxEvents = MAX_EVENTS) {
 }
 
 function loadRecentSpineEvents(hours = DEFAULT_HOURS, maxEvents = 600) {
-  const h = clampNumber(hours, 1, 24 * 30, DEFAULT_HOURS);
+  const h = clampNumber(hours, 1 / 60, 24 * 30, DEFAULT_HOURS);
   const cap = clampNumber(maxEvents, 20, 6000, 600);
   const cutoffMs = Date.now() - (h * 60 * 60 * 1000);
   const events = [];
@@ -613,6 +640,67 @@ function latestDatedJson(absDir) {
     file,
     rel,
     payload
+  };
+}
+
+function latestEventMs(events) {
+  const rows = Array.isArray(events) ? events : [];
+  for (const evt of rows) {
+    const ms = parseTsMs(evt && evt.ts);
+    if (ms != null) return ms;
+  }
+  return null;
+}
+
+function runtimeWindowMinutesFromInput(hours, liveMinutes, liveMode = true) {
+  if (liveMode === true) {
+    return clampLiveMinutes(liveMinutes, DEFAULT_LIVE_MINUTES);
+  }
+  return clampLiveMinutes(Math.round(clampNumber(hours, 1, 24 * 30, DEFAULT_HOURS) * 60), DEFAULT_HOURS * 60);
+}
+
+function buildRuntimeStatus(windowMinutes, spineEvents, continuumSnapshot) {
+  const nowMs = Date.now();
+  const liveM = clampLiveMinutes(windowMinutes, DEFAULT_LIVE_MINUTES);
+  const onlineMaxSec = Math.max(45, Math.round(liveM * 60));
+  const staleMaxSec = Math.max(onlineMaxSec + 30, Math.round(onlineMaxSec * 2));
+  const latestSpineMs = latestEventMs(spineEvents);
+  const latestContinuumMs = parseTsMs(continuumSnapshot && continuumSnapshot.last_pulse_ts);
+  const latestMs = Math.max(latestSpineMs || 0, latestContinuumMs || 0) || null;
+  const ageSec = latestMs != null ? Math.max(0, Math.round((nowMs - latestMs) / 1000)) : null;
+  const status = ageSec == null
+    ? 'offline'
+    : ageSec <= onlineMaxSec
+      ? 'online'
+      : ageSec <= staleMaxSec
+        ? 'stale'
+        : 'offline';
+  const statusReason = ageSec == null
+    ? 'no_recent_runtime_signal'
+    : status === 'online'
+      ? 'recent_runtime_signal'
+      : status === 'stale'
+        ? 'runtime_signal_aging'
+        : 'runtime_signal_expired';
+  const source = (latestSpineMs != null && latestContinuumMs != null)
+    ? (latestSpineMs >= latestContinuumMs ? 'spine' : 'continuum')
+    : (latestSpineMs != null ? 'spine' : (latestContinuumMs != null ? 'continuum' : 'none'));
+  const eventCount = Array.isArray(spineEvents) ? spineEvents.length : 0;
+  const activityScale = status === 'online' ? 1 : (status === 'stale' ? 0.58 : 0.18);
+  return {
+    status,
+    online: status === 'online',
+    stale: status === 'stale',
+    offline: status === 'offline',
+    reason: statusReason,
+    source,
+    live_window_minutes: Number(liveM),
+    online_max_sec: Number(onlineMaxSec),
+    stale_max_sec: Number(staleMaxSec),
+    latest_signal_ts: latestMs != null ? new Date(latestMs).toISOString() : '',
+    signal_age_sec: ageSec == null ? null : Number(ageSec),
+    spine_event_count_window: Number(eventCount),
+    activity_scale: Number(activityScale)
   };
 }
 
@@ -2954,6 +3042,9 @@ function buildHoloModel(runs, summary) {
   const continuum = summary && summary.continuum && typeof summary.continuum === 'object'
     ? summary.continuum
     : {};
+  const runtime = summary && summary.runtime && typeof summary.runtime === 'object'
+    ? summary.runtime
+    : {};
   const workflowBirth = summary && summary.workflow_birth && typeof summary.workflow_birth === 'object'
     ? summary.workflow_birth
     : {};
@@ -3014,6 +3105,12 @@ function buildHoloModel(runs, summary) {
       continuum_last_trit_label: String(continuum.last_trit_label || ''),
       continuum_last_skipped: continuum.last_skipped === true ? 1 : 0,
       continuum_pulse_age_sec: Number(continuum.pulse_age_sec || 0),
+      runtime_status: String(runtime.status || 'unknown'),
+      runtime_online: runtime.online === true ? 1 : 0,
+      runtime_stale: runtime.stale === true ? 1 : 0,
+      runtime_signal_age_sec: Number(runtime.signal_age_sec == null ? 0 : runtime.signal_age_sec),
+      runtime_live_window_minutes: Number(runtime.live_window_minutes || 0),
+      runtime_activity_scale: Number(runtime.activity_scale || 0),
       continuum_autotest_failed_last: Number(continuum.autotest_failed_last || 0),
       continuum_autotest_guard_blocked_last: Number(continuum.autotest_guard_blocked_last || 0),
       continuum_autotest_untested_modules_last: Number(continuum.autotest_untested_modules_last || 0),
@@ -3067,7 +3164,7 @@ function buildHoloModel(runs, summary) {
   };
 }
 
-function buildPayload(hours) {
+function buildPayload(hours, liveMinutes = DEFAULT_LIVE_MINUTES, liveMode = true) {
   const telemetry = loadRecentTelemetry(hours, MAX_EVENTS);
   const directives = loadDirectiveSummary();
   const strategy = loadStrategySummary();
@@ -3077,6 +3174,9 @@ function buildPayload(hours) {
   const evolution = loadEvolutionSnapshot();
   const fractalSnapshot = loadFractalSnapshot();
   const continuumSnapshot = loadContinuumSnapshot();
+  const runtimeWindowMinutes = runtimeWindowMinutesFromInput(telemetry.window_hours, liveMinutes, liveMode === true);
+  const runtimeSpineEvents = loadRecentSpineEvents(Math.max(1 / 60, runtimeWindowMinutes / 60), 240);
+  const runtimeStatus = buildRuntimeStatus(runtimeWindowMinutes, runtimeSpineEvents, continuumSnapshot);
   const workflowBirthSnapshot = loadWorkflowBirthSnapshot(telemetry.window_hours);
   const doctorSnapshot = loadDoctorHealthSnapshot(telemetry.window_hours);
   const fractal = {
@@ -3144,6 +3244,7 @@ function buildPayload(hours) {
     evolution,
     fractal,
     continuum,
+    runtime: runtimeStatus,
     workflow_birth: {
       available: workflowBirthSnapshot.available === true,
       file: String(workflowBirthSnapshot.file || ''),
@@ -3183,6 +3284,9 @@ function buildPayload(hours) {
   return {
     ok: true,
     generated_at: nowIso(),
+    live_mode: liveMode === true,
+    live_minutes: Number(runtimeWindowMinutes),
+    runtime: runtimeStatus,
     summary,
     graph,
     holo,
@@ -3200,8 +3304,9 @@ function buildPayload(hours) {
   };
 }
 
-function buildSpinePulse(hours = DEFAULT_HOURS) {
-  const events = loadRecentSpineEvents(Math.min(Math.max(1, Number(hours || DEFAULT_HOURS)), 24), 220);
+function buildSpinePulse(liveMinutes = DEFAULT_LIVE_MINUTES) {
+  const liveM = clampLiveMinutes(liveMinutes, DEFAULT_LIVE_MINUTES);
+  const events = loadRecentSpineEvents(Math.max(1 / 60, liveM / 60), 220);
   const typeCounts = {};
   for (const evt of events) {
     const type = String(evt && evt.type || 'unknown');
@@ -3209,6 +3314,7 @@ function buildSpinePulse(hours = DEFAULT_HOURS) {
   }
   return {
     generated_at: nowIso(),
+    live_window_minutes: Number(liveM),
     event_count: events.length,
     top_types: topCounts(typeCounts, 8),
     latest: events.slice(0, 18)
@@ -3232,21 +3338,25 @@ function wsSendJson(socket, payload) {
   }
 }
 
-function createHoloSnapshot(hours, reason) {
+function createHoloSnapshot(hours, liveMinutes, liveMode, reason) {
   const h = clampNumber(hours, 1, 24 * 30, DEFAULT_HOURS);
-  const payload = buildPayload(h);
+  const liveM = clampLiveMinutes(liveMinutes, DEFAULT_LIVE_MINUTES);
+  const payload = buildPayload(h, liveM, liveMode === true);
   return {
     type: 'holo_snapshot',
     reason: String(reason || 'tick'),
     generated_at: payload.generated_at,
+    live_mode: payload.live_mode === true,
+    live_minutes: Number(payload.live_minutes || liveM),
+    runtime: payload.runtime || (payload.summary && payload.summary.runtime) || null,
     summary: payload.summary,
     holo: payload.holo,
     incidents: payload.incidents || {},
-    spine_pulse: buildSpinePulse(h)
+    spine_pulse: buildSpinePulse(liveM)
   };
 }
 
-function createWsHub(server, defaultHours) {
+function createWsHub(server, defaultHours, defaultLiveMinutes) {
   if (!WebSocketServer) {
     return {
       enabled: false,
@@ -3272,22 +3382,27 @@ function createWsHub(server, defaultHours) {
   if (typeof pingTimer.unref === 'function') pingTimer.unref();
 
   const hoursFor = (ws) => clampNumber(ws && ws.sub_hours, 1, 24 * 30, defaultHours);
+  const liveMinutesFor = (ws) => clampLiveMinutes(ws && ws.sub_live_minutes, defaultLiveMinutes);
+  const liveModeFor = (ws) => (ws && ws.sub_live_mode === false ? false : true);
 
   const sendSnapshot = (ws, reason) => {
-    const snapshot = createHoloSnapshot(hoursFor(ws), reason);
+    const snapshot = createHoloSnapshot(hoursFor(ws), liveMinutesFor(ws), liveModeFor(ws), reason);
     wsSendJson(ws, snapshot);
   };
 
   const broadcast = (reason = 'tick') => {
     const openClients = Array.from(clients).filter((ws) => ws.readyState === 1);
     if (!openClients.length) return;
-    const snapshotByHours = {};
+    const snapshotBySubscription = {};
     for (const ws of openClients) {
       const h = hoursFor(ws);
-      if (!snapshotByHours[h]) {
-        snapshotByHours[h] = createHoloSnapshot(h, reason);
+      const liveM = liveMinutesFor(ws);
+      const liveMode = liveModeFor(ws);
+      const key = `${h}:${liveM}:${liveMode ? 1 : 0}`;
+      if (!snapshotBySubscription[key]) {
+        snapshotBySubscription[key] = createHoloSnapshot(h, liveM, liveMode, reason);
       }
-      wsSendJson(ws, snapshotByHours[h]);
+      wsSendJson(ws, snapshotBySubscription[key]);
     }
   };
 
@@ -3319,14 +3434,22 @@ function createWsHub(server, defaultHours) {
 
   wss.on('connection', (ws, req) => {
     let subHours = defaultHours;
+    let subLiveMinutes = defaultLiveMinutes;
+    let subLiveMode = true;
     try {
       const parsed = new URL(String(req && req.url || WS_PATH), `http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
       const qHours = Number(parsed.searchParams.get('hours'));
       if (Number.isFinite(qHours)) subHours = clampNumber(qHours, 1, 24 * 30, defaultHours);
+      const qLiveMinutes = Number(parsed.searchParams.get('live_minutes'));
+      if (Number.isFinite(qLiveMinutes)) subLiveMinutes = clampLiveMinutes(qLiveMinutes, defaultLiveMinutes);
+      const qLiveMode = parsed.searchParams.get('live_mode');
+      if (qLiveMode != null) subLiveMode = parseBoolish(qLiveMode, true);
     } catch {
       // ignore malformed URL
     }
     ws.sub_hours = subHours;
+    ws.sub_live_minutes = subLiveMinutes;
+    ws.sub_live_mode = subLiveMode;
     clients.add(ws);
     sendSnapshot(ws, 'connect');
 
@@ -3334,9 +3457,12 @@ function createWsHub(server, defaultHours) {
       const msg = safeParseMessage(raw);
       if (!msg || typeof msg !== 'object') return;
       const type = String(msg.type || '').trim().toLowerCase();
-      if (type === 'subscribe' || type === 'set_hours') {
+      if (type === 'subscribe' || type === 'set_hours' || type === 'set_live') {
         const h = Number(msg.hours);
         if (Number.isFinite(h)) ws.sub_hours = clampNumber(h, 1, 24 * 30, defaultHours);
+        const liveM = Number(msg.live_minutes);
+        if (Number.isFinite(liveM)) ws.sub_live_minutes = clampLiveMinutes(liveM, defaultLiveMinutes);
+        if (msg.live_mode != null) ws.sub_live_mode = parseBoolish(msg.live_mode, true);
         sendSnapshot(ws, 'subscribe');
       } else if (type === 'refresh') {
         sendSnapshot(ws, 'refresh');
@@ -4729,6 +4855,7 @@ function main() {
   const host = args.host || DEFAULT_HOST;
   const port = Number(args.port || DEFAULT_PORT);
   const defaultHours = clampNumber(args.hours, 1, 24 * 30, DEFAULT_HOURS);
+  const defaultLiveMinutes = clampLiveMinutes(args.live_minutes, DEFAULT_LIVE_MINUTES);
 
   const server = http.createServer((req, res) => {
     const parsed = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`);
@@ -4740,8 +4867,11 @@ function main() {
     if (pathname === '/api/graph') {
       const qHours = Number(parsed.searchParams.get('hours'));
       const hours = Number.isFinite(qHours) ? qHours : defaultHours;
+      const qLiveMinutes = Number(parsed.searchParams.get('live_minutes'));
+      const liveMinutes = Number.isFinite(qLiveMinutes) ? qLiveMinutes : defaultLiveMinutes;
+      const liveMode = parseBoolish(parsed.searchParams.get('live_mode'), true);
       try {
-        sendJson(res, 200, buildPayload(hours));
+        sendJson(res, 200, buildPayload(hours, liveMinutes, liveMode));
       } catch (err) {
         sendJson(res, 500, {
           ok: false,
@@ -4754,11 +4884,17 @@ function main() {
     if (pathname === '/api/holo') {
       const qHours = Number(parsed.searchParams.get('hours'));
       const hours = Number.isFinite(qHours) ? qHours : defaultHours;
+      const qLiveMinutes = Number(parsed.searchParams.get('live_minutes'));
+      const liveMinutes = Number.isFinite(qLiveMinutes) ? qLiveMinutes : defaultLiveMinutes;
+      const liveMode = parseBoolish(parsed.searchParams.get('live_mode'), true);
       try {
-        const payload = buildPayload(hours);
+        const payload = buildPayload(hours, liveMinutes, liveMode);
         sendJson(res, 200, {
           ok: true,
           generated_at: payload.generated_at,
+          live_mode: payload.live_mode === true,
+          live_minutes: Number(payload.live_minutes || liveMinutes),
+          runtime: payload.runtime || null,
           summary: payload.summary,
           holo: payload.holo,
           incidents: payload.incidents || {}
@@ -4879,7 +5015,7 @@ function main() {
       sendText(res, 404, 'not_found\n');
     }
   });
-  const wsHub = createWsHub(server, defaultHours);
+  const wsHub = createWsHub(server, defaultHours, defaultLiveMinutes);
   const tickTimer = setInterval(() => {
     if (wsHub.clientCount() > 0) wsHub.broadcast('tick');
   }, WS_TICK_MS);
@@ -4900,6 +5036,7 @@ function main() {
       port,
       url: `http://${host}:${port}`,
       default_hours: defaultHours,
+      default_live_minutes: defaultLiveMinutes,
       static_dir: STATIC_DIR,
       ws_path: WS_PATH,
       ws_enabled: wsHub.enabled,

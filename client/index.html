@@ -89,8 +89,16 @@
       font-size: 0.72rem;
       padding: 6px 8px;
     }
-    #controlBar input {
+    #queryInput {
       width: clamp(210px, 24vw, 360px);
+    }
+    #controlBar input[type="checkbox"] {
+      width: auto;
+      padding: 0;
+      margin: 0 2px 0 0;
+      border-radius: 4px;
+      accent-color: #5df7ff;
+      transform: scale(1.05);
     }
     #controlBar button {
       cursor: pointer;
@@ -441,6 +449,17 @@
       <option value="24" selected>24h</option>
       <option value="72">72h</option>
       <option value="168">7d</option>
+    </select>
+    <label for="liveMode">Live</label>
+    <input id="liveMode" type="checkbox" checked>
+    <label for="liveMinutes">Live Window</label>
+    <select id="liveMinutes">
+      <option value="2">2m</option>
+      <option value="5">5m</option>
+      <option value="6" selected>6m</option>
+      <option value="10">10m</option>
+      <option value="15">15m</option>
+      <option value="30">30m</option>
     </select>
     <input id="queryInput" type="text" placeholder="Code query (e.g. who imports systems/spine/spine.ts)">
     <button id="queryRun">Query</button>
