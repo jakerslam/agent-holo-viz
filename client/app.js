@@ -90,6 +90,7 @@ const state = {
   selected: null,
   selected_subfractal: null,
   selected_link: null,
+  workflow_birth_selection_id: '',
   hover: null,
   refresh_ms: 6000,
   refresh_timer: null,
@@ -1549,8 +1550,43 @@ function nodeErrorRowsForSelection(node, integrityRows = [], errorSignal = 0) {
   const row = node && typeof node === 'object' ? node : null;
   if (!row) return out;
   const hasIntegrityRows = Array.isArray(integrityRows) && integrityRows.length > 0;
+  const doctorState = String(row.doctor_state || '').trim().toLowerCase();
+  const hasDoctorState = Boolean(doctorState);
   const hasNodeError = row.error_state_active === true || row.integrity_alert === true;
-  if (!hasNodeError || hasIntegrityRows) return out;
+  if (!hasNodeError && !hasDoctorState) return out;
+
+  if (hasDoctorState) {
+    const doctorCode = String(row.doctor_code || 'autotest_doctor_event').trim();
+    const doctorReason = String(
+      row.doctor_summary
+      || (
+        doctorState === 'rollback_cut'
+          ? 'Doctor triggered rollback cut due to failed repair/regression.'
+          : doctorState === 'wounded'
+            ? 'Doctor marked this module as wounded due to destructive/blocked repair signal.'
+            : doctorState === 'healing'
+              ? 'Doctor healing attempt in progress.'
+              : doctorState === 'regrowth'
+                ? 'Doctor observed successful regrowth for this module.'
+                : 'Doctor event mapped to selected node.'
+      )
+    ).trim();
+    const stateLabel = doctorState
+      ? doctorState.replace(/_/g, ' ')
+      : 'active';
+    out.push(['Errors', stateLabel]);
+    out.push(['Error Source', `autotest_doctor/${doctorCode}`]);
+    out.push(['Error Reason', doctorReason]);
+    if (row.doctor_severity) {
+      out.push(['Error Severity', String(row.doctor_severity).toLowerCase()]);
+    }
+    if (row.doctor_module) {
+      out.push(['Error Module', String(row.doctor_module)]);
+    }
+    if (!hasNodeError) return out;
+  }
+
+  if (hasIntegrityRows && !hasDoctorState) return out;
 
   const source = row.integrity_alert === true
     ? 'integrity'
@@ -1573,11 +1609,30 @@ function linkErrorRowsForSelection(link) {
   const out = [];
   const row = link && typeof link === 'object' ? link : null;
   if (!row) return out;
+  const doctorState = String(row.doctor_state || '').trim().toLowerCase();
+  const kind = String(row.kind || '').trim().toLowerCase();
   const errWeight = clamp(Number(row.error_weight || 0), 0, 1);
   const blockedRatio = clamp(Number(row.blocked_ratio || 0), 0, 1);
   const blocked = row.flow_blocked === true || blockedRatio > 0.02;
   const degraded = errWeight >= 0.045;
-  if (!blocked && !degraded) return out;
+  const doctorPath = kind === 'doctor' || Boolean(doctorState);
+  if (!blocked && !degraded && !doctorPath) return out;
+
+  if (doctorPath) {
+    const stateLabel = doctorState || (blocked ? 'wounded' : 'healing');
+    out.push(['Errors', stateLabel.replace(/_/g, ' ')]);
+    out.push(['Error Source', 'autotest_doctor/doctor_link']);
+    if (blocked) {
+      out.push(['Error Reason', String(row.block_reason || 'Doctor flow blocked by rollback/kill switch signal.')]);
+    } else if (doctorState === 'regrowth') {
+      out.push(['Error Reason', 'Doctor regrowth link indicates module recovered.']);
+    } else if (doctorState === 'healing') {
+      out.push(['Error Reason', 'Doctor healing attempt flow active.']);
+    } else {
+      out.push(['Error Reason', `Doctor path watch signal at ${fmtNum(errWeight * 100)}% weight.`]);
+    }
+    return out;
+  }
 
   out.push(['Errors', blocked ? 'Blocked Flow' : 'Degraded Flow']);
   out.push(['Error Source', blocked ? 'flow_block' : 'error_weight']);
@@ -2063,6 +2118,15 @@ function buildScene(payload) {
   const holo = payload && payload.holo && typeof payload.holo === 'object' ? payload.holo : null;
   if (!holo) return null;
   const summary = payload && payload.summary && typeof payload.summary === 'object' ? payload.summary : {};
+  const workflowBirth = holo.workflow_birth && typeof holo.workflow_birth === 'object'
+    ? holo.workflow_birth
+    : (summary.workflow_birth && typeof summary.workflow_birth === 'object' ? summary.workflow_birth : {});
+  const doctor = holo.doctor && typeof holo.doctor === 'object'
+    ? holo.doctor
+    : (summary.doctor && typeof summary.doctor === 'object' ? summary.doctor : {});
+  const doctorModules = Array.isArray(doctor.modules) ? doctor.modules : [];
+  const doctorWoundedActive = Number(doctor.wounded_active || 0);
+  const doctorCoreAlert = doctorWoundedActive > 0;
   const errorSignal = computeErrorSignal(summary);
   const integrity = normalizeIntegrityIncident(payload);
   const integrityAlert = integrity.active === true;
@@ -2209,10 +2273,17 @@ function buildScene(payload) {
     y: center.y,
     radius: 15,
     activity: clamp(holo.metrics && holo.metrics.drift_proxy, 0, 1),
-    error_hint: 0.1,
+    error_hint: clamp(0.1 + (doctorCoreAlert ? 0.26 : 0), 0, 1),
     integrity_alert: integrityAlert,
     integrity_severity: integrity.severity,
-    error_state_active: integrityAlert,
+    error_state_active: integrityAlert || doctorCoreAlert,
+    doctor_state: doctorCoreAlert ? 'wounded' : '',
+    doctor_code: doctorCoreAlert ? 'autotest_doctor_wounded_module' : '',
+    doctor_summary: doctorCoreAlert
+      ? `Doctor reports ${fmtNum(doctorWoundedActive)} wounded module(s).`
+      : '',
+    doctor_severity: doctorCoreAlert ? 'high' : '',
+    doctor_module: '',
     change_state: spineChangeState,
     change_active: spineChangeState.changed === true
   };
@@ -2231,6 +2302,14 @@ function buildScene(payload) {
     activity: 0.5,
     integrity_alert: integrityAlert,
     integrity_severity: integrity.severity,
+    error_state_active: integrityAlert || doctorCoreAlert,
+    doctor_state: doctorCoreAlert ? 'wounded' : '',
+    doctor_code: doctorCoreAlert ? 'autotest_doctor_wounded_module' : '',
+    doctor_summary: doctorCoreAlert
+      ? `Doctor reports ${fmtNum(doctorWoundedActive)} wounded module(s).`
+      : '',
+    doctor_severity: doctorCoreAlert ? 'high' : '',
+    doctor_module: '',
     change_state: spineChangeState,
     change_active: spineChangeState.changed === true
   };
@@ -2369,6 +2448,14 @@ function buildScene(payload) {
     const layerOrbitDirection = (orbitSeed % 2 === 0) ? 1 : -1;
     const layerOrbitSpeed = layerOrbitDirection * (0.000018 + ((orbitSeed % 6) * 0.000001));
     const layerIntegrityAlert = integrityAlert && (layerKey === 'systems' || layerRel.toLowerCase().includes('systems'));
+    const layerDoctor = doctorModuleMatchForRel(doctorModules, layerRel);
+    const layerDoctorState = String(layerDoctor && layerDoctor.latest_state || '').trim().toLowerCase();
+    const layerDoctorError = doctorStateIsError(layerDoctorState);
+    const layerErrorHint = clamp(
+      computeNodeErrorHint(layerId, layerRel, layer.name, layer.key) + doctorStateHintBoost(layerDoctorState),
+      0,
+      1
+    );
     const layerNode = {
       id: layerId,
       type: 'layer',
@@ -2380,10 +2467,15 @@ function buildScene(payload) {
       radius: layerRadius,
       ring_width: Math.max(13, nominalRingStep * 0.5),
       activity: clamp(layer.activity, 0, 1),
-      error_hint: computeNodeErrorHint(layerId, layerRel, layer.name, layer.key),
+      error_hint: layerErrorHint,
       integrity_alert: layerIntegrityAlert,
       integrity_severity: integrity.severity,
-      error_state_active: layerIntegrityAlert
+      error_state_active: layerIntegrityAlert || layerDoctorError,
+      doctor_state: layerDoctorState,
+      doctor_code: String(layerDoctor && layerDoctor.latest_code || ''),
+      doctor_summary: String(layerDoctor && layerDoctor.latest_summary || ''),
+      doctor_severity: String(layerDoctor && layerDoctor.latest_severity || ''),
+      doctor_module: String(layerDoctor && layerDoctor.module || '')
     };
     nodes.push(layerNode);
     nodeById[layerNode.id] = layerNode;
@@ -2415,6 +2507,9 @@ function buildScene(payload) {
       const modId = String(mod.id || `${layerId}/m${mi}`);
       const modRel = String(mod.rel || `${layerRel}/${String(mod.name || modId)}`);
       const moduleIntegrityAlert = integrityAlert && hasIntegrityPathMatch(modRel, integrityFiles);
+      const moduleDoctor = doctorModuleMatchForRel(doctorModules, modRel);
+      const moduleDoctorState = String(moduleDoctor && moduleDoctor.latest_state || '').trim().toLowerCase();
+      const moduleDoctorError = doctorStateIsError(moduleDoctorState);
       const moduleChangeState = normalizeChangeState(mod && mod.change_state);
       const spinSeed = (stableHash(`${modId}|spin`) % 1000) / 1000;
       const spinBase = (stableHash(`${modId}|spinbase`) % 6283) / 1000;
@@ -2441,10 +2536,19 @@ function buildScene(payload) {
         codebase_size_norm: clamp(Number(modRow.codebase_size_norm || 0.5), 0, 1),
         child_ids: [],
         activity: clamp(mod.activity, 0, 1),
-        error_hint: computeNodeErrorHint(modId, modRel, mod.name, layerNode.name),
+        error_hint: clamp(
+          computeNodeErrorHint(modId, modRel, mod.name, layerNode.name) + doctorStateHintBoost(moduleDoctorState),
+          0,
+          1
+        ),
         integrity_alert: moduleIntegrityAlert,
         integrity_severity: integrity.severity,
-        error_state_active: moduleIntegrityAlert,
+        error_state_active: moduleIntegrityAlert || moduleDoctorError,
+        doctor_state: moduleDoctorState,
+        doctor_code: String(moduleDoctor && moduleDoctor.latest_code || ''),
+        doctor_summary: String(moduleDoctor && moduleDoctor.latest_summary || ''),
+        doctor_severity: String(moduleDoctor && moduleDoctor.latest_severity || ''),
+        doctor_module: String(moduleDoctor && moduleDoctor.module || ''),
         change_state: moduleChangeState,
         change_active: moduleChangeState.changed === true
       };
@@ -2491,7 +2595,10 @@ function buildScene(payload) {
         }
         const subErrorHint = computeNodeErrorHint(subId, subRel, sub.name, moduleNode.name);
         const subIntegrityAlert = integrityAlert && hasIntegrityPathMatch(subRel, integrityFiles);
-        const subErrorActive = subIntegrityAlert || hasActiveErrorState(sub, subErrorHint, errorSignal);
+        const subDoctor = doctorModuleMatchForRel(doctorModules, subRel);
+        const subDoctorState = String(subDoctor && subDoctor.latest_state || '').trim().toLowerCase();
+        const subDoctorError = doctorStateIsError(subDoctorState);
+        const subErrorActive = subIntegrityAlert || subDoctorError || hasActiveErrorState(sub, subErrorHint, errorSignal);
         const subChangeState = normalizeChangeState(sub && sub.change_state);
         const subNode = {
           id: subId,
@@ -2514,10 +2621,15 @@ function buildScene(payload) {
           subfractal_children: subfractalChildren,
           subfractal_count: subfractalChildren.length,
           activity: clamp(sub.activity, 0, 1),
-          error_hint: subErrorHint,
+          error_hint: clamp(subErrorHint + doctorStateHintBoost(subDoctorState), 0, 1),
           error_state_active: subErrorActive,
           integrity_alert: subIntegrityAlert,
           integrity_severity: integrity.severity,
+          doctor_state: subDoctorState,
+          doctor_code: String(subDoctor && subDoctor.latest_code || ''),
+          doctor_summary: String(subDoctor && subDoctor.latest_summary || ''),
+          doctor_severity: String(subDoctor && subDoctor.latest_severity || ''),
+          doctor_module: String(subDoctor && subDoctor.module || ''),
           change_state: subChangeState,
           change_active: subChangeState.changed === true
         };
@@ -2629,6 +2741,7 @@ function buildScene(payload) {
       blocked_ratio: clamp(Number(row.blocked_ratio || 0), 0, 1),
       flow_blocked: row.flow_blocked === true,
       block_reason: String(row.block_reason || '').trim(),
+      doctor_state: String(row.doctor_state || '').trim().toLowerCase(),
       kind,
       arc_side: (stableHash(`${row.from}|${row.to}|${kind}`) % 2) ? 1 : -1
     };
@@ -2650,6 +2763,16 @@ function buildScene(payload) {
       : 0;
     if (link.flow_blocked || link.blocked_ratio > 0.01) {
       link.error_weight = Math.max(link.error_weight, clamp(0.16 + (link.blocked_ratio * 0.74), 0.16, 0.96));
+    }
+    if (kind === 'doctor') {
+      const doctorState = String(link.doctor_state || '').trim().toLowerCase();
+      if (doctorState === 'wounded' || doctorState === 'rollback_cut') {
+        link.error_weight = Math.max(link.error_weight, 0.68);
+      } else if (doctorState === 'healing') {
+        link.error_weight = Math.max(link.error_weight, 0.2);
+      } else if (doctorState === 'regrowth') {
+        link.error_weight = Math.max(link.error_weight, 0.08);
+      }
     }
     if (integrityPathAlert) {
       link.error_weight = Math.max(link.error_weight, clamp(0.52 + (link.activity * 0.38), 0.52, 0.95));
@@ -2685,7 +2808,9 @@ function buildScene(payload) {
     integrity_alert: integrityAlert,
     integrity_severity: integrity.severity,
     integrity_violation_total: Number(integrity.violation_total || 0),
-    integrity_top_files: integrityFiles
+    integrity_top_files: integrityFiles,
+    doctor,
+    workflow_birth: workflowBirth
   };
 }
 
@@ -3539,6 +3664,8 @@ function drawLinks(scene) {
     const introScale = Math.min(nodeIntroScale(fromNode), nodeIntroScale(toNode));
     if (introScale <= 0.02) continue;
     const kind = String(link.kind || '').toLowerCase();
+    const doctorState = String(link.doctor_state || '').trim().toLowerCase();
+    const doctorLink = kind === 'doctor' || Boolean(doctorState);
     if (kind === 'fractal') {
       const alpha = clamp((0.2 + (Number(link.activity || 0) * 0.35)) * (0.2 + introScale * 0.8) * codegraphScale, 0.06, 0.8);
       const resolvedAlpha = resolvedFlashAlpha('link', String(link && link.id || ''), nowTs);
@@ -3563,7 +3690,13 @@ function drawLinks(scene) {
     const alpha = (profile.tube_alpha + (link.activity * 0.12)) * (0.22 + (introScale * 0.78)) * codegraphScale;
     const baseLineWidth = (0.8 + (link.activity * 1.8)) * (0.35 + (introScale * 0.65));
     if (state.quality_tier === 'high' || state.quality_tier === 'ultra') {
-      if (errActive || blockedActive) {
+      if (doctorLink && doctorState === 'healing') {
+        ctx.shadowColor = `rgba(246,246,238,${clamp((0.2 + (link.activity * 0.25)) * codegraphScale, 0.08, 0.72)})`;
+        ctx.shadowBlur = (6 + (link.activity * 12)) * (0.2 + (introScale * 0.8));
+      } else if (doctorLink && doctorState === 'regrowth') {
+        ctx.shadowColor = `rgba(132,255,176,${clamp((0.22 + (link.activity * 0.28)) * codegraphScale, 0.08, 0.78)})`;
+        ctx.shadowBlur = (6 + (link.activity * 13)) * (0.2 + (introScale * 0.8));
+      } else if (errActive || blockedActive) {
         ctx.shadowColor = `rgba(255,78,78,${(0.24 + (errW * 0.4)) * codegraphScale})`;
         ctx.shadowBlur = (8 + (errW * 22)) * (0.2 + (introScale * 0.8));
       } else {
@@ -3577,6 +3710,12 @@ function drawLinks(scene) {
     }
     if (resolvedAlpha > 0) {
       ctx.strokeStyle = `rgba(128,255,174,${clamp(0.2 + alpha + (resolvedAlpha * 0.42), 0.12, 0.98)})`;
+      ctx.lineWidth = baseLineWidth;
+    } else if (doctorLink && doctorState === 'healing') {
+      ctx.strokeStyle = `rgba(244,242,235,${clamp(0.16 + alpha + 0.2, 0.08, 0.96)})`;
+      ctx.lineWidth = baseLineWidth;
+    } else if (doctorLink && doctorState === 'regrowth') {
+      ctx.strokeStyle = `rgba(130,255,174,${clamp(0.14 + alpha + 0.18, 0.08, 0.96)})`;
       ctx.lineWidth = baseLineWidth;
     } else if (codegraphMatch) {
       ctx.strokeStyle = `rgba(232,246,255,${clamp(0.2 + alpha + 0.28, 0.1, 0.98)})`;
@@ -3884,6 +4023,7 @@ function describeLinkProcess(link) {
   if (kind === 'route') return 'Route dispatch between modules';
   if (kind === 'ingress') return 'Ingress path from external input';
   if (kind === 'egress') return 'Egress path to external output';
+  if (kind === 'doctor') return 'Autotest Doctor healing/rollback path';
   return 'Cross-module process path';
 }
 
@@ -4063,6 +4203,221 @@ function setPreviewTab(tab) {
   renderStats();
 }
 
+function workflowBirthSnapshot(scene, summary) {
+  const fromScene = scene && scene.workflow_birth && typeof scene.workflow_birth === 'object'
+    ? scene.workflow_birth
+    : null;
+  const fromSummary = summary && summary.workflow_birth && typeof summary.workflow_birth === 'object'
+    ? summary.workflow_birth
+    : null;
+  const src = fromScene || fromSummary || {};
+  return {
+    available: src.available === true,
+    events_total: Number(src.events_total || 0),
+    candidates_total: Number(src.candidates_total || 0),
+    runs_total: Number(src.runs_total || 0),
+    latest_run_id: String(src.latest_run_id || ''),
+    stage_counts: src.stage_counts && typeof src.stage_counts === 'object' ? src.stage_counts : {},
+    lineage_nodes: Array.isArray(src.lineage_nodes) ? src.lineage_nodes : [],
+    lineage_edges: Array.isArray(src.lineage_edges) ? src.lineage_edges : []
+  };
+}
+
+function workflowBirthNodeById(snapshot) {
+  const out = Object.create(null);
+  for (const row of snapshot.lineage_nodes || []) {
+    const id = String(row && row.candidate_id || '').trim();
+    if (!id) continue;
+    out[id] = row;
+  }
+  return out;
+}
+
+function workflowBirthDefaultSelection(snapshot) {
+  const rows = Array.isArray(snapshot && snapshot.lineage_nodes) ? snapshot.lineage_nodes : [];
+  if (!rows.length) return '';
+  const sorted = rows.slice().sort((a, b) => {
+    const sa = Number(a && a.scorecard && a.scorecard.composite_score || -999);
+    const sb = Number(b && b.scorecard && b.scorecard.composite_score || -999);
+    if (Math.abs(sa - sb) > 0.0001) return sb - sa;
+    const da = Number(a && a.fractal_depth || 0);
+    const db = Number(b && b.fractal_depth || 0);
+    if (Math.abs(da - db) > 0.0001) return da - db;
+    return String(a && a.candidate_id || '').localeCompare(String(b && b.candidate_id || ''));
+  });
+  return String(sorted[0] && sorted[0].candidate_id || '');
+}
+
+function workflowBirthLineagePath(nodeById, node) {
+  if (!node || typeof node !== 'object') return [];
+  if (Array.isArray(node.lineage_path) && node.lineage_path.length) {
+    return node.lineage_path.map((row) => String(row || '').trim()).filter(Boolean).slice(0, 12);
+  }
+  const out = [];
+  const seen = new Set();
+  let cur = String(node.candidate_id || '').trim();
+  while (cur && !seen.has(cur) && out.length < 12) {
+    seen.add(cur);
+    out.push(cur);
+    const parent = nodeById[cur] ? String(nodeById[cur].parent_candidate_id || '').trim() : '';
+    if (!parent) break;
+    cur = parent;
+  }
+  return out.reverse();
+}
+
+function shouldShowWorkflowBirthPanel(selectedType) {
+  const t = String(selectedType || '').toLowerCase();
+  if (!t) return true;
+  if (t === 'link') return false;
+  return true;
+}
+
+function doctorHealthSnapshot(scene, summary) {
+  const fromScene = scene && scene.doctor && typeof scene.doctor === 'object'
+    ? scene.doctor
+    : null;
+  const fromSummary = summary && summary.doctor && typeof summary.doctor === 'object'
+    ? summary.doctor
+    : null;
+  const src = fromScene || fromSummary || {};
+  return {
+    available: src.available === true,
+    events_total: Number(src.events_total || 0),
+    wounded_active: Number(src.wounded_active || 0),
+    healing_active: Number(src.healing_active || 0),
+    regrowth_recent: Number(src.regrowth_recent || 0),
+    modules_total: Number(src.modules_total || 0),
+    modules: Array.isArray(src.modules) ? src.modules : [],
+    events_recent: Array.isArray(src.events_recent) ? src.events_recent : []
+  };
+}
+
+function doctorStateIsError(stateText) {
+  const stateName = String(stateText || '').trim().toLowerCase();
+  return stateName === 'wounded' || stateName === 'rollback_cut';
+}
+
+function doctorStateHintBoost(stateText) {
+  const stateName = String(stateText || '').trim().toLowerCase();
+  if (stateName === 'rollback_cut') return 0.74;
+  if (stateName === 'wounded') return 0.66;
+  if (stateName === 'healing') return 0.26;
+  if (stateName === 'regrowth') return 0.12;
+  return 0;
+}
+
+function doctorModuleMatchForRel(moduleRows, relPath) {
+  const rel = normalizeRelPathText(relPath);
+  if (!rel) return null;
+  const rows = Array.isArray(moduleRows) ? moduleRows : [];
+  let best = null;
+  let bestScore = -1;
+  for (const row of rows) {
+    const moduleRel = normalizeRelPathText(row && row.module);
+    if (!moduleRel) continue;
+    if (!relPathsOverlap(rel, moduleRel)) continue;
+    const score = moduleRel.length;
+    if (score > bestScore) {
+      best = row;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function buildWorkflowBirthPanelHtml(snapshot) {
+  if (!snapshot || snapshot.available !== true) return '';
+  const rows = Array.isArray(snapshot.lineage_nodes) ? snapshot.lineage_nodes : [];
+  if (!rows.length) return '';
+  const nodeById = workflowBirthNodeById(snapshot);
+  const selectedIdRaw = String(state.workflow_birth_selection_id || '').trim();
+  const selectedId = selectedIdRaw && nodeById[selectedIdRaw]
+    ? selectedIdRaw
+    : workflowBirthDefaultSelection(snapshot);
+  state.workflow_birth_selection_id = selectedId || '';
+  const selected = selectedId ? nodeById[selectedId] : null;
+  const selectedScore = selected && selected.scorecard && typeof selected.scorecard === 'object'
+    ? selected.scorecard
+    : {};
+  const lineage = workflowBirthLineagePath(nodeById, selected);
+  const stageCounts = snapshot.stage_counts && typeof snapshot.stage_counts === 'object'
+    ? snapshot.stage_counts
+    : {};
+  const topStages = Object.entries(stageCounts)
+    .map(([stage, count]) => [String(stage || ''), Number(count || 0)])
+    .filter(([stage, count]) => stage && Number.isFinite(count) && count > 0)
+    .sort((a, b) => {
+      if (Math.abs(Number(a[1] || 0) - Number(b[1] || 0)) > 0.0001) return Number(b[1] || 0) - Number(a[1] || 0);
+      return String(a[0] || '').localeCompare(String(b[0] || ''));
+    })
+    .slice(0, 3)
+    .map(([stage, count]) => `${stage}:${fmtNum(count)}`);
+  const buttonRows = rows.slice(0, 16).map((row) => {
+    const cid = String(row && row.candidate_id || '').trim();
+    if (!cid) return '';
+    const shortId = cid.length > 14 ? `${cid.slice(0, 14)}…` : cid;
+    const stage = String(row && row.last_stage || '').trim();
+    const cls = cid === selectedId ? 'birthCandidateBtn active' : 'birthCandidateBtn';
+    const label = stage ? `${shortId} · ${stage}` : shortId;
+    return `<button class="${cls}" type="button" data-workflow-candidate-id="${escapeHtml(cid)}">${escapeHtml(label)}</button>`;
+  }).filter(Boolean).join('');
+  const lineageLabel = lineage.length ? lineage.map((row) => escapeHtml(row)).join(' <span class="birthArrow">→</span> ') : 'n/a';
+  const selectedType = String(selected && selected.proposal_type || 'n/a');
+  const selectedStage = String(selected && selected.last_stage || 'n/a');
+  const selectedMutation = String(selected && selected.mutation_kind || 'none');
+  const driftDelta = selectedScore && Number.isFinite(Number(selectedScore.predicted_drift_delta))
+    ? `${fmtNum(Number(selectedScore.predicted_drift_delta || 0) * 100)}%`
+    : 'n/a';
+  const yieldDelta = selectedScore && Number.isFinite(Number(selectedScore.predicted_yield_delta))
+    ? `${fmtNum(Number(selectedScore.predicted_yield_delta || 0) * 100)}%`
+    : 'n/a';
+  const scorecard = selectedScore && Number.isFinite(Number(selectedScore.composite_score))
+    ? fmtNum(Number(selectedScore.composite_score || 0))
+    : 'n/a';
+  const tritAlign = selectedScore && Number.isFinite(Number(selectedScore.trit_alignment))
+    ? fmtNum(Number(selectedScore.trit_alignment || 0))
+    : 'n/a';
+  const pass = typeof selectedScore.adversarial_pass === 'boolean'
+    ? (selectedScore.adversarial_pass ? 'pass' : 'fail')
+    : 'n/a';
+  const topStagesLabel = topStages.length ? topStages.join(' | ') : 'n/a';
+
+  return [
+    '<div class="workflowBirthPanel">',
+    '  <div class="birthHeader">Workflow Birth Lineage</div>',
+    `  <div class="birthMeta">events ${fmtNum(snapshot.events_total)} | candidates ${fmtNum(snapshot.candidates_total)} | run ${escapeHtml(snapshot.latest_run_id || 'n/a')}</div>`,
+    `  <div class="birthMeta">stages ${escapeHtml(topStagesLabel)}</div>`,
+    `  <div class="birthLineage">${lineageLabel}</div>`,
+    '  <div class="birthButtons">',
+    buttonRows || '<span class="birthEmpty">No lineage nodes in window.</span>',
+    '  </div>',
+    '  <div class="birthScorecard">',
+    `    <div class="birthScoreRow"><span>Candidate</span><span>${escapeHtml(selectedId || 'n/a')}</span></div>`,
+    `    <div class="birthScoreRow"><span>Proposal Type</span><span>${escapeHtml(selectedType)}</span></div>`,
+    `    <div class="birthScoreRow"><span>Stage</span><span>${escapeHtml(selectedStage)}</span></div>`,
+    `    <div class="birthScoreRow"><span>Mutation</span><span>${escapeHtml(selectedMutation)}</span></div>`,
+    `    <div class="birthScoreRow"><span>Composite</span><span>${escapeHtml(scorecard)}</span></div>`,
+    `    <div class="birthScoreRow"><span>Trit Align</span><span>${escapeHtml(tritAlign)}</span></div>`,
+    `    <div class="birthScoreRow"><span>Drift Delta</span><span>${escapeHtml(driftDelta)}</span></div>`,
+    `    <div class="birthScoreRow"><span>Yield Delta</span><span>${escapeHtml(yieldDelta)}</span></div>`,
+    `    <div class="birthScoreRow"><span>Adversarial</span><span>${escapeHtml(pass)}</span></div>`,
+    '  </div>',
+    '</div>'
+  ].join('');
+}
+
+function onStatsGridClick(ev) {
+  const target = ev && ev.target && typeof ev.target.closest === 'function'
+    ? ev.target.closest('[data-workflow-candidate-id]')
+    : null;
+  if (!target) return;
+  const candidateId = String(target.getAttribute('data-workflow-candidate-id') || '').trim();
+  if (!candidateId) return;
+  state.workflow_birth_selection_id = candidateId;
+  renderStats();
+}
+
 function renderStats() {
   const payload = state.payload || {};
   const integrityIncident = normalizeIntegrityIncident(payload);
@@ -4082,6 +4437,24 @@ function renderStats() {
   const continuum = summary.continuum && typeof summary.continuum === 'object'
     ? summary.continuum
     : {};
+  const workflowBirth = workflowBirthSnapshot(state.scene, summary);
+  const doctor = doctorHealthSnapshot(state.scene, summary);
+  const workflowBirthStageCounts = workflowBirth.stage_counts && typeof workflowBirth.stage_counts === 'object'
+    ? workflowBirth.stage_counts
+    : {};
+  const workflowBirthTopStage = Object.entries(workflowBirthStageCounts)
+    .map(([stage, count]) => [String(stage || ''), Number(count || 0)])
+    .filter(([stage, count]) => stage && Number.isFinite(count) && count > 0)
+    .sort((a, b) => {
+      if (Math.abs(Number(a[1] || 0) - Number(b[1] || 0)) > 0.0001) return Number(b[1] || 0) - Number(a[1] || 0);
+      return String(a[0] || '').localeCompare(String(b[0] || ''));
+    });
+  const workflowBirthTopStageLabel = workflowBirthTopStage.length
+    ? `${workflowBirthTopStage[0][0]}:${fmtNum(workflowBirthTopStage[0][1])}`
+    : 'n/a';
+  const doctorHealthLabel = Number(doctor.wounded_active || 0) > 0
+    ? `Wounded ${fmtNum(doctor.wounded_active)}`
+    : (Number(doctor.healing_active || 0) > 0 ? `Healing ${fmtNum(doctor.healing_active)}` : 'Nominal');
   const continuumAvailable = continuum.available === true;
   const continuumPulseAgeSec = Number(continuum.pulse_age_sec || 0);
   const continuumPulseStatus = !continuumAvailable
@@ -4228,6 +4601,15 @@ function renderStats() {
       ['Continuum Anticipation', fmtNum(continuum.anticipation_candidates_last || 0)],
       ['Continuum Red-Team Critical', fmtNum(continuum.red_team_critical_last || 0)],
       ['Continuum Observer Mood', String(continuum.observer_mood_last || 'n/a')],
+      ['Doctor Health', doctorHealthLabel],
+      ['Doctor Events', fmtNum(doctor.events_total || 0)],
+      ['Doctor Wounded Active', fmtNum(doctor.wounded_active || 0)],
+      ['Doctor Healing Active', fmtNum(doctor.healing_active || 0)],
+      ['Doctor Regrowth Recent', fmtNum(doctor.regrowth_recent || 0)],
+      ['Workflow Birth Events', fmtNum(workflowBirth.events_total || 0)],
+      ['Workflow Birth Candidates', fmtNum(workflowBirth.candidates_total || 0)],
+      ['Workflow Birth Latest Run', String(workflowBirth.latest_run_id || 'n/a')],
+      ['Workflow Birth Top Stage', workflowBirthTopStageLabel],
       ['Continuum Skip Reasons', continuumSkipReasons || 'n/a'],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
@@ -4277,6 +4659,15 @@ function renderStats() {
       ['Continuum Anticipation', fmtNum(continuum.anticipation_candidates_last || 0)],
       ['Continuum Red-Team Critical', fmtNum(continuum.red_team_critical_last || 0)],
       ['Continuum Observer Mood', String(continuum.observer_mood_last || 'n/a')],
+      ['Doctor Health', doctorHealthLabel],
+      ['Doctor Events', fmtNum(doctor.events_total || 0)],
+      ['Doctor Wounded Active', fmtNum(doctor.wounded_active || 0)],
+      ['Doctor Healing Active', fmtNum(doctor.healing_active || 0)],
+      ['Doctor Regrowth Recent', fmtNum(doctor.regrowth_recent || 0)],
+      ['Workflow Birth Events', fmtNum(workflowBirth.events_total || 0)],
+      ['Workflow Birth Candidates', fmtNum(workflowBirth.candidates_total || 0)],
+      ['Workflow Birth Latest Run', String(workflowBirth.latest_run_id || 'n/a')],
+      ['Workflow Birth Top Stage', workflowBirthTopStageLabel],
       ['Continuum Skip Reasons', continuumSkipReasons || 'n/a'],
       ...selectedChangeRows,
       ...selectedNodeErrorRows,
@@ -4465,6 +4856,15 @@ function renderStats() {
       ['Continuum Anticipation', fmtNum(continuum.anticipation_candidates_last || 0)],
       ['Continuum Red-Team Critical', fmtNum(continuum.red_team_critical_last || 0)],
       ['Continuum Observer Mood', String(continuum.observer_mood_last || 'n/a')],
+      ['Doctor Health', doctorHealthLabel],
+      ['Doctor Events', fmtNum(doctor.events_total || 0)],
+      ['Doctor Wounded Active', fmtNum(doctor.wounded_active || 0)],
+      ['Doctor Healing Active', fmtNum(doctor.healing_active || 0)],
+      ['Doctor Regrowth Recent', fmtNum(doctor.regrowth_recent || 0)],
+      ['Workflow Birth Events', fmtNum(workflowBirth.events_total || 0)],
+      ['Workflow Birth Candidates', fmtNum(workflowBirth.candidates_total || 0)],
+      ['Workflow Birth Latest Run', String(workflowBirth.latest_run_id || 'n/a')],
+      ['Workflow Birth Top Stage', workflowBirthTopStageLabel],
       ['Continuum Skip Reasons', continuumSkipReasons || 'n/a'],
       ['Layer Nodes', fmtNum(nodeCount)],
       ['Links', fmtNum(linkCount)],
@@ -4517,6 +4917,9 @@ function renderStats() {
       : (warningRow ? 'v v-warning' : (goodRow ? 'v v-good' : 'v'));
     return `<div class="${itemClass}"><div class="k">${escapeHtml(String(k))}</div><div class="${valueClass}">${escapeHtml(String(v))}</div></div>`;
   }).join('');
+  const workflowBirthPanelHtml = (!showingCode && shouldShowWorkflowBirthPanel(selectedType))
+    ? buildWorkflowBirthPanelHtml(workflowBirth)
+    : '';
   if (showingCode) {
     ensureCodePreview(scene);
     if (statsGridEl) statsGridEl.style.display = 'none';
@@ -4544,7 +4947,7 @@ function renderStats() {
   } else {
     if (statsGridEl) {
       statsGridEl.style.display = 'grid';
-      statsGridEl.innerHTML = rowsHtml;
+      statsGridEl.innerHTML = rowsHtml + workflowBirthPanelHtml;
     }
     if (codePaneEl) {
       codePaneEl.style.display = 'none';
@@ -6273,11 +6676,15 @@ function boot() {
   renderCodegraphStatus();
   const tabPreviewBtn = byId('tabPreview');
   const tabCodeBtn = byId('tabCode');
+  const statsGridEl = byId('statsGrid');
   if (tabPreviewBtn) {
     tabPreviewBtn.addEventListener('click', () => setPreviewTab('preview'));
   }
   if (tabCodeBtn) {
     tabCodeBtn.addEventListener('click', () => setPreviewTab('code'));
+  }
+  if (statsGridEl) {
+    statsGridEl.addEventListener('click', onStatsGridClick);
   }
 
   const queryInputEl = byId('queryInput');

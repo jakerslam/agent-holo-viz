@@ -30,10 +30,15 @@ const CONTINUUM_RUNS_DIR = path.join(CONTINUUM_DIR, 'runs');
 const CONTINUUM_EVENTS_DIR = path.join(CONTINUUM_DIR, 'events');
 const CONTINUUM_LATEST_PATH = path.join(CONTINUUM_DIR, 'latest.json');
 const CONTINUUM_HISTORY_PATH = path.join(CONTINUUM_DIR, 'history.jsonl');
+const WORKFLOW_ORCHESTRON_DIR = path.join(REPO_ROOT, 'state', 'adaptive', 'workflows', 'orchestron');
+const WORKFLOW_BIRTH_EVENTS_PATH = path.join(WORKFLOW_ORCHESTRON_DIR, 'birth_events.jsonl');
+const WORKFLOW_ORCHESTRON_LATEST_PATH = path.join(WORKFLOW_ORCHESTRON_DIR, 'latest.json');
 const AUTOTEST_DIR = path.join(REPO_ROOT, 'state', 'ops', 'autotest');
 const AUTOTEST_LATEST_PATH = path.join(AUTOTEST_DIR, 'latest.json');
 const AUTOTEST_STATUS_PATH = path.join(AUTOTEST_DIR, 'status.json');
 const AUTOTEST_EVENTS_PATH = path.join(AUTOTEST_DIR, 'events.jsonl');
+const SYSTEM_HEALTH_DIR = path.join(REPO_ROOT, 'state', 'ops', 'system_health');
+const SYSTEM_HEALTH_EVENTS_PATH = path.join(SYSTEM_HEALTH_DIR, 'events.jsonl');
 const FRACTAL_ORGANISM_DIR = path.join(FRACTAL_DIR, 'organism_cycle');
 const FRACTAL_INTROSPECTION_DIR = path.join(FRACTAL_DIR, 'introspection');
 const FRACTAL_PHEROMONE_DIR = path.join(FRACTAL_DIR, 'pheromones');
@@ -68,6 +73,8 @@ const MAX_CHANGE_FILES = 10;
 const EVOLUTION_CACHE_TTL_MS = 30000;
 const FRACTAL_CACHE_TTL_MS = 3000;
 const CONTINUUM_CACHE_TTL_MS = 3000;
+const WORKFLOW_BIRTH_CACHE_TTL_MS = 3000;
+const DOCTOR_HEALTH_CACHE_TTL_MS = 3000;
 const CODEBASE_SIZE_MAX_FILES = 2400;
 const CODEBASE_SIZE_MAX_DEPTH = 10;
 const CODE_PREVIEW_MAX_BYTES = 180 * 1024;
@@ -112,6 +119,21 @@ const CODEGRAPH_FILE_EXTS = new Set([
 const CODEGRAPH_IMPORT_SCAN_EXTS = new Set([
   '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.py'
 ]);
+const DOCTOR_WOUNDED_CODES = new Set([
+  'autotest_doctor_wounded_module',
+  'autotest_doctor_destructive_repair_blocked',
+  'autotest_doctor_kill_switch',
+  'autotest_doctor_kill_same_signature'
+]);
+const DOCTOR_HEALING_CODES = new Set([
+  'autotest_doctor_healing_attempt'
+]);
+const DOCTOR_REGROWTH_CODES = new Set([
+  'autotest_doctor_regrowth'
+]);
+const DOCTOR_ROLLBACK_CODES = new Set([
+  'autotest_doctor_rollback_cut'
+]);
 
 const LAYER_ROOTS = [
   { key: 'adaptive', label: 'Adaptive', rel: 'adaptive' },
@@ -145,6 +167,18 @@ let FRACTAL_CACHE = {
 
 let CONTINUUM_CACHE = {
   ts: 0,
+  payload: null
+};
+
+let WORKFLOW_BIRTH_CACHE = {
+  ts: 0,
+  hours: 0,
+  payload: null
+};
+
+let DOCTOR_HEALTH_CACHE = {
+  ts: 0,
+  hours: 0,
   payload: null
 };
 
@@ -249,6 +283,47 @@ function normalizeRelPath(raw) {
     .replace(/\\/g, '/')
     .replace(/^\.\//, '')
     .replace(/\/{2,}/g, '/');
+}
+
+function severityRank(raw) {
+  const sev = String(raw || '').trim().toLowerCase();
+  if (sev === 'critical') return 4;
+  if (sev === 'high') return 3;
+  if (sev === 'medium') return 2;
+  if (sev === 'low') return 1;
+  return 0;
+}
+
+function doctorStateFromEvent(row) {
+  const explicit = String(row && row.viz_state || '').trim().toLowerCase();
+  if (explicit === 'wounded' || explicit === 'healing' || explicit === 'regrowth' || explicit === 'rollback_cut') {
+    return explicit;
+  }
+  const code = String(row && row.code || '').trim().toLowerCase();
+  if (!code) return '';
+  if (DOCTOR_ROLLBACK_CODES.has(code)) return 'rollback_cut';
+  if (DOCTOR_WOUNDED_CODES.has(code)) return 'wounded';
+  if (DOCTOR_HEALING_CODES.has(code)) return 'healing';
+  if (DOCTOR_REGROWTH_CODES.has(code)) return 'regrowth';
+  if (code.includes('rollback')) return 'rollback_cut';
+  if (code.includes('regrowth')) return 'regrowth';
+  if (code.includes('healing')) return 'healing';
+  if (code.includes('kill') || code.includes('blocked') || code.includes('wounded')) return 'wounded';
+  return '';
+}
+
+function resolveAliasPath(aliasToId, rawAlias) {
+  const map = aliasToId && typeof aliasToId === 'object' ? aliasToId : {};
+  let key = normalizeRelPath(rawAlias).replace(/^\/+/, '').toLowerCase();
+  if (!key) return null;
+  if (map[key]) return map[key];
+  while (key.includes('/')) {
+    const idx = key.lastIndexOf('/');
+    if (idx <= 0) break;
+    key = key.slice(0, idx);
+    if (map[key]) return map[key];
+  }
+  return map[key] || null;
 }
 
 function runCmd(cmd, args, timeoutMs = GIT_CMD_TIMEOUT_MS) {
@@ -789,6 +864,334 @@ function loadContinuumSnapshot() {
 
   CONTINUUM_CACHE = {
     ts: nowMs,
+    payload
+  };
+  return cloneJson(payload);
+}
+
+function loadWorkflowBirthSnapshot(hours = DEFAULT_HOURS) {
+  const h = clampNumber(hours, 1, 24 * 30, DEFAULT_HOURS);
+  const nowMs = Date.now();
+  if (
+    WORKFLOW_BIRTH_CACHE.payload
+    && Number(WORKFLOW_BIRTH_CACHE.hours || 0) === Number(h)
+    && (nowMs - Number(WORKFLOW_BIRTH_CACHE.ts || 0)) < WORKFLOW_BIRTH_CACHE_TTL_MS
+  ) {
+    return cloneJson(WORKFLOW_BIRTH_CACHE.payload);
+  }
+
+  const cutoffMs = nowMs - (h * 60 * 60 * 1000);
+  const rows = readJsonlRows(WORKFLOW_BIRTH_EVENTS_PATH);
+  const stageCounts = {};
+  const runCounts = {};
+  const candidateMap = {};
+  const recentEvents = [];
+
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (!row || typeof row !== 'object') continue;
+    if (String(row.type || '') !== 'orchestron_birth_event') continue;
+    const tsMs = parseTsMs(row.ts);
+    if (tsMs != null && tsMs < cutoffMs) break;
+    const stage = String(row.stage || 'unknown').trim() || 'unknown';
+    stageCounts[stage] = Number(stageCounts[stage] || 0) + 1;
+
+    const runId = String(row.run_id || '').trim();
+    if (runId) runCounts[runId] = Number(runCounts[runId] || 0) + 1;
+
+    if (recentEvents.length < 180) {
+      recentEvents.push({
+        ts: String(row.ts || ''),
+        stage,
+        run_id: runId || null,
+        candidate_id: String(row.candidate_id || '').trim() || null,
+        parent_candidate_id: String(row.parent_candidate_id || '').trim() || null,
+        proposal_type: String(row.proposal_type || '').trim() || null,
+        mutation_kind: String(row.mutation_kind || '').trim() || null
+      });
+    }
+
+    const candidateId = String(row.candidate_id || '').trim();
+    if (!candidateId) continue;
+    if (!candidateMap[candidateId]) {
+      candidateMap[candidateId] = {
+        candidate_id: candidateId,
+        parent_candidate_id: null,
+        fractal_depth: 0,
+        proposal_type: '',
+        mutation_kind: '',
+        run_id: '',
+        last_stage: '',
+        last_ts: '',
+        stage_counts: {},
+        scorecard: {
+          trit_alignment: null,
+          composite_score: null,
+          predicted_drift_delta: null,
+          predicted_yield_delta: null,
+          critical_failures: null,
+          non_critical_findings: null,
+          adversarial_pass: null
+        }
+      };
+    }
+    const cand = candidateMap[candidateId];
+    if (runId) cand.run_id = runId;
+    const parentId = String(row.parent_candidate_id || '').trim();
+    if (parentId) cand.parent_candidate_id = parentId;
+    if (Number.isFinite(Number(row.fractal_depth))) cand.fractal_depth = Number(row.fractal_depth || 0);
+    if (!cand.proposal_type && row.proposal_type) cand.proposal_type = String(row.proposal_type);
+    if (!cand.mutation_kind && row.mutation_kind) cand.mutation_kind = String(row.mutation_kind);
+    cand.last_stage = stage;
+    cand.last_ts = String(row.ts || cand.last_ts || '');
+    cand.stage_counts[stage] = Number(cand.stage_counts[stage] || 0) + 1;
+    if (Number.isFinite(Number(row.trit_alignment))) cand.scorecard.trit_alignment = Number(row.trit_alignment);
+    if (Number.isFinite(Number(row.composite_score))) cand.scorecard.composite_score = Number(row.composite_score);
+    if (Number.isFinite(Number(row.predicted_drift_delta))) cand.scorecard.predicted_drift_delta = Number(row.predicted_drift_delta);
+    if (Number.isFinite(Number(row.predicted_yield_delta))) cand.scorecard.predicted_yield_delta = Number(row.predicted_yield_delta);
+    if (Number.isFinite(Number(row.critical_failures))) cand.scorecard.critical_failures = Number(row.critical_failures);
+    if (Number.isFinite(Number(row.non_critical_findings))) cand.scorecard.non_critical_findings = Number(row.non_critical_findings);
+    if (typeof row.pass === 'boolean') cand.scorecard.adversarial_pass = row.pass === true;
+  }
+
+  const candidates = Object.values(candidateMap);
+  const topRuns = topCounts(runCounts, 5);
+  const latestRunId = topRuns.length ? String(topRuns[0][0] || '') : '';
+
+  const candidateById = {};
+  for (const row of candidates) candidateById[row.candidate_id] = row;
+  for (const row of candidates) {
+    const lineage = [];
+    const seen = new Set();
+    let cur = String(row.candidate_id || '');
+    while (cur && !seen.has(cur) && lineage.length < 12) {
+      seen.add(cur);
+      lineage.push(cur);
+      const next = candidateById[cur] && String(candidateById[cur].parent_candidate_id || '').trim();
+      if (!next) break;
+      cur = next;
+    }
+    row.lineage_path = lineage.reverse();
+  }
+
+  const sortedCandidates = candidates
+    .sort((a, b) => {
+      const da = Number(a.fractal_depth || 0);
+      const db = Number(b.fractal_depth || 0);
+      if (Math.abs(da - db) > 0.0001) return da - db;
+      const sa = Number(a.scorecard && a.scorecard.composite_score || -999);
+      const sb = Number(b.scorecard && b.scorecard.composite_score || -999);
+      if (Math.abs(sa - sb) > 0.0001) return sb - sa;
+      return String(a.candidate_id || '').localeCompare(String(b.candidate_id || ''));
+    })
+    .slice(0, 220)
+    .map((row) => ({
+      candidate_id: String(row.candidate_id || ''),
+      parent_candidate_id: row.parent_candidate_id ? String(row.parent_candidate_id) : null,
+      fractal_depth: Number(row.fractal_depth || 0),
+      proposal_type: String(row.proposal_type || ''),
+      mutation_kind: String(row.mutation_kind || ''),
+      run_id: String(row.run_id || ''),
+      last_stage: String(row.last_stage || ''),
+      last_ts: String(row.last_ts || ''),
+      stage_counts: row.stage_counts && typeof row.stage_counts === 'object' ? row.stage_counts : {},
+      lineage_path: Array.isArray(row.lineage_path) ? row.lineage_path.slice(0, 12) : [],
+      scorecard: row.scorecard && typeof row.scorecard === 'object' ? row.scorecard : {}
+    }));
+  const visibleCandidateIds = new Set(sortedCandidates.map((row) => String(row.candidate_id || '')));
+  const lineageEdges = [];
+  for (const row of sortedCandidates) {
+    const from = String(row.parent_candidate_id || '').trim();
+    const to = String(row.candidate_id || '').trim();
+    if (!from || !to || !visibleCandidateIds.has(from) || !visibleCandidateIds.has(to)) continue;
+    lineageEdges.push({
+      from,
+      to,
+      relation: 'spawned'
+    });
+  }
+
+  const latest = safeJsonRead(WORKFLOW_ORCHESTRON_LATEST_PATH, null);
+  const latestPayload = latest && typeof latest === 'object' ? latest : {};
+  const payload = {
+    generated_at: nowIso(),
+    available: fs.existsSync(WORKFLOW_BIRTH_EVENTS_PATH),
+    file: fs.existsSync(WORKFLOW_BIRTH_EVENTS_PATH)
+      ? path.relative(REPO_ROOT, WORKFLOW_BIRTH_EVENTS_PATH).replace(/\\/g, '/')
+      : '',
+    latest_file: fs.existsSync(WORKFLOW_ORCHESTRON_LATEST_PATH)
+      ? path.relative(REPO_ROOT, WORKFLOW_ORCHESTRON_LATEST_PATH).replace(/\\/g, '/')
+      : '',
+    window_hours: h,
+    events_total: recentEvents.length,
+    stage_counts: stageCounts,
+    runs_total: Object.keys(runCounts).length,
+    latest_run_id: latestRunId || String(latestPayload.run_id || ''),
+    candidates_total: sortedCandidates.length,
+    lineage_nodes: sortedCandidates,
+    lineage_edges: lineageEdges,
+    events_recent: recentEvents.slice(0, 120)
+  };
+
+  WORKFLOW_BIRTH_CACHE = {
+    ts: nowMs,
+    hours: Number(h),
+    payload
+  };
+  return cloneJson(payload);
+}
+
+function loadDoctorHealthSnapshot(hours = DEFAULT_HOURS) {
+  const h = clampNumber(hours, 1, 24 * 30, DEFAULT_HOURS);
+  const nowMs = Date.now();
+  if (
+    DOCTOR_HEALTH_CACHE.payload
+    && Number(DOCTOR_HEALTH_CACHE.hours || 0) === Number(h)
+    && (nowMs - Number(DOCTOR_HEALTH_CACHE.ts || 0)) < DOCTOR_HEALTH_CACHE_TTL_MS
+  ) {
+    return cloneJson(DOCTOR_HEALTH_CACHE.payload);
+  }
+
+  const cutoffMs = nowMs - (h * 60 * 60 * 1000);
+  const rows = readJsonlRows(SYSTEM_HEALTH_EVENTS_PATH);
+  const codeCounts = {};
+  const stateCounts = {};
+  const modulesMap = {};
+  const recentEvents = [];
+  let totalEvents = 0;
+
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const row = rows[i];
+    if (!row || typeof row !== 'object') continue;
+    if (String(row.type || '') !== 'system_health_event') continue;
+    const code = String(row.code || '').trim().toLowerCase();
+    const source = String(row.source || '').trim().toLowerCase();
+    if (source !== 'autotest_doctor' && !code.startsWith('autotest_doctor_')) continue;
+    const tsMs = parseTsMs(row.ts);
+    if (tsMs != null && tsMs < cutoffMs) break;
+
+    totalEvents += 1;
+    if (code) codeCounts[code] = Number(codeCounts[code] || 0) + 1;
+    const state = doctorStateFromEvent(row);
+    if (state) stateCounts[state] = Number(stateCounts[state] || 0) + 1;
+
+    const moduleRel = normalizeRelPath(
+      row.module
+      || row.module_path
+      || row.rel
+      || row.path
+      || row.file
+      || ''
+    ).replace(/^\/+/, '');
+    const signatureId = String(row.signature_id || '').trim();
+    const severity = String(row.severity || 'medium').trim().toLowerCase() || 'medium';
+    const summary = String(row.summary || '').trim();
+    const risk = String(row.risk || '').trim().toLowerCase() || '';
+
+    if (recentEvents.length < 220) {
+      recentEvents.push({
+        ts: String(row.ts || ''),
+        code,
+        state,
+        severity,
+        risk,
+        module: moduleRel || '',
+        signature_id: signatureId || '',
+        summary,
+        details: String(row.details || '').trim().slice(0, 220)
+      });
+    }
+
+    const moduleKey = moduleRel || (signatureId ? `signature:${signatureId}` : '');
+    if (!moduleKey) continue;
+    if (!modulesMap[moduleKey]) {
+      modulesMap[moduleKey] = {
+        module: moduleRel || '',
+        signature_id: signatureId || '',
+        events_total: 0,
+        latest_ts: '',
+        latest_code: '',
+        latest_state: '',
+        latest_summary: '',
+        latest_severity: 'low',
+        max_severity: 'low',
+        max_severity_rank: 0,
+        state_counts: {},
+        code_counts: {}
+      };
+    }
+    const agg = modulesMap[moduleKey];
+    agg.events_total += 1;
+    if (signatureId && !agg.signature_id) agg.signature_id = signatureId;
+    if (moduleRel && !agg.module) agg.module = moduleRel;
+    if (code) agg.code_counts[code] = Number(agg.code_counts[code] || 0) + 1;
+    if (state) agg.state_counts[state] = Number(agg.state_counts[state] || 0) + 1;
+    const sevRank = severityRank(severity);
+    if (sevRank >= Number(agg.max_severity_rank || 0)) {
+      agg.max_severity_rank = sevRank;
+      agg.max_severity = severity || agg.max_severity;
+    }
+    if (!agg.latest_ts) {
+      agg.latest_ts = String(row.ts || '');
+      agg.latest_code = code;
+      agg.latest_state = state;
+      agg.latest_summary = summary;
+      agg.latest_severity = severity;
+    }
+  }
+
+  const modules = Object.values(modulesMap)
+    .map((row) => {
+      const latestState = String(row.latest_state || '').trim().toLowerCase();
+      return {
+        module: String(row.module || '').trim(),
+        signature_id: String(row.signature_id || '').trim(),
+        events_total: Number(row.events_total || 0),
+        latest_ts: String(row.latest_ts || ''),
+        latest_code: String(row.latest_code || ''),
+        latest_state: latestState,
+        latest_summary: String(row.latest_summary || ''),
+        latest_severity: String(row.latest_severity || row.max_severity || 'low'),
+        max_severity: String(row.max_severity || 'low'),
+        state_counts: row.state_counts && typeof row.state_counts === 'object' ? row.state_counts : {},
+        code_counts: row.code_counts && typeof row.code_counts === 'object' ? row.code_counts : {},
+        active: latestState === 'wounded' || latestState === 'rollback_cut',
+        healing: latestState === 'healing',
+        regrowth: latestState === 'regrowth'
+      };
+    })
+    .sort((a, b) => {
+      const aActive = a.active ? 1 : 0;
+      const bActive = b.active ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      const at = Number(parseTsMs(a.latest_ts) || 0);
+      const bt = Number(parseTsMs(b.latest_ts) || 0);
+      if (Math.abs(at - bt) > 0.0001) return bt - at;
+      return String(a.module || a.signature_id || '').localeCompare(String(b.module || b.signature_id || ''));
+    })
+    .slice(0, 260);
+
+  const payload = {
+    generated_at: nowIso(),
+    available: fs.existsSync(SYSTEM_HEALTH_EVENTS_PATH),
+    file: fs.existsSync(SYSTEM_HEALTH_EVENTS_PATH)
+      ? path.relative(REPO_ROOT, SYSTEM_HEALTH_EVENTS_PATH).replace(/\\/g, '/')
+      : '',
+    window_hours: h,
+    events_total: totalEvents,
+    code_counts: codeCounts,
+    state_counts: stateCounts,
+    wounded_active: modules.filter((row) => row.active).length,
+    healing_active: modules.filter((row) => row.healing).length,
+    regrowth_recent: modules.filter((row) => row.regrowth).length,
+    modules_total: modules.length,
+    modules,
+    events_recent: recentEvents.slice(0, 140)
+  };
+
+  DOCTOR_HEALTH_CACHE = {
+    ts: nowMs,
+    hours: Number(h),
     payload
   };
   return cloneJson(payload);
@@ -2125,6 +2528,11 @@ function assignLayerActivity(layers, runs, summary, aliasToId) {
     if (!id) return;
     bump(id, weight);
   };
+  const bumpRel = (relPath, weight) => {
+    const id = resolveAliasPath(aliasToId, relPath);
+    if (!id) return;
+    bump(id, weight);
+  };
 
   const eventRows = Array.isArray(runs) ? runs.slice(0, 2400) : [];
   for (const evt of eventRows) {
@@ -2194,6 +2602,29 @@ function assignLayerActivity(layers, runs, summary, aliasToId) {
     bumpAlias('systems/ops', Math.max(0.2, Number(continuum.autotest_alerts_24h || 0) * 0.12));
     bumpAlias('state/ops', Math.max(0.15, Number(continuum.autotest_modules_changed || 0) * 0.08));
   }
+  const doctor = summary && summary.doctor && typeof summary.doctor === 'object'
+    ? summary.doctor
+    : {};
+  const doctorModules = Array.isArray(doctor.modules) ? doctor.modules : [];
+  if (doctorModules.length > 0) {
+    bumpAlias('systems/ops', Math.max(0.2, Number(doctor.events_total || 0) * 0.03));
+    bumpAlias('state/ops', Math.max(0.15, Number(doctor.wounded_active || 0) * 0.16));
+  }
+  for (const row of doctorModules.slice(0, 180)) {
+    const moduleRel = String(row && row.module || '').trim();
+    if (!moduleRel) continue;
+    const latestState = String(row && row.latest_state || '').trim().toLowerCase();
+    const events = Math.max(1, Number(row && row.events_total || 1));
+    let weight = 0.24 + (Math.min(8, events) * 0.05);
+    if (latestState === 'wounded' || latestState === 'rollback_cut') {
+      weight += 0.55;
+    } else if (latestState === 'healing') {
+      weight += 0.25;
+    } else if (latestState === 'regrowth') {
+      weight += 0.12;
+    }
+    bumpRel(moduleRel, weight);
+  }
 
   let maxRaw = 0;
   for (const value of Object.values(raw)) {
@@ -2241,7 +2672,8 @@ function buildHoloLinks(layers, summary, runs, aliasToId) {
         packet_samples: 0,
         blocked_count: 0,
         event_count: 0,
-        block_reason: ''
+        block_reason: '',
+        doctor_state: ''
       };
     }
     const edge = edgeMap[key];
@@ -2263,9 +2695,12 @@ function buildHoloLinks(layers, summary, runs, aliasToId) {
       if (blockReason && !edge.block_reason) {
         edge.block_reason = blockReason;
       }
+      const doctorState = String(meta.doctor_state || '').trim().toLowerCase();
+      if (doctorState && !edge.doctor_state) edge.doctor_state = doctorState;
     }
   };
   const byAlias = (alias) => aliasToId[String(alias || '').toLowerCase()] || null;
+  const byAliasPath = (relPath) => resolveAliasPath(aliasToId, relPath);
 
   for (const layer of layers || []) {
     for (const mod of layer.modules || []) {
@@ -2377,6 +2812,44 @@ function buildHoloLinks(layers, summary, runs, aliasToId) {
       block_reason: flowBlockReason(evt)
     });
   }
+  const doctor = summary && summary.doctor && typeof summary.doctor === 'object'
+    ? summary.doctor
+    : {};
+  const doctorModules = Array.isArray(doctor.modules) ? doctor.modules : [];
+  if (doctorModules.length > 0) {
+    const doctorSource = byAlias('systems/ops/autotest_doctor')
+      || byAlias('systems/ops')
+      || byAlias('systems');
+    const doctorState = byAlias('state/ops') || byAlias('state') || byAlias('systems');
+    if (doctorSource && doctorState) {
+      add(doctorSource, doctorState, Math.max(0.4, Number(doctor.events_total || 0) * 0.12), 'doctor', {
+        packet_tokens: Math.max(160, Number(doctor.events_total || 0) * 52),
+        event_count: Math.max(1, Number(doctor.events_total || 0)),
+        blocked: Number(doctor.wounded_active || 0) > 0,
+        block_reason: Number(doctor.wounded_active || 0) > 0 ? 'doctor_active_wounded_modules' : '',
+        doctor_state: Number(doctor.wounded_active || 0) > 0 ? 'wounded' : ''
+      });
+    }
+    for (const row of doctorModules.slice(0, 160)) {
+      const moduleRel = String(row && row.module || '').trim();
+      if (!moduleRel || !doctorSource) continue;
+      const target = byAliasPath(moduleRel);
+      if (!target || target === doctorSource) continue;
+      const latestState = String(row && row.latest_state || '').trim().toLowerCase();
+      const events = Math.max(1, Number(row && row.events_total || 1));
+      const blocked = latestState === 'wounded' || latestState === 'rollback_cut';
+      const baseCount = latestState === 'wounded' || latestState === 'rollback_cut'
+        ? 1.2
+        : (latestState === 'healing' ? 0.9 : 0.7);
+      add(doctorSource, target, Math.max(0.4, baseCount + (Math.min(8, events) * 0.08)), 'doctor', {
+        packet_tokens: Math.max(150, events * 64),
+        event_count: events,
+        blocked,
+        block_reason: blocked ? String(row && row.latest_code || 'doctor_blocked') : '',
+        doctor_state: latestState
+      });
+    }
+  }
 
   const links = Object.values(edgeMap);
   let maxCount = 0;
@@ -2481,6 +2954,12 @@ function buildHoloModel(runs, summary) {
   const continuum = summary && summary.continuum && typeof summary.continuum === 'object'
     ? summary.continuum
     : {};
+  const workflowBirth = summary && summary.workflow_birth && typeof summary.workflow_birth === 'object'
+    ? summary.workflow_birth
+    : {};
+  const doctor = summary && summary.doctor && typeof summary.doctor === 'object'
+    ? summary.doctor
+    : {};
 
   return {
     generated_at: nowIso(),
@@ -2542,12 +3021,48 @@ function buildHoloModel(runs, summary) {
       continuum_autotest_alerts_24h: Number(continuum.autotest_alerts_24h || 0),
       continuum_autotest_failed_24h: Number(continuum.autotest_failed_24h || 0),
       continuum_autotest_guard_blocked_24h: Number(continuum.autotest_guard_blocked_24h || 0),
+      workflow_birth_events_24h: Number(workflowBirth.events_total || 0),
+      workflow_birth_candidates: Number(workflowBirth.candidates_total || 0),
+      workflow_birth_grafted: Number(workflowBirth.stage_counts && workflowBirth.stage_counts.grafted || 0),
+      workflow_birth_rewrites: Number(workflowBirth.stage_counts && workflowBirth.stage_counts.candidate_indexed || 0),
+      doctor_events_24h: Number(doctor.events_total || 0),
+      doctor_wounded_active: Number(doctor.wounded_active || 0),
+      doctor_healing_active: Number(doctor.healing_active || 0),
+      doctor_regrowth_recent: Number(doctor.regrowth_recent || 0),
+      doctor_modules_total: Number(doctor.modules_total || 0),
       change_pending_push: pendingPush,
       change_just_pushed: justPushed,
       change_active_modules: Number(changeSummary.active_modules || 0),
       change_dirty_files_total: Number(changeSummary.dirty_files_total || 0),
       change_staged_files_total: Number(changeSummary.staged_files_total || 0),
       change_ahead_count: Number(changeSummary.ahead_count || 0)
+    },
+    doctor: {
+      available: doctor.available === true,
+      window_hours: Number(doctor.window_hours || 0),
+      events_total: Number(doctor.events_total || 0),
+      wounded_active: Number(doctor.wounded_active || 0),
+      healing_active: Number(doctor.healing_active || 0),
+      regrowth_recent: Number(doctor.regrowth_recent || 0),
+      modules_total: Number(doctor.modules_total || 0),
+      code_counts: doctor.code_counts && typeof doctor.code_counts === 'object' ? doctor.code_counts : {},
+      state_counts: doctor.state_counts && typeof doctor.state_counts === 'object' ? doctor.state_counts : {},
+      modules: Array.isArray(doctor.modules) ? doctor.modules.slice(0, 260) : [],
+      events_recent: Array.isArray(doctor.events_recent) ? doctor.events_recent.slice(0, 140) : []
+    },
+    workflow_birth: {
+      available: workflowBirth.available === true,
+      window_hours: Number(workflowBirth.window_hours || 0),
+      events_total: Number(workflowBirth.events_total || 0),
+      candidates_total: Number(workflowBirth.candidates_total || 0),
+      runs_total: Number(workflowBirth.runs_total || 0),
+      latest_run_id: String(workflowBirth.latest_run_id || ''),
+      stage_counts: workflowBirth.stage_counts && typeof workflowBirth.stage_counts === 'object'
+        ? workflowBirth.stage_counts
+        : {},
+      lineage_nodes: Array.isArray(workflowBirth.lineage_nodes) ? workflowBirth.lineage_nodes.slice(0, 220) : [],
+      lineage_edges: Array.isArray(workflowBirth.lineage_edges) ? workflowBirth.lineage_edges.slice(0, 320) : [],
+      events_recent: Array.isArray(workflowBirth.events_recent) ? workflowBirth.events_recent.slice(0, 120) : []
     }
   };
 }
@@ -2562,6 +3077,8 @@ function buildPayload(hours) {
   const evolution = loadEvolutionSnapshot();
   const fractalSnapshot = loadFractalSnapshot();
   const continuumSnapshot = loadContinuumSnapshot();
+  const workflowBirthSnapshot = loadWorkflowBirthSnapshot(telemetry.window_hours);
+  const doctorSnapshot = loadDoctorHealthSnapshot(telemetry.window_hours);
   const fractal = {
     harmony_score: Number(fractalSnapshot && fractalSnapshot.organism ? fractalSnapshot.organism.harmony_score || 0 : 0),
     symbiosis_plans: Number(fractalSnapshot && fractalSnapshot.organism ? fractalSnapshot.organism.symbiosis_plans || 0 : 0),
@@ -2626,7 +3143,40 @@ function buildPayload(hours) {
     },
     evolution,
     fractal,
-    continuum
+    continuum,
+    workflow_birth: {
+      available: workflowBirthSnapshot.available === true,
+      file: String(workflowBirthSnapshot.file || ''),
+      window_hours: Number(workflowBirthSnapshot.window_hours || telemetry.window_hours || 0),
+      events_total: Number(workflowBirthSnapshot.events_total || 0),
+      runs_total: Number(workflowBirthSnapshot.runs_total || 0),
+      latest_run_id: String(workflowBirthSnapshot.latest_run_id || ''),
+      candidates_total: Number(workflowBirthSnapshot.candidates_total || 0),
+      stage_counts: workflowBirthSnapshot.stage_counts && typeof workflowBirthSnapshot.stage_counts === 'object'
+        ? workflowBirthSnapshot.stage_counts
+        : {},
+      lineage_nodes: Array.isArray(workflowBirthSnapshot.lineage_nodes) ? workflowBirthSnapshot.lineage_nodes.slice(0, 220) : [],
+      lineage_edges: Array.isArray(workflowBirthSnapshot.lineage_edges) ? workflowBirthSnapshot.lineage_edges.slice(0, 320) : [],
+      events_recent: Array.isArray(workflowBirthSnapshot.events_recent) ? workflowBirthSnapshot.events_recent.slice(0, 120) : []
+    },
+    doctor: {
+      available: doctorSnapshot.available === true,
+      file: String(doctorSnapshot.file || ''),
+      window_hours: Number(doctorSnapshot.window_hours || telemetry.window_hours || 0),
+      events_total: Number(doctorSnapshot.events_total || 0),
+      wounded_active: Number(doctorSnapshot.wounded_active || 0),
+      healing_active: Number(doctorSnapshot.healing_active || 0),
+      regrowth_recent: Number(doctorSnapshot.regrowth_recent || 0),
+      modules_total: Number(doctorSnapshot.modules_total || 0),
+      code_counts: doctorSnapshot.code_counts && typeof doctorSnapshot.code_counts === 'object'
+        ? doctorSnapshot.code_counts
+        : {},
+      state_counts: doctorSnapshot.state_counts && typeof doctorSnapshot.state_counts === 'object'
+        ? doctorSnapshot.state_counts
+        : {},
+      modules: Array.isArray(doctorSnapshot.modules) ? doctorSnapshot.modules.slice(0, 260) : [],
+      events_recent: Array.isArray(doctorSnapshot.events_recent) ? doctorSnapshot.events_recent.slice(0, 140) : []
+    }
   };
   const graph = buildGraph(telemetry.runs, directives, strategy);
   const holo = buildHoloModel(telemetry.runs, summary);
@@ -2640,6 +3190,8 @@ function buildPayload(hours) {
     evolution,
     fractal,
     continuum,
+    workflow_birth: workflowBirthSnapshot,
+    doctor_health: doctorSnapshot,
     fractal_snapshot: fractalSnapshot,
     continuum_snapshot: continuumSnapshot,
     incidents: {
