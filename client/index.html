@@ -408,6 +408,125 @@
       tab-size: 2;
       -moz-tab-size: 2;
     }
+    #terminalPane {
+      display: none;
+      min-height: 220px;
+      border: 1px dashed rgba(93, 247, 255, 0.24);
+      border-radius: 8px;
+      padding: 7px;
+      background: rgba(9, 25, 40, 0.58);
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.64rem;
+      color: rgba(225, 246, 255, 0.94);
+      overflow: hidden;
+    }
+    #terminalTop {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.58rem;
+      color: rgba(215, 249, 255, 0.78);
+      margin-bottom: 6px;
+    }
+    #terminalCwd {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 72%;
+    }
+    #terminalStatus {
+      color: rgba(188, 228, 244, 0.84);
+      white-space: nowrap;
+    }
+    #terminalControls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+    }
+    #terminalInput {
+      flex: 1 1 auto;
+      min-width: 0;
+      border: 1px solid rgba(93, 247, 255, 0.28);
+      border-radius: 7px;
+      background: rgba(7, 20, 32, 0.86);
+      color: rgba(230, 247, 255, 0.95);
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.61rem;
+      padding: 5px 7px;
+    }
+    #terminalRun,
+    #terminalClear {
+      border: 1px solid rgba(93, 247, 255, 0.3);
+      border-radius: 7px;
+      background: rgba(10, 28, 44, 0.84);
+      color: rgba(225, 246, 255, 0.92);
+      font-family: "Share Tech Mono", monospace;
+      font-size: 0.58rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 5px 7px;
+      cursor: pointer;
+    }
+    #terminalRun:hover,
+    #terminalClear:hover {
+      filter: brightness(1.08);
+    }
+    #terminalOutput {
+      margin: 0;
+      min-height: 150px;
+      max-height: min(42vh, 360px);
+      overflow: auto;
+      overflow-x: auto;
+      overflow-y: auto;
+      scrollbar-gutter: stable both-edges;
+      overscroll-behavior: contain;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.32;
+      font-size: 0.62rem;
+      color: rgba(225, 246, 255, 0.94);
+      border: 1px solid rgba(93, 247, 255, 0.17);
+      border-radius: 7px;
+      background: rgba(6, 16, 28, 0.82);
+      padding: 7px;
+      scrollbar-width: auto;
+      scrollbar-color: rgba(158, 231, 255, 0.92) rgba(7, 22, 34, 0.9);
+    }
+    #terminalOutput::-webkit-scrollbar {
+      width: 12px;
+      height: 12px;
+    }
+    #terminalOutput::-webkit-scrollbar-track {
+      background: rgba(7, 22, 34, 0.9);
+      border-radius: 8px;
+    }
+    #terminalOutput::-webkit-scrollbar-thumb {
+      background: linear-gradient(180deg, rgba(188, 241, 255, 0.98), rgba(98, 205, 244, 0.92));
+      border-radius: 8px;
+      border: 2px solid rgba(7, 22, 34, 0.9);
+    }
+    #terminalOutput::-webkit-scrollbar-thumb:hover {
+      background: linear-gradient(180deg, rgba(194, 242, 255, 0.96), rgba(96, 198, 240, 0.92));
+    }
+    #terminalFollowWrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.56rem;
+      color: rgba(205, 236, 248, 0.84);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      user-select: none;
+    }
+    #terminalAutoFollow {
+      width: auto;
+      margin: 0;
+      accent-color: #5df7ff;
+      transform: scale(1.03);
+    }
     #metaLine {
       margin-top: 6px;
       font-family: "Share Tech Mono", monospace;
@@ -475,10 +594,27 @@
     <div id="previewTabs">
       <button id="tabPreview" class="previewTabBtn active" type="button">Preview</button>
       <button id="tabCode" class="previewTabBtn" type="button">Code</button>
+      <button id="tabTerminal" class="previewTabBtn" type="button">Terminal</button>
     </div>
     <h2 id="statsTitle">Preview Pane</h2>
     <div id="statsGrid"></div>
     <pre id="codePane" aria-live="polite"></pre>
+    <div id="terminalPane" aria-live="polite">
+      <div id="terminalTop">
+        <span id="terminalCwd">.</span>
+        <span id="terminalStatus">idle</span>
+      </div>
+      <div id="terminalControls">
+        <input id="terminalInput" type="text" autocomplete="off" spellcheck="false" placeholder="Run command in selected path">
+        <button id="terminalRun" type="button">Run</button>
+        <button id="terminalClear" type="button">Clear</button>
+        <label id="terminalFollowWrap" for="terminalAutoFollow">
+          <input id="terminalAutoFollow" type="checkbox">
+          Auto-follow
+        </label>
+      </div>
+      <pre id="terminalOutput"></pre>
+    </div>
     <div id="metaLine">Booting hologram...</div>
   </section>
 

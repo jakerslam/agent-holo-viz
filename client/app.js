@@ -66,7 +66,8 @@ const SYSTEM_ROOT_ID = 'system:root';
 const WORKSPACE_ROOT_PATH = '/Users/jay/.openclaw/workspace';
 const PACKET_RADIUS_FLOOR = 0.45;
 const PACKET_RADIUS_CEILING = 3.8;
-const PACKET_PATHWAY_OPACITY_SCALE = 0.58;
+const PACKET_PATHWAY_OPACITY_SCALE = 0.32;
+const PACKET_MOTION_SPEED_SCALE = 1.8;
 const MODULE_RADIUS_MIN = 10;
 const MODULE_RADIUS_MAX = 34;
 const MODULE_RADIUS_SIZE_BLEND = 0.42;
@@ -151,6 +152,21 @@ const state = {
   },
   focus: null,
   preview_tab: 'preview',
+  terminal: {
+    cwd_abs: WORKSPACE_ROOT_PATH,
+    cwd_rel: '.',
+    loaded: false,
+    loading: false,
+    running: false,
+    output: '',
+    last_exit_code: 0,
+    last_command: '',
+    selection_sync_key: '',
+    auto_follow: false,
+    scroll_top: 0,
+    scroll_listener_bound: false,
+    suppress_scroll_event: false
+  },
   codegraph: {
     query: '',
     mode: '',
@@ -900,6 +916,28 @@ async function fetchCodePreview(pathText) {
   return res.json();
 }
 
+async function fetchTerminalState() {
+  const res = await fetch('/api/terminal/state', { cache: 'no-store' });
+  if (!res.ok) throw new Error(`terminal_state_http_${res.status}`);
+  return res.json();
+}
+
+async function fetchTerminalSetCwd(pathText) {
+  const p = String(pathText || '').trim();
+  if (!p) throw new Error('terminal_cwd_path_required');
+  const res = await fetch(`/api/terminal/cwd?path=${encodeURIComponent(p)}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`terminal_cwd_http_${res.status}`);
+  return res.json();
+}
+
+async function fetchTerminalExec(commandText) {
+  const cmd = String(commandText || '').trim();
+  if (!cmd) throw new Error('terminal_command_required');
+  const res = await fetch(`/api/terminal/exec?cmd=${encodeURIComponent(cmd)}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`terminal_exec_http_${res.status}`);
+  return res.json();
+}
+
 async function fetchCodegraphQuery(queryText, options = {}) {
   const q = String(queryText || '').trim();
   const mode = String(options.mode || '').trim();
@@ -1189,7 +1227,7 @@ function runtimeSnapshotFromPayload(payload) {
   const status = String(runtime.status || '').trim().toLowerCase() || 'unknown';
   const online = runtime.online === true || status === 'online';
   const stale = runtime.stale === true || status === 'stale';
-  const offline = runtime.offline === true || (!online && !stale);
+  const offline = runtime.offline === true || status === 'offline';
   const signalAge = runtime.signal_age_sec == null ? null : Number(runtime.signal_age_sec);
   const liveWindowMinutes = Math.max(1, Number(runtime.live_window_minutes || payload && payload.live_minutes || state.live_minutes || 6));
   const activityScale = clamp(Number(runtime.activity_scale == null ? (offline ? 0.2 : (stale ? 0.58 : 1)) : runtime.activity_scale), 0.12, 1.2);
@@ -3408,7 +3446,7 @@ function runtimeStatusForScene(scene) {
   const status = String(merged.status || '').trim().toLowerCase() || 'unknown';
   const online = merged.online === true || status === 'online';
   const stale = merged.stale === true || status === 'stale';
-  const offline = merged.offline === true || (!online && !stale);
+  const offline = merged.offline === true || status === 'offline';
   return {
     ...merged,
     status,
@@ -4024,7 +4062,7 @@ function drawParticles(dt) {
     const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
     const blockedFlow = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
     const moveGain = blockedFlow ? (0.14 + ((1 - blockedRatio) * 0.22)) : 1;
-    p.t += p.speed * Math.max(0.001, dt) * (0.5 + link.activity) * burstBoost * moveGain * runtimeFlowScale;
+    p.t += p.speed * PACKET_MOTION_SPEED_SCALE * Math.max(0.001, dt) * (0.5 + link.activity) * burstBoost * moveGain * runtimeFlowScale;
     if (p.t > 1) p.t -= 1;
     if (blockedFlow) {
       const failEnd = 0.86;
@@ -4395,13 +4433,274 @@ function ensureCodePreview(scene) {
 }
 
 function setPreviewTab(tab) {
-  const next = tab === 'code' ? 'code' : 'preview';
+  const next = tab === 'code' ? 'code' : (tab === 'terminal' ? 'terminal' : 'preview');
   if (state.preview_tab === next) return;
   state.preview_tab = next;
   if (next === 'code') {
     state.code_preview.selection_key = '';
+  } else if (next === 'terminal') {
+    ensureTerminalState();
+    if (state.scene) syncTerminalCwdFromSelection(state.scene, { silent: true });
   }
   renderStats();
+}
+
+function terminalStateRef() {
+  const t = state.terminal && typeof state.terminal === 'object'
+    ? state.terminal
+    : null;
+  if (t) return t;
+  state.terminal = {
+    cwd_abs: WORKSPACE_ROOT_PATH,
+    cwd_rel: '.',
+    loaded: false,
+    loading: false,
+    running: false,
+    output: '',
+    last_exit_code: 0,
+    last_command: '',
+    selection_sync_key: '',
+    auto_follow: false,
+    scroll_top: 0,
+    scroll_listener_bound: false,
+    suppress_scroll_event: false
+  };
+  return state.terminal;
+}
+
+function bindTerminalScrollTracking(outEl, term) {
+  if (!outEl || !term || term.scroll_listener_bound === true) return;
+  outEl.addEventListener('scroll', () => {
+    if (term.suppress_scroll_event === true) return;
+    const current = Number(outEl.scrollTop || 0);
+    term.scroll_top = Number.isFinite(current) ? current : 0;
+    if (term.auto_follow === true) {
+      const distanceToBottom = Number(outEl.scrollHeight || 0) - (Number(outEl.clientHeight || 0) + Number(outEl.scrollTop || 0));
+      if (Number.isFinite(distanceToBottom) && distanceToBottom > 24) {
+        term.auto_follow = false;
+        const followEl = byId('terminalAutoFollow');
+        if (followEl) followEl.checked = false;
+      }
+    }
+  });
+  term.scroll_listener_bound = true;
+}
+
+function pushTerminalOutput(chunk, opts = {}) {
+  const term = terminalStateRef();
+  const text = String(chunk == null ? '' : chunk).replace(/\r\n/g, '\n');
+  if (!text) return;
+  const suffix = opts.no_newline ? '' : '\n';
+  const next = `${String(term.output || '')}${text}${suffix}`;
+  const maxChars = 32000;
+  term.output = next.length > maxChars
+    ? `... [terminal output clipped]\n${next.slice(-maxChars)}`
+    : next;
+}
+
+function applyTerminalPayload(payload, opts = {}) {
+  const src = payload && typeof payload === 'object' ? payload : {};
+  const term = terminalStateRef();
+  if (src.cwd_abs) term.cwd_abs = String(src.cwd_abs);
+  if (src.cwd_rel) term.cwd_rel = String(src.cwd_rel);
+  if (Number.isFinite(Number(src.last_exit_code))) term.last_exit_code = Number(src.last_exit_code);
+  if (src.last_command != null) term.last_command = String(src.last_command || '');
+  if (src.command != null) term.last_command = String(src.command || term.last_command || '');
+  if (opts.logCommand && term.last_command) {
+    pushTerminalOutput(`$ ${term.last_command}`);
+  }
+  const stdout = String(src.stdout || '');
+  const stderr = String(src.stderr || '');
+  if (stdout) pushTerminalOutput(stdout, { no_newline: stdout.endsWith('\n') });
+  if (stderr) pushTerminalOutput(stderr, { no_newline: stderr.endsWith('\n') });
+  if (src.timed_out === true) pushTerminalOutput('[terminal] command timed out');
+  if (src.error) pushTerminalOutput(`[terminal] ${String(src.error)}`);
+  term.loaded = true;
+  term.loading = false;
+  term.running = false;
+}
+
+function terminalPathFromSelection(scene) {
+  const selected = state.selected && typeof state.selected === 'object' ? state.selected : null;
+  if (!selected) return '';
+  const rawPath = String(selected.path || '').trim();
+  if (!rawPath) return '';
+  if (rawPath.includes(' -> ')) return '';
+  if (rawPath.startsWith('/')) return rawPath;
+  const normalized = normalizeRelPathText(rawPath);
+  if (!normalized || normalized === '.') return WORKSPACE_ROOT_PATH;
+  return `${WORKSPACE_ROOT_PATH}/${normalized}`;
+}
+
+function bestNodeIdForRelPath(scene, relPath) {
+  if (!scene || !scene.node_by_id) return '';
+  const target = normalizeRelPathText(relPath).toLowerCase();
+  if (!target || target === '.') return SYSTEM_ROOT_ID;
+  let bestId = '';
+  let bestScore = -Infinity;
+  for (const node of scene.nodes || []) {
+    if (!node || typeof node !== 'object') continue;
+    const id = String(node.id || '').trim();
+    const rel = normalizeRelPathText(node.rel || '').toLowerCase();
+    if (!id || !rel) continue;
+    let score = -Infinity;
+    if (rel === target) {
+      score = 2000 + rel.length;
+    } else if (target.startsWith(`${rel}/`)) {
+      score = 1000 + rel.length;
+    } else if (rel.startsWith(`${target}/`)) {
+      score = 600 + target.length;
+    } else {
+      continue;
+    }
+    const type = String(node.type || '').toLowerCase();
+    if (type === 'module') score += 18;
+    else if (type === 'layer') score += 12;
+    else if (type === 'submodule') score += 8;
+    if (score > bestScore) {
+      bestScore = score;
+      bestId = id;
+    }
+  }
+  return bestId;
+}
+
+function focusSelectionForTerminalCwd() {
+  const scene = state.scene;
+  const term = terminalStateRef();
+  if (!scene || !scene.node_by_id) return;
+  const rel = normalizeRelPathText(term.cwd_rel || '');
+  if (!rel) return;
+  const bestId = bestNodeIdForRelPath(scene, rel);
+  if (!bestId || !scene.node_by_id[bestId]) return;
+  const same = state.selected && String(state.selected.id || '') === bestId;
+  if (same) return;
+  const node = scene.node_by_id[bestId];
+  state.selected = {
+    id: bestId,
+    name: String(node.name || bestId),
+    path: String(node.rel || ''),
+    kind: String(node.type || 'node'),
+    type: selectionTypeFrom(node, String(node.type || ''))
+  };
+  state.selected_link = null;
+  applySelectionFocus(true);
+  renderSelectionTag();
+  renderStats();
+}
+
+function renderTerminalPane() {
+  const term = terminalStateRef();
+  const cwdEl = byId('terminalCwd');
+  const statusEl = byId('terminalStatus');
+  const outEl = byId('terminalOutput');
+  const followEl = byId('terminalAutoFollow');
+  if (cwdEl) cwdEl.textContent = String(term.cwd_rel || '.');
+  if (statusEl) {
+    if (term.running) statusEl.textContent = 'running';
+    else if (term.loading) statusEl.textContent = 'loading';
+    else statusEl.textContent = `exit ${fmtNum(term.last_exit_code || 0)}`;
+  }
+  if (followEl) followEl.checked = term.auto_follow === true;
+  if (outEl) {
+    bindTerminalScrollTracking(outEl, term);
+    const prevTop = Number(outEl.scrollTop || 0);
+    if (Number.isFinite(prevTop)) term.scroll_top = prevTop;
+    outEl.textContent = String(term.output || '');
+    term.suppress_scroll_event = true;
+    if (term.auto_follow === true) {
+      outEl.scrollTop = outEl.scrollHeight;
+      term.scroll_top = Number(outEl.scrollTop || 0);
+    } else {
+      const target = Number.isFinite(Number(term.scroll_top)) ? Number(term.scroll_top) : 0;
+      outEl.scrollTop = Math.max(0, target);
+    }
+    term.suppress_scroll_event = false;
+  }
+}
+
+function setTerminalAutoFollow(enabled) {
+  const term = terminalStateRef();
+  term.auto_follow = enabled === true;
+  const outEl = byId('terminalOutput');
+  if (outEl && term.auto_follow === true) {
+    outEl.scrollTop = outEl.scrollHeight;
+    term.scroll_top = Number(outEl.scrollTop || 0);
+  } else if (outEl) {
+    term.scroll_top = Number(outEl.scrollTop || 0);
+  }
+  renderTerminalPane();
+}
+
+function ensureTerminalState() {
+  const term = terminalStateRef();
+  if (term.loading || term.loaded) return;
+  term.loading = true;
+  fetchTerminalState()
+    .then((payload) => {
+      applyTerminalPayload(payload);
+      renderTerminalPane();
+    })
+    .catch((err) => {
+      term.loading = false;
+      term.running = false;
+      term.loaded = true;
+      pushTerminalOutput(`[terminal] ${String(err && err.message || err || 'state_load_failed')}`);
+      renderTerminalPane();
+    });
+}
+
+function syncTerminalCwdFromSelection(scene, opts = {}) {
+  const term = terminalStateRef();
+  const pathText = terminalPathFromSelection(scene);
+  if (!pathText) return;
+  const selectedId = String(state.selected && state.selected.id || '').trim();
+  const syncKey = `${selectedId}|${pathText}`;
+  if (syncKey === term.selection_sync_key) return;
+  term.selection_sync_key = syncKey;
+  fetchTerminalSetCwd(pathText)
+    .then((payload) => {
+      applyTerminalPayload(payload);
+      if (!opts.silent) {
+        pushTerminalOutput(`[terminal] cwd -> ${String(payload.cwd_rel || '.')}`);
+      }
+      renderTerminalPane();
+    })
+    .catch((err) => {
+      if (!opts.silent) {
+        pushTerminalOutput(`[terminal] ${String(err && err.message || err || 'cwd_sync_failed')}`);
+        renderTerminalPane();
+      }
+    });
+}
+
+function runTerminalCommand() {
+  const inputEl = byId('terminalInput');
+  const term = terminalStateRef();
+  if (!inputEl || term.running) return;
+  const command = String(inputEl.value || '').trim();
+  if (!command) return;
+  inputEl.value = '';
+  term.running = true;
+  pushTerminalOutput(`$ ${command}`);
+  renderTerminalPane();
+  fetchTerminalExec(command)
+    .then((payload) => {
+      applyTerminalPayload(payload);
+      renderTerminalPane();
+      focusSelectionForTerminalCwd();
+    })
+    .catch((err) => {
+      term.running = false;
+      pushTerminalOutput(`[terminal] ${String(err && err.message || err || 'exec_failed')}`);
+      renderTerminalPane();
+    });
+}
+
+function clearTerminalOutput() {
+  const term = terminalStateRef();
+  term.output = '';
+  renderTerminalPane();
 }
 
 function workflowBirthSnapshot(scene, summary) {
@@ -4713,11 +5012,15 @@ function renderStats() {
   const titleEl = byId('statsTitle');
   const statsGridEl = byId('statsGrid');
   const codePaneEl = byId('codePane');
+  const terminalPaneEl = byId('terminalPane');
   const previewTabBtn = byId('tabPreview');
   const codeTabBtn = byId('tabCode');
+  const terminalTabBtn = byId('tabTerminal');
   const showingCode = state.preview_tab === 'code';
-  if (previewTabBtn) previewTabBtn.classList.toggle('active', !showingCode);
+  const showingTerminal = state.preview_tab === 'terminal';
+  if (previewTabBtn) previewTabBtn.classList.toggle('active', !showingCode && !showingTerminal);
   if (codeTabBtn) codeTabBtn.classList.toggle('active', showingCode);
+  if (terminalTabBtn) terminalTabBtn.classList.toggle('active', showingTerminal);
   let rows = [];
   const cg = codegraphState();
   const cgResult = cg.last_result && typeof cg.last_result === 'object'
@@ -5133,12 +5436,13 @@ function renderStats() {
       : (warningRow ? 'v v-warning' : (goodRow ? 'v v-good' : 'v'));
     return `<div class="${itemClass}"><div class="k">${escapeHtml(String(k))}</div><div class="${valueClass}">${escapeHtml(String(v))}</div></div>`;
   }).join('');
-  const workflowBirthPanelHtml = (!showingCode && shouldShowWorkflowBirthPanel(selectedType))
+  const workflowBirthPanelHtml = (!showingCode && !showingTerminal && shouldShowWorkflowBirthPanel(selectedType))
     ? buildWorkflowBirthPanelHtml(workflowBirth)
     : '';
   if (showingCode) {
     ensureCodePreview(scene);
     if (statsGridEl) statsGridEl.style.display = 'none';
+    if (terminalPaneEl) terminalPaneEl.style.display = 'none';
     if (codePaneEl) {
       codePaneEl.style.display = 'block';
       const view = state.code_preview && typeof state.code_preview === 'object'
@@ -5160,6 +5464,20 @@ function renderStats() {
       codePaneEl.textContent = codeBody;
     }
     if (titleEl) titleEl.textContent = 'Code';
+  } else if (showingTerminal) {
+    if (statsGridEl) {
+      statsGridEl.style.display = 'none';
+      statsGridEl.innerHTML = '';
+    }
+    if (codePaneEl) {
+      codePaneEl.style.display = 'none';
+      codePaneEl.textContent = '';
+    }
+    if (terminalPaneEl) terminalPaneEl.style.display = 'block';
+    ensureTerminalState();
+    syncTerminalCwdFromSelection(scene, { silent: true });
+    renderTerminalPane();
+    if (titleEl) titleEl.textContent = 'Terminal';
   } else {
     if (statsGridEl) {
       statsGridEl.style.display = 'grid';
@@ -5169,6 +5487,7 @@ function renderStats() {
       codePaneEl.style.display = 'none';
       codePaneEl.textContent = '';
     }
+    if (terminalPaneEl) terminalPaneEl.style.display = 'none';
   }
   const pulseSuffix = state.spine_event_top
     ? ` | spine ${fmtNum(state.spine_event_count)} evt (${state.spine_event_top})`
@@ -6901,15 +7220,42 @@ function boot() {
   syncLiveControlState();
   const tabPreviewBtn = byId('tabPreview');
   const tabCodeBtn = byId('tabCode');
+  const tabTerminalBtn = byId('tabTerminal');
   const statsGridEl = byId('statsGrid');
+  const terminalInputEl = byId('terminalInput');
+  const terminalRunBtn = byId('terminalRun');
+  const terminalClearBtn = byId('terminalClear');
+  const terminalAutoFollowEl = byId('terminalAutoFollow');
   if (tabPreviewBtn) {
     tabPreviewBtn.addEventListener('click', () => setPreviewTab('preview'));
   }
   if (tabCodeBtn) {
     tabCodeBtn.addEventListener('click', () => setPreviewTab('code'));
   }
+  if (tabTerminalBtn) {
+    tabTerminalBtn.addEventListener('click', () => setPreviewTab('terminal'));
+  }
   if (statsGridEl) {
     statsGridEl.addEventListener('click', onStatsGridClick);
+  }
+  if (terminalInputEl) {
+    terminalInputEl.addEventListener('keydown', (evt) => {
+      if (evt.key !== 'Enter') return;
+      evt.preventDefault();
+      runTerminalCommand();
+    });
+  }
+  if (terminalRunBtn) {
+    terminalRunBtn.addEventListener('click', () => runTerminalCommand());
+  }
+  if (terminalClearBtn) {
+    terminalClearBtn.addEventListener('click', () => clearTerminalOutput());
+  }
+  if (terminalAutoFollowEl) {
+    terminalAutoFollowEl.checked = false;
+    terminalAutoFollowEl.addEventListener('change', () => {
+      setTerminalAutoFollow(terminalAutoFollowEl.checked === true);
+    });
   }
 
   const queryInputEl = byId('queryInput');
