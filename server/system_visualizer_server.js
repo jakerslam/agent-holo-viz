@@ -261,6 +261,16 @@ function clampLiveMinutes(v, fallback = DEFAULT_LIVE_MINUTES) {
   return clampNumber(v, LIVE_MINUTES_MIN, LIVE_MINUTES_MAX, fallback);
 }
 
+function parseQueryNumber(searchParams, key) {
+  if (!searchParams || typeof searchParams.get !== 'function') return NaN;
+  const raw = searchParams.get(String(key || ''));
+  if (raw == null) return NaN;
+  const text = String(raw).trim();
+  if (!text) return NaN;
+  const n = Number(text);
+  return Number.isFinite(n) ? n : NaN;
+}
+
 function parseBoolish(value, fallback = false) {
   if (typeof value === 'boolean') return value;
   const text = String(value == null ? '' : value).trim().toLowerCase();
@@ -3438,9 +3448,9 @@ function createWsHub(server, defaultHours, defaultLiveMinutes) {
     let subLiveMode = true;
     try {
       const parsed = new URL(String(req && req.url || WS_PATH), `http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
-      const qHours = Number(parsed.searchParams.get('hours'));
+      const qHours = parseQueryNumber(parsed.searchParams, 'hours');
       if (Number.isFinite(qHours)) subHours = clampNumber(qHours, 1, 24 * 30, defaultHours);
-      const qLiveMinutes = Number(parsed.searchParams.get('live_minutes'));
+      const qLiveMinutes = parseQueryNumber(parsed.searchParams, 'live_minutes');
       if (Number.isFinite(qLiveMinutes)) subLiveMinutes = clampLiveMinutes(qLiveMinutes, defaultLiveMinutes);
       const qLiveMode = parsed.searchParams.get('live_mode');
       if (qLiveMode != null) subLiveMode = parseBoolish(qLiveMode, true);
@@ -4865,9 +4875,9 @@ function main() {
       return;
     }
     if (pathname === '/api/graph') {
-      const qHours = Number(parsed.searchParams.get('hours'));
+      const qHours = parseQueryNumber(parsed.searchParams, 'hours');
       const hours = Number.isFinite(qHours) ? qHours : defaultHours;
-      const qLiveMinutes = Number(parsed.searchParams.get('live_minutes'));
+      const qLiveMinutes = parseQueryNumber(parsed.searchParams, 'live_minutes');
       const liveMinutes = Number.isFinite(qLiveMinutes) ? qLiveMinutes : defaultLiveMinutes;
       const liveMode = parseBoolish(parsed.searchParams.get('live_mode'), true);
       try {
@@ -4882,9 +4892,9 @@ function main() {
       return;
     }
     if (pathname === '/api/holo') {
-      const qHours = Number(parsed.searchParams.get('hours'));
+      const qHours = parseQueryNumber(parsed.searchParams, 'hours');
       const hours = Number.isFinite(qHours) ? qHours : defaultHours;
-      const qLiveMinutes = Number(parsed.searchParams.get('live_minutes'));
+      const qLiveMinutes = parseQueryNumber(parsed.searchParams, 'live_minutes');
       const liveMinutes = Number.isFinite(qLiveMinutes) ? qLiveMinutes : defaultLiveMinutes;
       const liveMode = parseBoolish(parsed.searchParams.get('live_mode'), true);
       try {

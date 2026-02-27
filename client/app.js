@@ -3966,12 +3966,10 @@ function drawParticles(dt) {
   const scene = state.scene;
   if (!scene || !state.particles.length) return;
   const runtime = runtimeStatusForScene(scene);
-  if (runtime.offline) {
-    for (const p of state.particles) {
-      if (p && Array.isArray(p.trail)) p.trail.length = 0;
-    }
-    return;
-  }
+  // Keep a low-energy packet lane visible even when runtime is stale/offline so
+  // operators can still read flow topology during quiet windows.
+  const runtimeFlowScale = runtime.offline ? 0.24 : (runtime.stale ? 0.62 : 1);
+  const runtimeAlphaScale = runtime.offline ? 0.4 : (runtime.stale ? 0.7 : 1);
   const ctx = state.ctx;
   const trailLength = state.quality_profile.trail_length;
   const nowTs = performance.now();
@@ -4018,7 +4016,7 @@ function drawParticles(dt) {
     const blockedRatio = clamp(Number(link.blocked_ratio || 0), 0, 1);
     const blockedFlow = Boolean(link.flow_blocked === true || blockedRatio > 0.02);
     const moveGain = blockedFlow ? (0.14 + ((1 - blockedRatio) * 0.22)) : 1;
-    p.t += p.speed * Math.max(0.001, dt) * (0.5 + link.activity) * burstBoost * moveGain;
+    p.t += p.speed * Math.max(0.001, dt) * (0.5 + link.activity) * burstBoost * moveGain * runtimeFlowScale;
     if (p.t > 1) p.t -= 1;
     if (blockedFlow) {
       const failEnd = 0.86;
@@ -4060,7 +4058,7 @@ function drawParticles(dt) {
     for (let i = 1; i < p.trail.length; i += 1) {
       const a = p.trail[i - 1];
       const b = p.trail[i];
-      const alphaBase = (i / p.trail.length) * 0.3 * (0.2 + (introScale * 0.8));
+      const alphaBase = (i / p.trail.length) * 0.3 * (0.2 + (introScale * 0.8)) * runtimeAlphaScale;
       if (failActive) {
         const flicker = 0.32 + (0.68 * Math.abs(Math.sin((nowTs * (0.028 + (failRatio * 0.016))) + (p.id * 1.97) + (i * 0.75))));
         const fade = clamp(1 - (failProgress * 0.9), 0.04, 1);
@@ -4091,7 +4089,7 @@ function drawParticles(dt) {
     const failProgress = clamp(Number(p.fail_progress || 0), 0, 1);
     const failActive = p.fail_active === true && failProgress > 0;
     const failRatio = clamp(Number(p.fail_ratio || 0), 0, 1);
-    let alpha = (0.45 + (link.activity * 0.5)) * (0.25 + (introScale * 0.75));
+    let alpha = (0.45 + (link.activity * 0.5)) * (0.25 + (introScale * 0.75)) * runtimeAlphaScale;
     let radius = Math.max(PACKET_RADIUS_FLOOR, Number(p.radius || PACKET_RADIUS_FLOOR));
     if (failActive) {
       const flicker = 0.2 + (0.8 * Math.abs(Math.sin((nowTs * (0.035 + (failRatio * 0.02))) + (p.id * 2.17))));
@@ -4103,7 +4101,13 @@ function drawParticles(dt) {
       const bCh = Math.round(255 - (redMix * 225));
       ctx.fillStyle = `rgba(255,${g},${bCh},${alpha})`;
     } else {
-      ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+      if (runtime.offline) {
+        ctx.fillStyle = `rgba(255,186,122,${alpha})`;
+      } else if (runtime.stale) {
+        ctx.fillStyle = `rgba(232,244,255,${alpha})`;
+      } else {
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+      }
     }
     ctx.beginPath();
     ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
