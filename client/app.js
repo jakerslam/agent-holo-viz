@@ -3966,10 +3966,14 @@ function drawParticles(dt) {
   const scene = state.scene;
   if (!scene || !state.particles.length) return;
   const runtime = runtimeStatusForScene(scene);
-  // Keep a low-energy packet lane visible even when runtime is stale/offline so
-  // operators can still read flow topology during quiet windows.
-  const runtimeFlowScale = runtime.offline ? 0.24 : (runtime.stale ? 0.62 : 1);
-  const runtimeAlphaScale = runtime.offline ? 0.4 : (runtime.stale ? 0.7 : 1);
+  if (runtime.offline) {
+    for (const p of state.particles) {
+      if (p && Array.isArray(p.trail)) p.trail.length = 0;
+    }
+    return;
+  }
+  const runtimeFlowScale = runtime.stale ? 0.62 : 1;
+  const runtimeAlphaScale = runtime.stale ? 0.7 : 1;
   const ctx = state.ctx;
   const trailLength = state.quality_profile.trail_length;
   const nowTs = performance.now();
@@ -4101,9 +4105,7 @@ function drawParticles(dt) {
       const bCh = Math.round(255 - (redMix * 225));
       ctx.fillStyle = `rgba(255,${g},${bCh},${alpha})`;
     } else {
-      if (runtime.offline) {
-        ctx.fillStyle = `rgba(255,186,122,${alpha})`;
-      } else if (runtime.stale) {
+      if (runtime.stale) {
         ctx.fillStyle = `rgba(232,244,255,${alpha})`;
       } else {
         ctx.fillStyle = `rgba(255,255,255,${alpha})`;
