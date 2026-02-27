@@ -66,6 +66,7 @@ const SYSTEM_ROOT_ID = 'system:root';
 const WORKSPACE_ROOT_PATH = '/Users/jay/.openclaw/workspace';
 const PACKET_RADIUS_FLOOR = 0.45;
 const PACKET_RADIUS_CEILING = 3.8;
+const PACKET_PATHWAY_OPACITY_SCALE = 0.58;
 const MODULE_RADIUS_MIN = 10;
 const MODULE_RADIUS_MAX = 34;
 const MODULE_RADIUS_SIZE_BLEND = 0.42;
@@ -3830,6 +3831,8 @@ function drawIoNode(node, ts) {
 
 function drawLinks(scene) {
   const ctx = state.ctx;
+  ctx.save();
+  ctx.globalAlpha *= PACKET_PATHWAY_OPACITY_SCALE;
   const profile = state.quality_profile;
   const nowTs = performance.now();
   const runtimeScale = runtimeLinkAlphaScale(scene);
@@ -3943,6 +3946,7 @@ function drawLinks(scene) {
     }
   }
   ctx.shadowBlur = 0;
+  ctx.restore();
 }
 
 function isModuleDepthPacketView(scene) {
