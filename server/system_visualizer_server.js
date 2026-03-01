@@ -61,7 +61,7 @@ const WS_TICK_MS = 1300;
 const WS_WATCH_DEBOUNCE_MS = 220;
 const WS_PING_MS = 15000;
 const MODULE_SCAN_CACHE_TTL_MS = 7000;
-const MAX_LAYER_MODULES = 24;
+const MAX_LAYER_MODULES = Math.round(clampNumber(process.env.HOLO_LAYER_MODULE_LIMIT, 8, 256, 48));
 const MAX_MODULE_SUBMODULES = 20;
 const MAX_SUBMODULE_SUBFOLDERS = 14;
 const MAX_INTEGRITY_FILES = 12;
@@ -86,6 +86,15 @@ const CODEGRAPH_MAX_FILE_BYTES = 96 * 1024;
 const CODEGRAPH_DEFAULT_QUERY_LIMIT = 24;
 const LIVE_MINUTES_MIN = 1;
 const LIVE_MINUTES_MAX = 24 * 60;
+const RUNTIME_STALE_MULTIPLIER = clampNumber(process.env.HOLO_RUNTIME_STALE_MULTIPLIER, 2, 12, 5);
+const RUNTIME_STALE_MIN_SEC = clampNumber(process.env.HOLO_RUNTIME_STALE_MIN_SEC, 60, 12 * 60 * 60, 20 * 60);
+const SPINE_PENDING_RUN_GRACE_SEC = clampNumber(process.env.HOLO_SPINE_PENDING_RUN_GRACE_SEC, 120, 12 * 60 * 60, 90 * 60);
+const RUNTIME_SIGNAL_LOOKBACK_HOURS = clampNumber(process.env.HOLO_RUNTIME_SIGNAL_LOOKBACK_HOURS, 1, 24 * 30, 24);
+const SPINE_SIGNAL_SCAN_MAX_ROWS = Math.round(clampNumber(process.env.HOLO_SPINE_SIGNAL_SCAN_MAX_ROWS, 120, 6000, 1200));
+const SPINE_SIGNAL_CACHE_TTL_MS = Math.round(clampNumber(process.env.HOLO_SPINE_SIGNAL_CACHE_TTL_MS, 250, 15000, 1500));
+const TERMINAL_OUTPUT_MAX_CHARS = 20000;
+const TERMINAL_CMD_TIMEOUT_MS = 20000;
+const TERMINAL_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 const CODEBASE_SIZE_EXTS = new Set([
   '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
   '.json', '.md', '.yaml', '.yml',
@@ -136,6 +145,13 @@ const DOCTOR_REGROWTH_CODES = new Set([
 ]);
 const DOCTOR_ROLLBACK_CODES = new Set([
   'autotest_doctor_rollback_cut'
+]);
+const SPINE_RUN_TERMINAL_TYPES = new Set([
+  'spine_run_ok',
+  'spine_run_failed',
+  'spine_run_error',
+  'spine_run_stopped',
+  'spine_run_halt'
 ]);
 
 const LAYER_ROOTS = [
@@ -188,6 +204,16 @@ let DOCTOR_HEALTH_CACHE = {
 let CODEGRAPH_CACHE = {
   ts: 0,
   payload: null
+};
+let SPINE_SIGNAL_CACHE = {
+  ts: 0,
+  payload: null
+};
+const TERMINAL_STATE = {
+  cwd: REPO_ROOT,
+  updated_at: nowIso(),
+  last_exit_code: 0,
+  last_command: ''
 };
 
 let TYPESCRIPT_MODULE_CACHE = {
@@ -662,6 +688,78 @@ function latestEventMs(events) {
   return null;
 }
 
+function loadSpineRuntimeSignal(lookbackHours = RUNTIME_SIGNAL_LOOKBACK_HOURS) {
+  const nowMs = Date.now();
+  if (
+    SPINE_SIGNAL_CACHE.payload
+    && (nowMs - Number(SPINE_SIGNAL_CACHE.ts || 0)) < SPINE_SIGNAL_CACHE_TTL_MS
+  ) {
+    return { ...SPINE_SIGNAL_CACHE.payload };
+  }
+  const lookbackMs = clampNumber(lookbackHours, 1, 24 * 30, RUNTIME_SIGNAL_LOOKBACK_HOURS) * 60 * 60 * 1000;
+  const cutoffMs = nowMs - lookbackMs;
+  const files = listSpineRunFilesDesc().slice(0, 4);
+  let latestMs = null;
+  let latestType = '';
+  const signalRows = [];
+  let done = false;
+  for (const file of files) {
+    if (done) break;
+    const fp = path.join(SPINE_RUNS_DIR, file);
+    if (!fs.existsSync(fp)) continue;
+    const lines = String(fs.readFileSync(fp, 'utf8') || '').split('\n');
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = String(lines[i] || '').trim();
+      if (!line) continue;
+      const evt = safeJsonParse(line);
+      if (!evt || typeof evt !== 'object') continue;
+      const ms = parseTsMs(evt.ts);
+      if (ms == null) continue;
+      if (ms < cutoffMs) break;
+      const type = String(evt.type || '').trim();
+      if (latestMs == null || ms > latestMs) {
+        latestMs = ms;
+        latestType = type;
+      }
+      if (type === 'spine_run_started' || SPINE_RUN_TERMINAL_TYPES.has(type)) {
+        signalRows.push({ ms, type });
+      }
+      if (signalRows.length >= SPINE_SIGNAL_SCAN_MAX_ROWS) {
+        done = true;
+        break;
+      }
+    }
+  }
+  signalRows.sort((a, b) => a.ms - b.ms);
+  let latestStartMs = null;
+  let latestTerminalMs = null;
+  for (const row of signalRows) {
+    if (!row || typeof row !== 'object') continue;
+    if (row.type === 'spine_run_started') {
+      latestStartMs = row.ms;
+      continue;
+    }
+    if (SPINE_RUN_TERMINAL_TYPES.has(row.type)) latestTerminalMs = row.ms;
+  }
+  const pendingRun = latestStartMs != null && (latestTerminalMs == null || latestTerminalMs < latestStartMs);
+  const pendingAgeSec = pendingRun
+    ? Math.max(0, Math.round((nowMs - latestStartMs) / 1000))
+    : null;
+  const payload = {
+    latest_ms: latestMs,
+    latest_ts: latestMs != null ? new Date(latestMs).toISOString() : '',
+    latest_type: latestType,
+    pending_run: pendingRun,
+    pending_run_started_ts: latestStartMs != null ? new Date(latestStartMs).toISOString() : '',
+    pending_run_age_sec: pendingAgeSec
+  };
+  SPINE_SIGNAL_CACHE = {
+    ts: nowMs,
+    payload
+  };
+  return { ...payload };
+}
+
 function runtimeWindowMinutesFromInput(hours, liveMinutes, liveMode = true) {
   if (liveMode === true) {
     return clampLiveMinutes(liveMinutes, DEFAULT_LIVE_MINUTES);
@@ -669,29 +767,48 @@ function runtimeWindowMinutesFromInput(hours, liveMinutes, liveMode = true) {
   return clampLiveMinutes(Math.round(clampNumber(hours, 1, 24 * 30, DEFAULT_HOURS) * 60), DEFAULT_HOURS * 60);
 }
 
-function buildRuntimeStatus(windowMinutes, spineEvents, continuumSnapshot) {
+function buildRuntimeStatus(windowMinutes, spineEvents, continuumSnapshot, spineSignal = null) {
   const nowMs = Date.now();
   const liveM = clampLiveMinutes(windowMinutes, DEFAULT_LIVE_MINUTES);
   const onlineMaxSec = Math.max(45, Math.round(liveM * 60));
-  const staleMaxSec = Math.max(onlineMaxSec + 30, Math.round(onlineMaxSec * 2));
-  const latestSpineMs = latestEventMs(spineEvents);
+  const staleMaxSec = Math.max(
+    onlineMaxSec + 30,
+    Math.round(onlineMaxSec * RUNTIME_STALE_MULTIPLIER),
+    Math.round(RUNTIME_STALE_MIN_SEC)
+  );
+  const spineSignalSafe = spineSignal && typeof spineSignal === 'object' ? spineSignal : {};
+  const latestSpineMs = Math.max(
+    latestEventMs(spineEvents) || 0,
+    parseTsMs(spineSignalSafe.latest_ts) || Number(spineSignalSafe.latest_ms || 0) || 0
+  ) || null;
   const latestContinuumMs = parseTsMs(continuumSnapshot && continuumSnapshot.last_pulse_ts);
   const latestMs = Math.max(latestSpineMs || 0, latestContinuumMs || 0) || null;
   const ageSec = latestMs != null ? Math.max(0, Math.round((nowMs - latestMs) / 1000)) : null;
-  const status = ageSec == null
+  let status = ageSec == null
     ? 'offline'
     : ageSec <= onlineMaxSec
       ? 'online'
       : ageSec <= staleMaxSec
         ? 'stale'
         : 'offline';
-  const statusReason = ageSec == null
+  let statusReason = ageSec == null
     ? 'no_recent_runtime_signal'
     : status === 'online'
       ? 'recent_runtime_signal'
       : status === 'stale'
         ? 'runtime_signal_aging'
         : 'runtime_signal_expired';
+  const pendingRunAgeSec = spineSignalSafe.pending_run_age_sec == null
+    ? null
+    : Number(spineSignalSafe.pending_run_age_sec);
+  const pendingRun = spineSignalSafe.pending_run === true
+    && Number.isFinite(pendingRunAgeSec)
+    && pendingRunAgeSec >= 0
+    && pendingRunAgeSec <= Math.max(staleMaxSec + 30, SPINE_PENDING_RUN_GRACE_SEC);
+  if (status === 'offline' && pendingRun) {
+    status = pendingRunAgeSec <= onlineMaxSec ? 'online' : 'stale';
+    statusReason = 'spine_run_in_progress';
+  }
   const source = (latestSpineMs != null && latestContinuumMs != null)
     ? (latestSpineMs >= latestContinuumMs ? 'spine' : 'continuum')
     : (latestSpineMs != null ? 'spine' : (latestContinuumMs != null ? 'continuum' : 'none'));
@@ -708,7 +825,12 @@ function buildRuntimeStatus(windowMinutes, spineEvents, continuumSnapshot) {
     online_max_sec: Number(onlineMaxSec),
     stale_max_sec: Number(staleMaxSec),
     latest_signal_ts: latestMs != null ? new Date(latestMs).toISOString() : '',
+    latest_spine_signal_ts: String(spineSignalSafe.latest_ts || ''),
+    latest_spine_signal_type: String(spineSignalSafe.latest_type || ''),
     signal_age_sec: ageSec == null ? null : Number(ageSec),
+    spine_pending_run: pendingRun,
+    spine_pending_run_started_ts: String(spineSignalSafe.pending_run_started_ts || ''),
+    spine_pending_run_age_sec: pendingRunAgeSec == null ? null : Number(pendingRunAgeSec),
     spine_event_count_window: Number(eventCount),
     activity_scale: Number(activityScale)
   };
@@ -1880,6 +2002,24 @@ function scanLayerModelRaw() {
 
 function cloneJson(obj) {
   return JSON.parse(JSON.stringify(obj));
+}
+
+function invalidateLayerModelCache() {
+  MODULE_SCAN_CACHE = {
+    ts: 0,
+    payload: null
+  };
+  CHANGE_STATE_CACHE = {
+    ts: 0,
+    payload: null
+  };
+}
+
+function invalidateCodegraphCache() {
+  CODEGRAPH_CACHE = {
+    ts: 0,
+    payload: null
+  };
 }
 
 function loadLayerModelCached() {
@@ -3186,7 +3326,8 @@ function buildPayload(hours, liveMinutes = DEFAULT_LIVE_MINUTES, liveMode = true
   const continuumSnapshot = loadContinuumSnapshot();
   const runtimeWindowMinutes = runtimeWindowMinutesFromInput(telemetry.window_hours, liveMinutes, liveMode === true);
   const runtimeSpineEvents = loadRecentSpineEvents(Math.max(1 / 60, runtimeWindowMinutes / 60), 240);
-  const runtimeStatus = buildRuntimeStatus(runtimeWindowMinutes, runtimeSpineEvents, continuumSnapshot);
+  const runtimeSpineSignal = loadSpineRuntimeSignal(RUNTIME_SIGNAL_LOOKBACK_HOURS);
+  const runtimeStatus = buildRuntimeStatus(runtimeWindowMinutes, runtimeSpineEvents, continuumSnapshot, runtimeSpineSignal);
   const workflowBirthSnapshot = loadWorkflowBirthSnapshot(telemetry.window_hours);
   const doctorSnapshot = loadDoctorHealthSnapshot(telemetry.window_hours);
   const fractal = {
@@ -3426,21 +3567,41 @@ function createWsHub(server, defaultHours, defaultLiveMinutes) {
     if (typeof debounceTimer.unref === 'function') debounceTimer.unref();
   };
 
-  const watchTarget = (absDir) => {
+  const watchTarget = (absDir, options = {}) => {
     if (!fs.existsSync(absDir)) return;
+    const opts = options && typeof options === 'object' ? options : {};
+    const invalidateLayerModel = opts.invalidate_layer_model === true;
+    const invalidateCodegraph = opts.invalidate_codegraph === true;
+    const reason = String(opts.reason || 'fswatch') || 'fswatch';
+    const onFsChange = () => {
+      if (invalidateLayerModel) invalidateLayerModelCache();
+      if (invalidateCodegraph) invalidateCodegraphCache();
+      scheduleBroadcast(reason);
+    };
     try {
-      const watcher = fs.watch(absDir, { persistent: false }, () => {
-        scheduleBroadcast('fswatch');
-      });
+      const watcher = fs.watch(absDir, { persistent: false, recursive: true }, onFsChange);
       watchers.push(watcher);
     } catch {
-      // ignore watcher failures
+      try {
+        const watcher = fs.watch(absDir, { persistent: false }, onFsChange);
+        watchers.push(watcher);
+      } catch {
+        // ignore watcher failures
+      }
     }
   };
   watchTarget(RUNS_DIR);
   watchTarget(SPINE_RUNS_DIR);
   watchTarget(CONTINUUM_RUNS_DIR);
   watchTarget(CONTINUUM_EVENTS_DIR);
+  for (const layerDef of LAYER_ROOTS) {
+    const layerAbs = path.join(REPO_ROOT, layerDef.rel);
+    watchTarget(layerAbs, {
+      reason: 'module_tree_change',
+      invalidate_layer_model: true,
+      invalidate_codegraph: true
+    });
+  }
 
   wss.on('connection', (ws, req) => {
     let subHours = defaultHours;
@@ -3535,6 +3696,159 @@ function resolveWorkspacePath(rawPath) {
   const rootPrefix = REPO_ROOT.endsWith(path.sep) ? REPO_ROOT : `${REPO_ROOT}${path.sep}`;
   if (abs !== REPO_ROOT && !abs.startsWith(rootPrefix)) return null;
   return abs;
+}
+
+function workspaceContainsPath(absPath) {
+  const abs = path.resolve(String(absPath || REPO_ROOT));
+  const rootPrefix = REPO_ROOT.endsWith(path.sep) ? REPO_ROOT : `${REPO_ROOT}${path.sep}`;
+  return abs === REPO_ROOT || abs.startsWith(rootPrefix);
+}
+
+function normalizeTerminalCwd(absPath, fallback = REPO_ROOT) {
+  const abs = path.resolve(String(absPath || fallback || REPO_ROOT));
+  if (!workspaceContainsPath(abs)) return path.resolve(String(fallback || REPO_ROOT));
+  return abs;
+}
+
+function terminalRel(absPath) {
+  const rel = normalizeRelPath(path.relative(REPO_ROOT, String(absPath || REPO_ROOT)));
+  return rel || '.';
+}
+
+function clipText(raw, limit = TERMINAL_OUTPUT_MAX_CHARS) {
+  const text = String(raw == null ? '' : raw).replace(/\r\n/g, '\n');
+  const maxChars = Math.max(512, Number(limit || TERMINAL_OUTPUT_MAX_CHARS));
+  if (text.length <= maxChars) {
+    return {
+      text,
+      truncated: false
+    };
+  }
+  const headChars = Math.max(160, Math.round(maxChars * 0.82));
+  const tailChars = Math.max(80, maxChars - headChars);
+  const clipped = `${text.slice(0, headChars)}\n... [output truncated] ...\n${text.slice(-tailChars)}`;
+  return {
+    text: clipped,
+    truncated: true
+  };
+}
+
+function parseTerminalCwdMarker(rawStdout, marker) {
+  const text = String(rawStdout == null ? '' : rawStdout);
+  if (!marker) return { cleaned: text, cwd: null };
+  const lines = text.split('\n');
+  let cwd = null;
+  const keep = [];
+  for (const line of lines) {
+    const row = String(line || '');
+    if (row.startsWith(`${marker}=`)) {
+      cwd = row.slice(marker.length + 1).trim();
+      continue;
+    }
+    keep.push(row);
+  }
+  let cleaned = keep.join('\n');
+  cleaned = cleaned.replace(/\n{3,}$/g, '\n\n');
+  return {
+    cleaned,
+    cwd
+  };
+}
+
+function terminalStatePayload(extra = null) {
+  const cwdAbs = normalizeTerminalCwd(TERMINAL_STATE.cwd, REPO_ROOT);
+  const payload = {
+    ok: true,
+    cwd_abs: cwdAbs,
+    cwd_rel: terminalRel(cwdAbs),
+    updated_at: String(TERMINAL_STATE.updated_at || nowIso()),
+    last_exit_code: Number(TERMINAL_STATE.last_exit_code || 0),
+    last_command: String(TERMINAL_STATE.last_command || '')
+  };
+  if (extra && typeof extra === 'object') Object.assign(payload, extra);
+  return payload;
+}
+
+function resolveTerminalTarget(rawPath, baseCwd) {
+  const text = String(rawPath || '').trim();
+  if (!text) return normalizeTerminalCwd(baseCwd, REPO_ROOT);
+  const cwdBase = normalizeTerminalCwd(baseCwd, REPO_ROOT);
+  const abs = path.isAbsolute(text)
+    ? path.resolve(text)
+    : path.resolve(cwdBase, text);
+  if (!workspaceContainsPath(abs)) return null;
+  let stat = null;
+  try {
+    stat = fs.statSync(abs);
+  } catch {
+    return null;
+  }
+  if (stat && stat.isDirectory()) return abs;
+  if (stat && stat.isFile()) return path.dirname(abs);
+  return null;
+}
+
+function setTerminalCwd(rawPath, source = 'api') {
+  const next = resolveTerminalTarget(rawPath, TERMINAL_STATE.cwd);
+  if (!next) {
+    return {
+      ok: false,
+      error: 'invalid_cwd_target'
+    };
+  }
+  TERMINAL_STATE.cwd = normalizeTerminalCwd(next, REPO_ROOT);
+  TERMINAL_STATE.updated_at = nowIso();
+  return terminalStatePayload({
+    source: String(source || 'api')
+  });
+}
+
+function execTerminalCommand(rawCmd) {
+  const command = String(rawCmd == null ? '' : rawCmd).trim();
+  if (!command) {
+    return {
+      ok: false,
+      error: 'empty_command'
+    };
+  }
+
+  const cwdBefore = normalizeTerminalCwd(TERMINAL_STATE.cwd, REPO_ROOT);
+  const marker = `__PROTHEUS_CWD_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}__`;
+  const script = `${command}\nprintf '\\n${marker}=%s\\n' "$PWD"`;
+  const proc = spawnSync('/bin/zsh', ['-lc', script], {
+    cwd: cwdBefore,
+    encoding: 'utf8',
+    timeout: TERMINAL_CMD_TIMEOUT_MS,
+    maxBuffer: TERMINAL_MAX_BUFFER_BYTES,
+    env: process.env
+  });
+
+  const parsed = parseTerminalCwdMarker(proc.stdout, marker);
+  const stdoutClip = clipText(parsed.cleaned, TERMINAL_OUTPUT_MAX_CHARS);
+  const stderrClip = clipText(proc.stderr, TERMINAL_OUTPUT_MAX_CHARS);
+  const markerCwd = parsed.cwd && workspaceContainsPath(parsed.cwd)
+    ? normalizeTerminalCwd(parsed.cwd, cwdBefore)
+    : cwdBefore;
+  TERMINAL_STATE.cwd = markerCwd;
+  TERMINAL_STATE.updated_at = nowIso();
+  TERMINAL_STATE.last_command = command;
+  TERMINAL_STATE.last_exit_code = Number(proc.status == null ? 1 : proc.status);
+  const timedOut = Boolean(proc.error && String(proc.error.code || '').toUpperCase() === 'ETIMEDOUT');
+
+  return terminalStatePayload({
+    executed: true,
+    command,
+    exit_code: Number(proc.status == null ? 1 : proc.status),
+    timed_out: timedOut,
+    signal: proc.signal ? String(proc.signal) : '',
+    error: proc.error ? String(proc.error && proc.error.message ? proc.error.message : proc.error) : '',
+    stdout: stdoutClip.text,
+    stderr: stderrClip.text,
+    stdout_truncated: stdoutClip.truncated === true,
+    stderr_truncated: stderrClip.truncated === true,
+    cwd_before_abs: cwdBefore,
+    cwd_before_rel: terminalRel(cwdBefore)
+  });
 }
 
 function likelyTextBuffer(buf) {
@@ -5016,6 +5330,44 @@ function main() {
         const err = String(payload.error || 'bad_request');
         const code = err === 'not_found' ? 404 : (err === 'path_outside_workspace' ? 403 : 400);
         sendJson(res, code, payload);
+        return;
+      }
+      sendJson(res, 200, payload);
+      return;
+    }
+    if (pathname === '/api/terminal/state') {
+      sendJson(res, 200, terminalStatePayload());
+      return;
+    }
+    if (pathname === '/api/terminal/cwd') {
+      const rawPath = String(parsed.searchParams.get('path') || '').trim();
+      if (!rawPath) {
+        sendJson(res, 400, {
+          ok: false,
+          error: 'path_required',
+          ts: nowIso()
+        });
+        return;
+      }
+      const payload = setTerminalCwd(rawPath, 'selection');
+      if (!payload.ok) {
+        sendJson(res, 400, {
+          ...payload,
+          ts: nowIso()
+        });
+        return;
+      }
+      sendJson(res, 200, payload);
+      return;
+    }
+    if (pathname === '/api/terminal/exec') {
+      const command = String(parsed.searchParams.get('cmd') || '');
+      const payload = execTerminalCommand(command);
+      if (!payload.ok) {
+        sendJson(res, 400, {
+          ...payload,
+          ts: nowIso()
+        });
         return;
       }
       sendJson(res, 200, payload);
