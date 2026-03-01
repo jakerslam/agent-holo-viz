@@ -4937,6 +4937,15 @@ function renderStats() {
   const continuum = summary.continuum && typeof summary.continuum === 'object'
     ? summary.continuum
     : {};
+  const overlays = summary.overlays && typeof summary.overlays === 'object'
+    ? summary.overlays
+    : {};
+  const emergenceOverlay = overlays.emergence && typeof overlays.emergence === 'object'
+    ? overlays.emergence
+    : {};
+  const controlOverlay = overlays.control_plane && typeof overlays.control_plane === 'object'
+    ? overlays.control_plane
+    : {};
   const runtime = runtimeSnapshotFromPayload(payload);
   state.runtime = runtime;
   const runtimeStatusLabel = runtime.online
@@ -5105,6 +5114,14 @@ function renderStats() {
       ['T1/T2 Directives', `${fmtNum(constitution.tier1_total || 0)} / ${fmtNum(constitution.tier2_total || 0)}`],
       ['Evolution Commits 30d', fmtNum(evolution.commits_30d || 0)],
       ['Fractal Harmony', `${fmtNum(Number(fractal.harmony_score || 0) * 100)}%`],
+      ['Emergence Fusion State', String(emergenceOverlay.fusion_state || 'unknown')],
+      ['Emergence Resonance Band', String(emergenceOverlay.resonance_band || 'unknown')],
+      ['Emergence Shadow Pressure', fmtNum(Number(emergenceOverlay.shadow_pressure || 0))],
+      ['Emergence Molt Window', String(emergenceOverlay.molt_window || 'unknown')],
+      ['Control Routing Lane', String(controlOverlay.routing_lane || 'unknown')],
+      ['Control Trust Posture', String(controlOverlay.trust_posture || 'unknown')],
+      ['Control Provider Count', fmtNum(Array.isArray(controlOverlay.provider_health) ? controlOverlay.provider_health.length : 0)],
+      ['Control Error Lanes', fmtNum(Number(controlOverlay.error_lane_count || 0))],
       ['Symbiosis Plans', fmtNum(fractal.symbiosis_plans || 0)],
       ['Predator Candidates', fmtNum(fractal.predator_candidates || 0)],
       ['Black-Box Rows', fmtNum(fractal.black_box_rows || 0)],
@@ -5161,6 +5178,14 @@ function renderStats() {
       ['Evolution Commits 30d', fmtNum(evolution.commits_30d || 0)],
       ['Evolution Stability', `${fmtNum(Number(evolution.stability_score || 0) * 100)}%`],
       ['Fractal Harmony', `${fmtNum(Number(fractal.harmony_score || 0) * 100)}%`],
+      ['Emergence Fusion State', String(emergenceOverlay.fusion_state || 'unknown')],
+      ['Emergence Resonance Band', String(emergenceOverlay.resonance_band || 'unknown')],
+      ['Emergence Shadow Pressure', fmtNum(Number(emergenceOverlay.shadow_pressure || 0))],
+      ['Emergence Molt Window', String(emergenceOverlay.molt_window || 'unknown')],
+      ['Control Routing Lane', String(controlOverlay.routing_lane || 'unknown')],
+      ['Control Trust Posture', String(controlOverlay.trust_posture || 'unknown')],
+      ['Control Provider Count', fmtNum(Array.isArray(controlOverlay.provider_health) ? controlOverlay.provider_health.length : 0)],
+      ['Control Error Lanes', fmtNum(Number(controlOverlay.error_lane_count || 0))],
       ['Symbiosis Plans', fmtNum(fractal.symbiosis_plans || 0)],
       ['Predator Candidates', fmtNum(fractal.predator_candidates || 0)],
       ['Restructure Candidates', fmtNum(fractal.restructure_candidates || 0)],

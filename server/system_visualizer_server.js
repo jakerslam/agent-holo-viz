@@ -39,6 +39,7 @@ const AUTOTEST_STATUS_PATH = path.join(AUTOTEST_DIR, 'status.json');
 const AUTOTEST_EVENTS_PATH = path.join(AUTOTEST_DIR, 'events.jsonl');
 const SYSTEM_HEALTH_DIR = path.join(REPO_ROOT, 'state', 'ops', 'system_health');
 const SYSTEM_HEALTH_EVENTS_PATH = path.join(SYSTEM_HEALTH_DIR, 'events.jsonl');
+const HOLO_OVERLAY_PATH = path.join(REPO_ROOT, 'state', 'ops', 'holo_overlays', 'latest.json');
 const FRACTAL_ORGANISM_DIR = path.join(FRACTAL_DIR, 'organism_cycle');
 const FRACTAL_INTROSPECTION_DIR = path.join(FRACTAL_DIR, 'introspection');
 const FRACTAL_PHEROMONE_DIR = path.join(FRACTAL_DIR, 'pheromones');
@@ -3324,6 +3325,7 @@ function buildPayload(hours, liveMinutes = DEFAULT_LIVE_MINUTES, liveMode = true
   const evolution = loadEvolutionSnapshot();
   const fractalSnapshot = loadFractalSnapshot();
   const continuumSnapshot = loadContinuumSnapshot();
+  const overlaySnapshot = safeJsonRead(HOLO_OVERLAY_PATH, {});
   const runtimeWindowMinutes = runtimeWindowMinutesFromInput(telemetry.window_hours, liveMinutes, liveMode === true);
   const runtimeSpineEvents = loadRecentSpineEvents(Math.max(1 / 60, runtimeWindowMinutes / 60), 240);
   const runtimeSpineSignal = loadSpineRuntimeSignal(RUNTIME_SIGNAL_LOOKBACK_HOURS);
@@ -3380,6 +3382,25 @@ function buildPayload(hours, liveMinutes = DEFAULT_LIVE_MINUTES, liveMode = true
     autotest_failed_24h: Number(continuumSnapshot && continuumSnapshot.autotest_failed_24h || 0),
     autotest_guard_blocked_24h: Number(continuumSnapshot && continuumSnapshot.autotest_guard_blocked_24h || 0)
   };
+  const overlays = {
+    emergence: overlaySnapshot && overlaySnapshot.emergence && typeof overlaySnapshot.emergence === 'object'
+      ? overlaySnapshot.emergence
+      : {
+          fusion_state: 'unknown',
+          resonance_band: 'unknown',
+          shadow_pressure: 0,
+          molt_window: 'unknown'
+        },
+    control_plane: overlaySnapshot && overlaySnapshot.control_plane && typeof overlaySnapshot.control_plane === 'object'
+      ? overlaySnapshot.control_plane
+      : {
+          routing_lane: 'unknown',
+          trust_posture: 'unknown',
+          provider_health: [],
+          error_lane_count: 0
+        },
+    generated_at: String(overlaySnapshot && overlaySnapshot.generated_at || '')
+  };
   const summary = {
     ...baseSummary,
     constitution: {
@@ -3395,6 +3416,7 @@ function buildPayload(hours, liveMinutes = DEFAULT_LIVE_MINUTES, liveMode = true
     evolution,
     fractal,
     continuum,
+    overlays,
     runtime: runtimeStatus,
     workflow_birth: {
       available: workflowBirthSnapshot.available === true,
@@ -3445,6 +3467,7 @@ function buildPayload(hours, liveMinutes = DEFAULT_LIVE_MINUTES, liveMode = true
     evolution,
     fractal,
     continuum,
+    overlays,
     workflow_birth: workflowBirthSnapshot,
     doctor_health: doctorSnapshot,
     fractal_snapshot: fractalSnapshot,
